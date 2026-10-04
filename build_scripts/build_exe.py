@@ -1,5 +1,5 @@
 """
-Build script for Fast Photo Culler Windows executable.
+Build script for the Quick Cull Windows executable.
 
 Usage (from project root):
     python build_scripts/build_exe.py           # Normal build (folder mode)
@@ -13,10 +13,11 @@ import shutil
 from pathlib import Path
 
 
+APP_NAME = "QuickCull"
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
-SPEC_FILE = SCRIPT_DIR / "FastPhotoCuller.spec"
-DIST_DIR = ROOT / "dist" / "FastPhotoCuller"
+SPEC_FILE = SCRIPT_DIR / f"{APP_NAME}.spec"
+DIST_DIR = ROOT / "dist" / APP_NAME
 
 
 def check_prerequisites():
@@ -31,9 +32,16 @@ def check_prerequisites():
         errors.append("PyInstaller is not installed. Run: pip install pyinstaller")
 
     # Required source files
-    for f in ["gui.py", "culler.py"]:
+    for f in ["gui.py", "gui.pyw", "bootstrap.py", "culler.py"]:
         if not (ROOT / f).exists():
             errors.append(f"Missing source file: {f}")
+
+    # App icon (window icon, splash art and the exe icon all come from it)
+    for asset in ["quick_cull.ico", "quick_cull_icon.png", "quick_cull_splash_icon.png"]:
+        if not (ROOT / "media" / asset).exists():
+            errors.append(
+                f"Missing icon asset: media/{asset} (run: python build_scripts/make_icon.py)"
+            )
 
     # Models directory
     models_dir = ROOT / "lib" / "models"
@@ -64,7 +72,7 @@ def check_prerequisites():
 
 def build(onefile: bool = False, console: bool = False):
     """Run PyInstaller build."""
-    print("\n=== Fast Photo Culler - Windows Executable Build ===\n")
+    print(f"\n=== {APP_NAME} - Windows Executable Build ===\n")
 
     print("[1/3] Checking prerequisites...")
     if not check_prerequisites():
@@ -84,7 +92,7 @@ def build(onefile: bool = False, console: bool = False):
 
     if onefile:
         modified_spec = modified_spec.replace(
-            "coll = COLLECT(\n    exe,\n    a.binaries,\n    a.zipfiles,\n    a.datas,\n    strip=False,\n    upx=False,\n    upx_exclude=[],\n    name=\"FastPhotoCuller\",\n)",
+            f"coll = COLLECT(\n    exe,\n    a.binaries,\n    a.zipfiles,\n    a.datas,\n    strip=False,\n    upx=False,\n    upx_exclude=[],\n    name=\"{APP_NAME}\",\n)",
             ""
         )
         modified_spec = modified_spec.replace(
@@ -109,8 +117,8 @@ def build(onefile: bool = False, console: bool = False):
     SPEC_FILE.write_text(original_spec, encoding="utf-8")
 
     if onefile:
-        build_exe = ROOT / "build" / "FastPhotoCuller" / "FastPhotoCuller.exe"
-        dist_exe = ROOT / "dist" / "FastPhotoCuller.exe"
+        build_exe = ROOT / "build" / APP_NAME / f"{APP_NAME}.exe"
+        dist_exe = ROOT / "dist" / f"{APP_NAME}.exe"
         if build_exe.exists():
             shutil.copy2(build_exe, dist_exe)
 
@@ -120,9 +128,9 @@ def build(onefile: bool = False, console: bool = False):
 
     print("\n[3/3] Verifying output...")
     if onefile:
-        exe_path = ROOT / "dist" / "FastPhotoCuller.exe"
+        exe_path = ROOT / "dist" / f"{APP_NAME}.exe"
     else:
-        exe_path = DIST_DIR / "FastPhotoCuller.exe"
+        exe_path = DIST_DIR / f"{APP_NAME}.exe"
 
     if exe_path.exists():
         size_mb = exe_path.stat().st_size / (1024 * 1024)

@@ -30,7 +30,8 @@ from culler.dataset_exporter import save_annotation, save_manual_annotation
 from culler.image_loader import ImageLoader
 from culler.ml_trainer import train_custom_yolo
 from culler.paths import DATASET_DIR
-from culler.gui import HeaderToolbar, ThumbnailList, ImageCanvasViewer, MetadataPanel, MetadataCleanupDialog, SettingsDialog, BlurScanDialog, DuplicateScanDialog, ProgressDialog, TabBar, SplashScreen
+from bootstrap import APP_NAME, SplashScreen, adopt_default_root, apply_window_icon, launch_gui
+from culler.gui import HeaderToolbar, ThumbnailList, ImageCanvasViewer, MetadataPanel, MetadataCleanupDialog, SettingsDialog, BlurScanDialog, DuplicateScanDialog, ProgressDialog, TabBar
 from culler.logger import log_info, log_debug, log_error
 
 # Set modern dark UI theme
@@ -40,7 +41,7 @@ ctk.set_default_color_theme("blue")
 
 class ImageCullerApp(ctk.CTk):
     """
-    Main Application Window for Fast Photo Culler.
+    Main Application Window for Quick Cull.
     Features: Multi-tab folder management, Fast ARW/RAW+JPG culling, 0ms RAM pre-fetch buffer navigation,
     Scan for Blur, Scan for Duplicates, Tagging (Blur, Duplicate, Dark, Over-exposed, Custom),
     and SQLite metadata folder hierarchy cleanup.
@@ -55,7 +56,7 @@ class ImageCullerApp(ctk.CTk):
 
     def _update_window_title(self):
         ws_name = self.db.db_path.name if self.db and hasattr(self.db, "db_path") else "default.fpc-workspace"
-        self.title(f"Fast Photo Culler - [{ws_name}]")
+        self.title(f"{APP_NAME} - [{ws_name}]")
 
     def __init__(
         self,
@@ -65,6 +66,10 @@ class ImageCullerApp(ctk.CTk):
         workspace_path: Optional[str] = None
     ):
         super().__init__()
+        # The splash owns tkinter's default root until it closes; take it over
+        # so this window's fonts and widgets are created on its own interpreter.
+        adopt_default_root(self)
+        apply_window_icon(self)
 
         target_ws = workspace_path
         folder_or_img = initial_path
@@ -103,14 +108,12 @@ class ImageCullerApp(ctk.CTk):
         splash = splash_screen
         if splash is None and show_splash:
             try:
-                splash = SplashScreen(master=self)
+                splash = SplashScreen()
                 if initial_path:
                     folder_label = os.path.basename(initial_path.rstrip("/\\")) or initial_path
                     splash.set_status(f"Loading {folder_label}...")
                 else:
                     splash.set_status("Initializing workspace...")
-                splash.update_idletasks()
-                splash.update()
             except Exception:
                 splash = None
 
@@ -2595,6 +2598,6 @@ def open_folder_in_explorer(folder_path: Path):
 
 
 if __name__ == "__main__":
-    initial_path = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else None
-    app = ImageCullerApp(initial_path=initial_path)
-    app.mainloop()
+    # Go through the bootstrap launcher so the splash is painted before the
+    # heavy imports run (see bootstrap.launch_gui).
+    launch_gui(initial_path=sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else None)

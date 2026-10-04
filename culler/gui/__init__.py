@@ -1,5 +1,5 @@
 """
-GUI components for Python Image Culler.
+GUI components for Quick Cull.
 """
 
 import os
@@ -80,7 +80,6 @@ from .duplicate_dialog import DuplicateScanDialog
 from .progress_dialog import ProgressDialog
 from .tooltip import ToolTip
 from .tab_bar import TabBar
-from .splash_screen import SplashScreen
 
 __all__ = [
     "HeaderToolbar",
@@ -94,5 +93,4 @@ __all__ = [
     "ProgressDialog",
     "ToolTip",
     "TabBar",
-    "SplashScreen"
 ]

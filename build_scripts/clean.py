@@ -1,5 +1,5 @@
 """
-Clean script for Fast Photo Culler build artifacts.
+Clean script for Quick Cull build artifacts.
 
 Removes PyInstaller output and cache directories.
 """

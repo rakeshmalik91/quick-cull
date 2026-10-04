@@ -293,9 +293,12 @@ def cmd_sync_exif(session: CullingSession, args):
 
 
 def cmd_gui(args):
-    from gui import ImageCullerApp
-    app = ImageCullerApp(initial_path=args.path, workspace_path=getattr(args, "workspace", None))
-    app.mainloop()
+    # Route through the bootstrap launcher so the splash appears immediately.
+    from bootstrap import launch_gui
+    launch_gui(
+        initial_path=args.path,
+        workspace_path=getattr(args, "workspace", None),
+    )
 
 
 def main():

@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Union
 
-APP_NAME = "FastPhotoCuller"
+APP_NAME = "QuickCull"
 
 
 def get_project_root() -> Path:

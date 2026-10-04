@@ -1,10 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec file for Fast Photo Culler.
-Bundles GUI app with CustomTkinter assets, YOLO models, and ExifTool.
+PyInstaller spec file for Quick Cull.
+Bundles GUI app with CustomTkinter assets, YOLO models, ExifTool, and the icon.
 
 Usage:
-    pyinstaller FastPhotoCuller.spec
+    pyinstaller QuickCull.spec
 """
 
 import sys
@@ -23,10 +23,13 @@ python_dlls = [
 # CustomTkinter themes and assets
 ctk_datas = collect_data_files("customtkinter")
 
-# Application data: YOLO models + ExifTool
+# Application data: YOLO models + ExifTool + app icon
 app_datas = [
     ("../lib/models", "lib/models"),
     ("../lib/exif-tools", "lib/exif-tools"),
+    ("../media/quick_cull.ico", "media"),
+    ("../media/quick_cull_icon.png", "media"),
+    ("../media/quick_cull_splash_icon.png", "media"),
 ]
 
 all_datas = ctk_datas + app_datas
@@ -34,6 +37,7 @@ all_datas = ctk_datas + app_datas
 # --- Hidden imports ---
 # Modules that PyInstaller cannot auto-detect from dynamic imports
 hidden_imports = [
+    "bootstrap",
     "customtkinter",
     "PIL._tkinter_finder",
     "PIL.Image",
@@ -50,8 +54,9 @@ hidden_imports = [
 ] + collect_submodules("culler")
 
 # --- Analysis ---
+# gui.pyw is the launcher: it paints the splash before importing the app.
 a = Analysis(
-    ["../gui.py"],
+    ["../gui.pyw"],
     pathex=[".."],
     binaries=python_dlls,
     datas=all_datas,
@@ -83,7 +88,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="FastPhotoCuller",
+    name="QuickCull",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -92,6 +97,7 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
+    icon="../media/quick_cull.ico",
     codesign_identity=None,
     entitlements_file=None,
 )
@@ -104,5 +110,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="FastPhotoCuller",
+    name="QuickCull",
 )

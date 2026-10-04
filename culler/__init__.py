@@ -1,5 +1,5 @@
 """
-Python Image Culler Package
+Quick Cull Package
 Support for Sony ARW (ExifTool), JPG, PNG, HEIF/HEIC.
 """
 

@@ -1,17 +1,21 @@
-# Python Image Culler
+# Quick Cull
+
+<p align="center">
+  <img src="media/quick_cull_icon.png" alt="Quick Cull icon" width="96">
+</p>
 
 > **Note**: This is an experimental project designed to test and evaluate automated image culling algorithms.
 
 A high-performance Python photo culling application designed for professional photography workflows. Supports **Sony ARW RAW**, **JPG**, **PNG**, and **HEIF/HEIC**.
 
-![Python Image Culler UI](media/ss1.jpg)
+![Quick Cull UI](media/ss1.jpg)
 
 ---
 
 ## ⚠️ Disclaimer & Data Safety
 
 > [!WARNING]
-> - **Non-Destructive Workflow**: Flagging, tagging, rating, or cropping photos within Python Image Culler does not alter original RAW image data. File organization actions (such as batch moving to `_SELECTED/` or `_REJECTED/` subfolders or moving items to Trash) perform real disk operations.
+> - **Non-Destructive Workflow**: Flagging, tagging, rating, or cropping photos within Quick Cull does not alter original RAW image data. File organization actions (such as batch moving to `_SELECTED/` or `_REJECTED/` subfolders or moving items to Trash) perform real disk operations.
 > - **Backup Recommendation**: Always maintain backup copies of your primary memory cards or photo sessions before executing batch moves or file deletions.
 > - **AI & Blur Detection Accuracy**: Automated focus sharpness, eye detection (YOLOv8, DoG), and duplicate scanning (dHash, EXIF) serve as culling acceleration tools. Photographers are advised to perform final manual review on key shots prior to permanent deletion.
 
@@ -45,21 +49,30 @@ A high-performance Python photo culling application designed for professional ph
 ## 🚀 Quick Start
 
 ```bash
-pip install -r requirements.txt
+# Windows: creates .venv, installs requirements and launches the app
+run.bat
 
-# Launch GUI (blank or restores open tabs)
-python gui.py
+# ... or launch directly (same entry point, splash appears instantly)
+python gui.pyw
+python gui.pyw "D:\Photos\2024"
 
 # Launch GUI and open a specific folder
-python gui.py "D:\Photos\2024"
+python gui.pyw "D:\Photos\2024"
 
 # Launch GUI, open containing folder, and automatically select the specified image
-python gui.py "D:\Photos\2024\DSC01234.ARW"
+python gui.pyw "D:\Photos\2024\DSC01234.ARW"
 
 # CLI Commands (accept directory or specific image file)
+python culler.py gui
 python culler.py scan "D:\Photos\2024"
 python culler.py cull "D:\Photos\2024\DSC01234.JPG"
 ```
+
+> [!NOTE]
+> `gui.pyw` is the launcher used by `run.bat` and by the packaged `.exe`. It paints the
+> splash screen before the heavy libraries (OpenCV, rawpy, Ultralytics, ...) are loaded,
+> so the app appears within a fraction of a second. `python gui.py` still works for
+> development, but it can only show the splash after its own imports have finished.
 
 ---
 
