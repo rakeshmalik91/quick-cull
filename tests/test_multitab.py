@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from culler.culler_engine import CullingSession, ImageItem, FlagState
 from culler.db_manager import DatabaseManager
+from culler.folder_watcher import FolderWatcher
 
 
 class TestDbManagerTabs(unittest.TestCase):
@@ -402,6 +404,349 @@ class TestImageCullerAppTabLogic(unittest.TestCase):
         self.assertEqual(app.tabs[0]["filter_values"]["rating"], ["5"])
         self.assertEqual(app.tabs[1]["filter_values"]["flag"], "Reject")
         self.assertEqual(app.tabs[1]["filter_values"]["rating"], ["1", "2"])
+
+
+class TestTabLoadStats(unittest.TestCase):
+    """
+    Unit tests for per-tab folder/thumbnail load stats stored in the tab dict.
+    """
+
+    def setUp(self):
+        self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self.temp_db_fd)
+        self.db = DatabaseManager(db_path=self.temp_db_path)
+
+    def tearDown(self):
+        if hasattr(self, "db") and self.db:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+        if os.path.exists(self.temp_db_path):
+            try:
+                os.remove(self.temp_db_path)
+            except Exception:
+                pass
+
+    def _make_app(self):
+        from gui import ImageCullerApp
+
+        app = MagicMock()
+        app.db = self.db
+        app.tabs = []
+        app.active_tab_index = -1
+        app.current_items = []
+        app.current_index = -1
+        app.selected_indices = set()
+        app.selection_anchor_idx = 0
+        app.toolbar = MagicMock()
+        app.thumb_list = MagicMock()
+        app.viewer = MagicMock()
+        app.meta_panel = MagicMock()
+        app.tab_bar = MagicMock()
+        app._create_tab_info = lambda directory, *a, **kw: ImageCullerApp._create_tab_info(app, directory, *a, **kw)
+        app._get_active_tab = lambda: ImageCullerApp._get_active_tab(app)
+        app._save_active_tab_state = lambda: ImageCullerApp._save_active_tab_state(app)
+        app._apply_tab_state = lambda tab: ImageCullerApp._apply_tab_state(app, tab)
+        app._persist_tabs_state = MagicMock()
+        app._switch_tab = lambda index: ImageCullerApp._switch_tab(app, index)
+        app._load_tab_directory = MagicMock()
+        return app
+
+    def test_create_tab_info_starts_with_empty_stats(self):
+        from gui import ImageCullerApp
+
+        app = self._make_app()
+        ImageCullerApp._add_tab(app, "D:/Photos/A")
+        self.assertEqual(app.tabs[0]["load_stats"], {"folder": None, "thumb": None})
+
+    def test_apply_tab_state_restores_saved_stats(self):
+        from gui import ImageCullerApp
+
+        app = self._make_app()
+        ImageCullerApp._add_tab(app, "D:/Photos/A")
+        ImageCullerApp._add_tab(app, "D:/Photos/B")
+        app.active_tab_index = 0
+
+        app.tabs[0]["load_stats"] = {"folder": 4.5, "thumb": 1.25}
+        app.tabs[0]["current_items"] = [ImageItem(Path("D:/Photos/A/IMG_0001.JPG"))]
+        app.tabs[0]["current_index"] = 0
+
+        ImageCullerApp._apply_tab_state(app, app.tabs[0])
+
+        app.thumb_list.show_load_stats.assert_called_once_with(4.5, 1.25)
+        app.thumb_list.begin_thumb_timing.assert_not_called()
+
+    def test_apply_tab_state_times_first_thumb_render(self):
+        from gui import ImageCullerApp
+
+        app = self._make_app()
+        ImageCullerApp._add_tab(app, "D:/Photos/A")
+        app.active_tab_index = 0
+
+        app.tabs[0]["load_stats"] = {"folder": 4.5, "thumb": None}
+        app.tabs[0]["current_items"] = [ImageItem(Path("D:/Photos/A/IMG_0001.JPG"))]
+        app.tabs[0]["current_index"] = 0
+
+        ImageCullerApp._apply_tab_state(app, app.tabs[0])
+
+        app.thumb_list.show_load_stats.assert_called_once_with(4.5, None)
+        app.thumb_list.begin_thumb_timing.assert_called_once()
+
+    def test_switch_tab_does_not_carry_stats_over(self):
+        from gui import ImageCullerApp
+
+        app = self._make_app()
+        ImageCullerApp._add_tab(app, "D:/Photos/A")
+        ImageCullerApp._add_tab(app, "D:/Photos/B")
+        app.active_tab_index = 0
+
+        app.tabs[0]["load_stats"] = {"folder": 4.5, "thumb": 1.25}
+        app.tabs[0]["is_loaded"] = True
+        app.tabs[0]["current_items"] = [ImageItem(Path("D:/Photos/A/IMG_0001.JPG"))]
+        app.tabs[0]["current_index"] = 0
+        app.tabs[1]["is_loaded"] = True
+        app.tabs[1]["load_stats"] = {"folder": 9.0, "thumb": 2.5}
+        app.tabs[1]["current_items"] = [ImageItem(Path("D:/Photos/B/IMG_0001.JPG"))]
+        app.tabs[1]["current_index"] = 0
+
+        ImageCullerApp._switch_tab(app, 1)
+
+        app.thumb_list.show_load_stats.assert_called_once_with(9.0, 2.5)
+        self.assertEqual(app.tabs[0]["load_stats"], {"folder": 4.5, "thumb": 1.25})
+
+    def test_on_load_stats_changed_writes_to_active_tab(self):
+        from gui import ImageCullerApp
+
+        app = self._make_app()
+        ImageCullerApp._add_tab(app, "D:/Photos/A")
+        ImageCullerApp._add_tab(app, "D:/Photos/B")
+        app.active_tab_index = 1
+
+        ImageCullerApp._on_load_stats_changed(app, {"folder": 9.0, "thumb": 2.5})
+
+        self.assertEqual(app.tabs[1]["load_stats"], {"folder": 9.0, "thumb": 2.5})
+        self.assertEqual(app.tabs[0]["load_stats"], {"folder": None, "thumb": None})
+
+    def test_on_load_stats_changed_ignores_missing_tab(self):
+        from gui import ImageCullerApp
+
+        app = self._make_app()
+        app.active_tab_index = -1
+        ImageCullerApp._on_load_stats_changed(app, {"folder": 1.0, "thumb": 2.0})
+
+
+class TestFolderChangeReload(unittest.TestCase):
+    """
+    Unit tests for automatic tab reload when a watched folder changes on disk.
+    """
+
+    def setUp(self):
+        self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self.temp_db_fd)
+        self.db = DatabaseManager(db_path=self.temp_db_path)
+        self.temp_dir = tempfile.mkdtemp()
+        self.directory = Path(self.temp_dir)
+
+    def tearDown(self):
+        if hasattr(self, "db") and self.db:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+        if os.path.exists(self.temp_db_path):
+            try:
+                os.remove(self.temp_db_path)
+            except Exception:
+                pass
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _make_app(self):
+        from gui import ImageCullerApp
+        from culler.folder_watcher import FolderChange
+
+        app = MagicMock()
+        app.db = self.db
+        app.tabs = []
+        app.active_tab_index = -1
+        app.current_items = []
+        app.current_index = -1
+        app.selected_indices = set()
+        app.selection_anchor_idx = 0
+        app.toolbar = MagicMock()
+        app.thumb_list = MagicMock()
+        app.viewer = MagicMock()
+        app.meta_panel = MagicMock()
+        app.tab_bar = MagicMock()
+        app.folder_watcher = FolderWatcher(settle_seconds=0.0, write_grace_seconds=0.0)
+        app.folder_watcher.start()
+        app.addCleanup(app.folder_watcher.stop, 0.1)
+        self.change_cls = FolderChange
+        app._update_status = MagicMock()
+        app._load_directory = MagicMock()
+        app._load_tab_directory = MagicMock()
+        app._get_active_tab = lambda: ImageCullerApp._get_active_tab(app)
+        app._watch_tab_directory = lambda tab: ImageCullerApp._watch_tab_directory(app, tab)
+        app._on_folder_changed = lambda tab, ch: ImageCullerApp._on_folder_changed(app, tab, ch)
+        app._suppress_folder_watch = lambda d, s=None: ImageCullerApp._suppress_folder_watch(app, d, s)
+        app._unwatch_tab_directory = lambda tab, d=None: ImageCullerApp._unwatch_tab_directory(app, tab, d)
+        app._close_tab = lambda index: ImageCullerApp._close_tab(app, index)
+        app._create_tab_info = lambda directory, *a, **kw: ImageCullerApp._create_tab_info(app, directory, *a, **kw)
+        return app
+
+    def _make_tab(self, app, name="A"):
+        tab_info = app._create_tab_info(str(self.directory))
+        tab_info["session"].directory = self.directory
+        tab_info["is_loaded"] = True
+        tab_info["tab_label"] = name
+        app.tabs.append(tab_info)
+        return tab_info
+
+    def test_watch_tab_directory_registers_watch(self):
+        app = self._make_app()
+        tab = self._make_tab(app)
+
+        app._watch_tab_directory(tab)
+
+        self.assertTrue(app.folder_watcher.is_watching(self.directory))
+
+    def test_watch_tab_directory_ignores_missing_folder(self):
+        app = self._make_app()
+        tab = self._make_tab(app)
+        tab["session"].directory = self.directory / "missing"
+
+        app._watch_tab_directory(tab)
+
+        self.assertEqual(len(app.folder_watcher.watched_directories()), 0)
+
+    def test_folder_change_reloads_active_tab(self):
+        app = self._make_app()
+        tab = self._make_tab(app)
+        app.active_tab_index = 0
+
+        change = self.change_cls(directory=self.directory, removed=("A.JPG", "B.JPG"))
+        app._on_folder_changed(tab, change)
+
+        app._load_directory.assert_called_once_with(str(self.directory))
+        app._load_tab_directory.assert_not_called()
+        app._update_status.assert_called_once()
+        self.assertIn("-2 removed", app._update_status.call_args[0][0])
+
+    def test_folder_change_reloads_background_tab_quietly(self):
+        app = self._make_app()
+        active = self._make_tab(app, "A")
+        background = self._make_tab(app, "B")
+        app.active_tab_index = 0
+
+        change = self.change_cls(directory=self.directory, added=("C.JPG",))
+        app._on_folder_changed(background, change)
+
+        app._load_tab_directory.assert_called_once_with(background, show_progress=False)
+        app._load_directory.assert_not_called()
+
+    def test_folder_change_ignored_while_tab_loading(self):
+        app = self._make_app()
+        tab = self._make_tab(app)
+        app.active_tab_index = 0
+        tab["loading"] = True
+
+        app._watch_tab_directory(tab)
+        change = self.change_cls(directory=self.directory, added=("C.JPG",))
+        app._on_folder_changed(tab, change)
+
+        app._load_directory.assert_not_called()
+        app._load_tab_directory.assert_not_called()
+
+    def test_folder_change_for_closed_tab_unwatches(self):
+        app = self._make_app()
+        tab = self._make_tab(app)
+        app.active_tab_index = 0
+        app._watch_tab_directory(tab)
+        app.tabs.remove(tab)
+
+        change = self.change_cls(directory=self.directory, removed=("A.JPG",))
+        app._on_folder_changed(tab, change)
+
+        self.assertFalse(app.folder_watcher.is_watching(self.directory))
+        app._load_directory.assert_not_called()
+
+    def test_folder_change_for_stale_directory_unwatches(self):
+        app = self._make_app()
+        tab = self._make_tab(app)
+        app.active_tab_index = 0
+        app._watch_tab_directory(tab)
+        tab["directory"] = str(self.directory / "elsewhere")
+
+        change = self.change_cls(directory=self.directory, removed=("A.JPG",))
+        app._on_folder_changed(tab, change)
+
+        self.assertFalse(app.folder_watcher.is_watching(self.directory))
+        app._load_directory.assert_not_called()
+
+    def test_close_tab_unwatches_directory(self):
+        app = self._make_app()
+        other_dir = Path(tempfile.mkdtemp(dir=self.temp_dir))
+        first = self._make_tab(app, "A")
+        second = self._make_tab(app, "B")
+        second["session"].directory = other_dir
+        app.active_tab_index = 1
+        app._watch_tab_directory(first)
+        app._watch_tab_directory(second)
+
+        app._close_tab(0)
+
+        self.assertFalse(app.folder_watcher.is_watching(self.directory))
+        self.assertTrue(app.folder_watcher.is_watching(other_dir))
+
+    def test_close_tab_keeps_watch_when_another_tab_shares_directory(self):
+        app = self._make_app()
+        first = self._make_tab(app, "A")
+        second = self._make_tab(app, "B")
+        app.active_tab_index = 1
+        app._watch_tab_directory(first)
+        app._watch_tab_directory(second)
+
+        app._close_tab(0)
+
+        self.assertTrue(app.folder_watcher.is_watching(self.directory))
+
+    def test_external_change_is_marshalled_to_gui_thread(self):
+        app = self._make_app()
+        tab = self._make_tab(app)
+        app.active_tab_index = 0
+        app._watch_tab_directory(tab)
+
+        (self.directory / "A.JPG").write_bytes(b"0")
+        app.folder_watcher.poll_now()
+        app.folder_watcher.poll_now()
+
+        self.assertEqual(app.after.call_count, 1)
+        self.assertEqual(app.after.call_args[0][0], 0)
+
+    def test_suppress_folder_watch_prevents_reload(self):
+        app = self._make_app()
+        tab = self._make_tab(app)
+        app.active_tab_index = 0
+        app._watch_tab_directory(tab)
+
+        (self.directory / "A.JPG").write_bytes(b"0")
+        app.folder_watcher.poll_now()
+        app.folder_watcher.poll_now()
+        self.assertEqual(app.after.call_count, 1, "unsuppressed change must be reported")
+
+        app._suppress_folder_watch(self.directory, 60.0)
+        (self.directory / "B.JPG").write_bytes(b"0")
+        app.folder_watcher.poll_now()
+        app.folder_watcher.poll_now()
+
+        self.assertEqual(app.after.call_count, 1, "suppressed change must be adopted silently")
+        app._load_directory.assert_not_called()
+
+        app.folder_watcher.resync(self.directory)
+        (self.directory / "C.JPG").write_bytes(b"0")
+        app.folder_watcher.poll_now()
+        app.folder_watcher.poll_now()
+        self.assertEqual(app.after.call_count, 2, "resync must re-enable detection")
 
 
 class TestTabBarDynamicIndex(unittest.TestCase):

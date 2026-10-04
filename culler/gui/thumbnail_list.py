@@ -1,4 +1,5 @@
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Callable, Optional, Dict, Tuple, Set
@@ -26,6 +27,7 @@ class ThumbnailList(ctk.CTkFrame):
         on_select_all: Optional[Callable[[], None]] = None,
         on_select_none: Optional[Callable[[], None]] = None,
         image_loader: Optional[ImageLoader] = None,
+        on_load_stats_changed: Optional[Callable[[Dict[str, Optional[float]]], None]] = None,
         **kwargs
     ):
         super().__init__(master, width=340, corner_radius=5, **kwargs)
@@ -34,6 +36,7 @@ class ThumbnailList(ctk.CTkFrame):
         self.on_select_image = on_select_image
         self.on_select_all = on_select_all
         self.on_select_none = on_select_none
+        self.on_load_stats_changed = on_load_stats_changed
         self.image_loader = image_loader
         self._executor = ThreadPoolExecutor(max_workers=4)
 
@@ -51,6 +54,14 @@ class ThumbnailList(ctk.CTkFrame):
         self._total_thumbs: int = 0
         self._loaded_thumbs: int = 0
         self._load_id: int = 0
+
+        self._folder_time_start: Optional[float] = None
+        self._folder_time_final: Optional[float] = None
+        self._thumb_time_start: Optional[float] = None
+        self._thumb_time_final: Optional[float] = None
+        self._folder_scan_active: bool = False
+        self._load_cycle_active: bool = False
+        self._timing_after_id: Optional[str] = None
 
         # Top Header Box
         self.hdr_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -97,28 +108,207 @@ class ThumbnailList(ctk.CTkFrame):
         self.scroll_frame = ctk.CTkScrollableFrame(self, label_text="")
         self.scroll_frame.pack(side="top", fill="both", expand=True, padx=2, pady=2)
 
-        self.progress_frame = ctk.CTkFrame(self, fg_color="transparent", height=20)
+        self.progress_frame = ctk.CTkFrame(self, fg_color="transparent", height=36)
         self.progress_frame.pack(side="bottom", fill="x", padx=4, pady=(0, 4))
         self.progress_frame.pack_propagate(False)
 
-        self.lbl_progress_text = ctk.CTkLabel(
+        self.lbl_load_timing = ctk.CTkLabel(
             self.progress_frame,
+            text="",
+            height=16,
+            font=ctk.CTkFont(size=9),
+            text_color="#6f8ba6",
+            anchor="w"
+        )
+        self.lbl_load_timing.pack(side="top", fill="x", padx=(2, 0))
+
+        self.progress_row = ctk.CTkFrame(self.progress_frame, fg_color="transparent", height=20)
+        self.progress_row.pack(side="top", fill="x")
+        self.progress_row.pack_propagate(False)
+        self.progress_row.grid_columnconfigure(1, weight=1)
+
+        self.lbl_progress_text = ctk.CTkLabel(
+            self.progress_row,
             text="",
             font=ctk.CTkFont(size=9),
             text_color="#888888",
             anchor="w"
         )
-        self.lbl_progress_text.pack(side="left", padx=(2, 0))
+        self.lbl_progress_text.grid(row=0, column=0, sticky="w", padx=(2, 0))
 
         self.progress_bar = ctk.CTkProgressBar(
-            self.progress_frame,
+            self.progress_row,
             height=10,
             corner_radius=5,
             fg_color="#2b2b2b",
             progress_color="#3a86ff"
         )
         self.progress_bar.set(0.0)
-        self.progress_bar.pack(side="right", fill="x", expand=True, padx=(4, 2))
+        self.progress_bar.grid(row=0, column=1, sticky="ew", padx=(4, 2))
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        minutes, secs = divmod(int(seconds), 60)
+        if minutes < 60:
+            return f"{minutes}:{secs:02d}"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+
+    def start_load_timing(self, folder_started_at: Optional[float] = None):
+        """Begin the folder-scan timer (and reset any previous timing state)."""
+        self._folder_time_start = folder_started_at if folder_started_at is not None else time.monotonic()
+        self._folder_time_final = None
+        self._thumb_time_start = None
+        self._thumb_time_final = None
+        self._folder_scan_active = True
+        self._load_cycle_active = True
+        self._ensure_timing_tick()
+        self._update_load_timing()
+        self._emit_load_stats()
+
+    def finish_folder_timing(self):
+        """Freeze the folder-scan timer at its total duration."""
+        if not self._folder_scan_active or self._folder_time_start is None:
+            return
+        self._folder_time_final = time.monotonic() - self._folder_time_start
+        self._folder_scan_active = False
+        self._update_load_timing()
+        self._emit_load_stats()
+
+    def start_thumb_timing(self, reset: bool = False):
+        """Start (or restart, when ``reset``) the thumbnail-load timer.
+
+        Only active during a folder load cycle, so filter changes and tab switches
+        keep showing the totals of the load that produced the current items.
+        """
+        if not self._load_cycle_active:
+            return
+        if self._thumb_time_start is not None and not reset:
+            return
+        self._thumb_time_start = time.monotonic()
+        self._thumb_time_final = None
+        self._ensure_timing_tick()
+        self._update_load_timing()
+
+    def finish_thumb_timing(self):
+        """Freeze the thumbnail-load timer at its total duration."""
+        if self._thumb_time_start is None or self._thumb_time_final is not None:
+            return
+        self._thumb_time_final = time.monotonic() - self._thumb_time_start
+        self._update_load_timing()
+
+    def freeze_load_timing(self):
+        """Stop refreshing the thumbnail timer and keep its frozen total on screen.
+
+        The folder timer is left running, because the directory scan can still be
+        in flight when the thumbnails finish; :meth:`finish_folder_timing` corrects
+        its value once the scan completes.
+        """
+        self.finish_thumb_timing()
+        self._stop_timing_tick()
+        self._load_cycle_active = False
+        self._emit_load_stats()
+
+    def finish_load_timing(self):
+        """Terminal state for a load that ended before all thumbnails arrived."""
+        self.finish_folder_timing()
+        self.freeze_load_timing()
+
+    def begin_thumb_timing(self):
+        """Time the thumbnail render of the current item set (used when restoring a tab)."""
+        self._load_cycle_active = True
+        self.start_thumb_timing(reset=True)
+
+    def show_load_stats(self, folder_seconds: Optional[float] = None, thumb_seconds: Optional[float] = None):
+        """Show the saved totals of an earlier load, e.g. when switching tabs.
+
+        No timers are restarted, so a re-render of cached thumbnails cannot
+        overwrite the stats belonging to the tab being restored.
+        """
+        self._stop_timing_tick()
+        self._folder_scan_active = False
+        self._load_cycle_active = False
+        if folder_seconds is None and thumb_seconds is None:
+            self._folder_time_start = None
+            self._folder_time_final = None
+            self._thumb_time_start = None
+            self._thumb_time_final = None
+        else:
+            self._folder_time_start = None
+            self._folder_time_final = folder_seconds
+            self._thumb_time_start = None
+            self._thumb_time_final = thumb_seconds
+        self._update_load_timing()
+
+    def _emit_load_stats(self):
+        if self.on_load_stats_changed is None:
+            return
+        try:
+            self.on_load_stats_changed({
+                "folder": self._elapsed_folder(),
+                "thumb": self._elapsed_thumb(),
+            })
+        except Exception:
+            log_error("Failed to report folder load stats", exc_info=True)
+
+    def _elapsed_folder(self) -> Optional[float]:
+        if self._folder_time_final is not None:
+            return self._folder_time_final
+        if self._folder_time_start is not None:
+            return time.monotonic() - self._folder_time_start
+        return None
+
+    def _elapsed_thumb(self) -> Optional[float]:
+        if self._thumb_time_final is not None:
+            return self._thumb_time_final
+        if self._thumb_time_start is not None:
+            return time.monotonic() - self._thumb_time_start
+        return None
+
+    def _update_load_timing(self):
+        if self._folder_time_final is None and self._folder_time_start is None:
+            self.lbl_load_timing.configure(text="")
+            return
+        parts = []
+        folder_elapsed = self._elapsed_folder()
+        if folder_elapsed is not None:
+            parts.append(f"Folder: {self._format_elapsed(folder_elapsed)}")
+        thumb_elapsed = self._elapsed_thumb()
+        if thumb_elapsed is not None:
+            parts.append(f"Thumbs: {self._format_elapsed(thumb_elapsed)}")
+        self.lbl_load_timing.configure(text="   |   ".join(parts))
+
+    def _ensure_timing_tick(self):
+        if self._timing_after_id is not None:
+            return
+        self._timing_after_id = self.after(100, self._tick_load_timing)
+
+    def _tick_load_timing(self):
+        self._timing_after_id = None
+        self._update_load_timing()
+        if self._folder_time_start is None and self._thumb_time_start is None:
+            return
+        self._ensure_timing_tick()
+
+    def _stop_timing_tick(self):
+        if self._timing_after_id is not None:
+            try:
+                self.after_cancel(self._timing_after_id)
+            except Exception:
+                pass
+            self._timing_after_id = None
+
+    def _reset_load_timing(self):
+        self._stop_timing_tick()
+        self._folder_time_start = None
+        self._folder_time_final = None
+        self._thumb_time_start = None
+        self._thumb_time_final = None
+        self._folder_scan_active = False
+        self._load_cycle_active = False
+        self.lbl_load_timing.configure(text="")
 
     def _handle_select_all(self):
         if self.on_select_all:
@@ -274,6 +464,22 @@ class ThumbnailList(ctk.CTkFrame):
                     count += 1
         return count
 
+    @staticmethod
+    def _row_signature(items: List[ImageItem]):
+        """Identity of what each grid row renders, for the soft-refresh check.
+
+        Comparing only the primary path is not enough: a rescan can keep the same
+        primary path while the stack composition changes (the JPG of an ARW+JPG
+        pair is deleted, or a RAW appears next to a lone JPG). The row height,
+        the filename label and the extra stacked thumbnails all depend on the
+        stack, so a changed signature must rebuild the rows instead of reusing
+        the existing buttons.
+        """
+        return [
+            (str(item.path), tuple(str(p) for p in item.stacked_paths), item.filename)
+            for item in items
+        ]
+
     def update_items(self, items: List[ImageItem], selected_idx: int = 0, white_balance: str = "camera"):
         log_debug(f"ThumbnailList.update_items: updating {len(items)} items, selected_idx={selected_idx}")
         self.lbl_title.configure(text=f"Images ({len(items)})")
@@ -282,8 +488,8 @@ class ThumbnailList(ctk.CTkFrame):
         current_load_id = self._load_id
         self._current_load_id = current_load_id
 
-        new_paths = [str(it.path) for it in items]
-        if hasattr(self, "_current_item_paths") and self._current_item_paths == new_paths:
+        new_signature = self._row_signature(items)
+        if hasattr(self, "_current_item_signature") and self._current_item_signature == new_signature:
             self._pending_items = list(items)
             self._pending_selected_idx = selected_idx
             self._pending_white_balance = white_balance
@@ -294,6 +500,7 @@ class ThumbnailList(ctk.CTkFrame):
             self._total_thumbs = self._count_thumb_requests(items)
             self.progress_bar.set(self._loaded_thumbs / max(1, self._total_thumbs))
             self.lbl_progress_text.configure(text=f"{self._loaded_thumbs} / {self._total_thumbs}")
+            self.start_thumb_timing()
 
             prev_selected = getattr(self, "_prev_selected_indices", set())
             prev_act = getattr(self, "_prev_active_idx", -1)
@@ -341,7 +548,7 @@ class ThumbnailList(ctk.CTkFrame):
             self._update_progress_ui()
             return
 
-        self._current_item_paths = new_paths
+        self._current_item_signature = new_signature
 
         if self._batch_after_id is not None:
             try:
@@ -367,6 +574,8 @@ class ThumbnailList(ctk.CTkFrame):
         self.progress_bar.set(0.0)
         self.lbl_progress_text.configure(text="")
 
+        self.start_thumb_timing(reset=True)
+
         self._pending_items = list(items)
         self._pending_selected_idx = selected_idx
         self._pending_white_balance = white_balance
@@ -374,6 +583,8 @@ class ThumbnailList(ctk.CTkFrame):
         if not items:
             self._total_thumbs = 0
             self.progress_bar.set(0.0)
+            self.lbl_progress_text.configure(text="0 / 0")
+            self.finish_load_timing()
             return
 
         self._total_thumbs = 0
@@ -564,13 +775,7 @@ class ThumbnailList(ctk.CTkFrame):
 
         if self._loaded_thumbs >= self._total_thumbs and self._batch_index >= len(self._pending_items):
             self.progress_bar.set(1.0)
-            self.lbl_progress_text.configure(text="Done")
-            self.after(800, self._hide_progress_bar)
-
-    def _hide_progress_bar(self):
-        if self._loaded_thumbs >= self._total_thumbs and self._batch_index >= len(self._pending_items):
-            self.progress_bar.set(0.0)
-            self.lbl_progress_text.configure(text="")
+            self.freeze_load_timing()
 
     def _load_single_thumb_async(self, file_path: Path, max_size: Tuple[int, int], white_balance: str, load_id: int):
         path_str = str(file_path)
@@ -613,4 +818,5 @@ class ThumbnailList(ctk.CTkFrame):
             self._batch_after_id = None
         if hasattr(self, "_executor"):
             self._executor.shutdown(wait=False, cancel_futures=True)
+        self._reset_load_timing()
         super().destroy()

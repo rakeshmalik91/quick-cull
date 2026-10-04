@@ -202,6 +202,68 @@ def _load_tab_directory(tab, show_progress=True):
 
 **No `ProgressDialog` is shown for directory loading.** The old modal progress dialog has been removed entirely. Progress is shown only in the thumbnail list's bottom bar.
 
+### Bottom Progress Bar Layout
+
+`ThumbnailList.progress_frame` is a fixed 36px transparent frame holding two rows:
+
+```python
+self.progress_frame                     # height=36, pack_propagate(False)
+  ├── lbl_load_timing                   # height=16, "Folder: 4.2s   |   Thumbs: 1.8s"
+  └── progress_row                      # height=20, grid_columnconfigure(1, weight=1)
+        ├── (0,0) lbl_progress_text     # "12 / 109", then "109 / 109"
+        └── (0,1) progress_bar          # sticky="ew"
+```
+
+The count/bar row uses `grid` (not `pack`): a `CTkLabel` requests a 28px natural height, which exhausted the 20px row cavity under `pack` and left the bar mispositioned. With `grid`, both children share the row and `CTkProgressBar` centers its own bar vertically.
+
+### Folder & Thumbnail Load Timing
+
+Two independent timers are displayed **above** the progress bar and **stay on screen permanently** after the load finishes (the bar no longer auto-hides; there is no "Done" text):
+
+| Timer | Start | Freeze | Reset |
+|---|---|---|---|
+| Folder | `start_load_timing(started_at)` from `gui.py` `_load_directory()` / `_load_tab_directory()` | `finish_folder_timing()` in `_on_scan_complete()` / `_on_tab_scan_complete()` | `start_load_timing()` (per load cycle) |
+| Thumbs | `start_thumb_timing()` from `ThumbnailList.update_items()` | `freeze_load_timing()` when `_update_progress_ui()` sees all thumbs loaded | `start_thumb_timing(reset=True)` when the item path set changes mid-load |
+
+- A 100ms `after()` tick (`_tick_load_timing`) refreshes `lbl_load_timing` while a cycle is active; `_stop_timing_tick()` ends the tick once the timers are frozen.
+- Elapsed values are frozen into `_folder_time_final` / `_thumb_time_final` at their end, so the label keeps showing the **total** duration rather than a running count.
+- `freeze_load_timing()` deliberately leaves `_folder_scan_active` alone: the scan can still be running when the thumbnails finish, and `finish_folder_timing()` corrects the value afterwards. `finish_load_timing()` (scan error, empty folder) freezes both.
+- `_folder_scan_active` / `_load_cycle_active` gate the freeze and thumb-start calls, so a later filter change or tab switch keeps the totals of the load that produced the current items instead of restarting the clock.
+- An empty folder result shows `0 / 0` and the frozen folder time; `_reset_load_timing()` runs only from `destroy()`.
+
+### Per-Tab Load Stats
+
+Stats belong to the **tab**, not to the thumbnail list, which is a single shared widget. Each tab dict carries:
+
+```python
+tab["load_stats"] = {"folder": Optional[float], "thumb": Optional[float]}
+```
+
+Writers and readers:
+
+| Producer | Detail |
+|---|---|
+| Scan worker (`_load_tab_directory` / `_load_directory`) | Stores the wall-clock `scan_directory()` duration in `tab["load_stats"]["folder"]` for **every** tab, including background ones that never became active |
+| `on_load_stats_changed` callback (`gui.py: _on_load_stats_changed`) | `ThumbnailList` reports `{"folder", "thumb"}` whenever a timer resets or freezes; `gui.py` writes it into `_get_active_tab()` |
+| `_apply_tab_state()` | Calls `show_load_stats(folder, thumb)` **before** `update_items()`, then `begin_thumb_timing()` if the tab has no saved thumb time yet |
+
+Ordering matters: `show_load_stats()` deactivates the load cycle before any widget rebuild runs. If `update_items()` ran first, a still-running cycle from the previous tab would restart its thumb timer and emit that stale folder time into the newly active tab.
+
+`show_load_stats()` restores frozen values only — it never starts a timer and never emits, so re-rendering a tab's thumbnails (`_ctk_img_cache` is cleared on every path-set change, so tab switches re-decode) cannot overwrite the totals it just restored.
+
+### Automatic Folder Reload
+
+`culler/folder_watcher.py` polls each loaded tab's folder in a background thread (`FolderWatcher`, one daemon thread, 1.5s interval, 0.5s settle, 2s write grace) and reloads the owning tab when photos are added, removed, or modified on disk.
+
+- **Polling, not watchdog.** No third-party dependency. One `os.scandir` per watched folder per interval, restricted to `ImageLoader.is_supported` files in the root.
+- **`os.stat`, not `DirEntry.stat()`.** On Windows `os.scandir` reports a stale size for a file that is still being written, so a growing RAW looked "stable" and got reported mid-copy. Verified: `entry.stat().st_size` lagged one write behind `os.stat()`.
+- **Two guards against double reporting.** A change must be identical across a full poll cycle *and* have a settled mtime. Windows refreshes mtime only when the last handle closes, so mid-write detection comes from `st_size` growth while the grace absorbs the close-time bump.
+- **Explicit lifecycle.** `FolderWatcher.start()` launches the thread, `stop()` joins it (`gui.py: _on_close`). `watch()` alone never starts it, which keeps tests deterministic via `poll_now()`.
+- **Thread marshalling.** Callbacks run on the watcher thread; `_watch_tab_directory()` wraps them in `self.after(0, ...)` so Tk is only touched from the GUI thread.
+- **Watches are per folder, not per tab.** `_close_tab` unwatches only when no remaining tab uses the same directory; `_unwatch_tab_directory()` drops the previous folder when a tab is re-pointed elsewhere.
+- **Self-inflicted changes are suppressed.** The app mutates the scanned folder in five places: move picked/rejected, batch move, trash, EXIF rating write-back (`-overwrite_original`), and JPG conversion. Each calls `_suppress_folder_watch()`, which adopts on-disk changes silently instead of reloading on top of the reload the app already performs. `suppress()` can only extend a window; `resync()` adopts the current state *and* clears it.
+- **Ignore non-image churn.** `culling_manifest.json`, `.txt` files, and the app's `_SELECTED` / `_REJECTED` / `_Trash` subfolders never affect the non-recursive scan, so they never trigger a reload.
+
 ### Per-Tab Progress Isolation
 
 `_sync_loading_progress()` reads from the **active tab only**:
@@ -255,12 +317,12 @@ This triggers the **soft refresh path** because the paths are the same as what `
 
 ### Soft Refresh (No Widget Rebuild)
 
-`ThumbnailList.update_items()` detects when the same paths are passed again:
+`ThumbnailList.update_items()` detects when the same rows are passed again:
 
 ```python
 # culler/gui/thumbnail_list.py: update_items()
-new_paths = [str(it.path) for it in items]
-if hasattr(self, "_current_item_paths") and self._current_item_paths == new_paths:
+new_signature = self._row_signature(items)
+if hasattr(self, "_current_item_signature") and self._current_item_signature == new_signature:
     # Soft refresh: keep widgets, just submit new thumbnail loads
     self._batch_raw_requests.clear()
     self._batch_other_requests.clear()
@@ -275,7 +337,16 @@ This avoids the expensive `widget.destroy()` + re-create cycle. The flow is:
 
 1. Placeholder preload → widgets created with placeholder images
 2. Scan completes → `_on_filter_changed()` → `update_items(real_items)` 
-3. Paths match → soft refresh: placeholders stay in place, real thumbnails load async and replace them
+3. Row signature matches → soft refresh: placeholders stay in place, real thumbnails load async and replace them
+
+**The comparison must include stack composition, not just the primary path.** A rescan
+after deleting the JPG of an ARW+JPG pair keeps the same primary path (`ALPHA.ARW`) but
+the item is no longer stacked, so the row height, the `ALPHA [Stacked: 1 ARW, 1 JPG]`
+label, and the second thumbnail all have to change. `_row_signature()` returns
+`(primary path, stacked paths, filename)` per item; `filename` already encodes the stack
+label, so a changed stack forces a full rebuild. Flag/rating edits deliberately stay out
+of the signature because the soft path already refreshes those via
+`update_single_item_status()`.
 
 ### Stale Update Prevention (`_load_id`)
 
@@ -350,7 +421,7 @@ class ImageLoader:
 class ThumbnailList:
     _ctk_img_cache: Dict[str, ctk.CTkImage]
     _load_id: int                          # Incremented per update_items() to prevent stale updates
-    _current_item_paths: List[str]         # Tracks displayed paths for soft refresh
+    _current_item_signature            # Row identity for soft refresh (path + stack + filename)
     def update_items()                      # Soft refresh when paths match, full rebuild otherwise
     def _load_single_thumb_async(load_id)   # ThreadPoolExecutor(max_workers=4) with stale-guard
     def _update_btn_image(load_id)          # PIL → CTkImage conversion, guarded by load_id

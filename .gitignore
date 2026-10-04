@@ -4,8 +4,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
-.vscode/
-.idea/
+.vscode
+.idea
+.kilo
 *.log
 culler_debug.log
 cull_manifest.json
@@ -26,3 +27,10 @@ yolo*.pt
 
 build/
 dist/
+
+/tmp
+/temp
+/_tmp
+/_temp
+/*.log
+/*.tmp

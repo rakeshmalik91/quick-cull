@@ -7,6 +7,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="keras.*")
 warnings.filterwarnings("ignore", message=".*np\\.object.*", category=FutureWarning)
 
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog as fd, messagebox as mb, simpledialog
 from pathlib import Path
@@ -27,6 +28,7 @@ except Exception:
 from culler.culler_engine import CullingSession, ImageItem, FlagState, resolve_input_path, find_item_index_by_path
 from culler.db_manager import DatabaseManager
 from culler.dataset_exporter import save_annotation, save_manual_annotation
+from culler.folder_watcher import FolderWatcher, FolderChange
 from culler.image_loader import ImageLoader
 from culler.ml_trainer import train_custom_yolo
 from culler.paths import DATASET_DIR
@@ -184,6 +186,7 @@ class ImageCullerApp(ctk.CTk):
             "loading": False,
             "load_total": 0,
             "load_current": 0,
+            "load_stats": {"folder": None, "thumb": None},
             "pending_target_image": target_image,
         }
 
@@ -390,9 +393,18 @@ class ImageCullerApp(ctk.CTk):
 
         tab = self.tabs[index]
         session = tab["session"]
+        closed_dir = str(session.directory) if session and session.directory else None
 
         self.tab_bar.remove_tab(index)
         self.tabs.pop(index)
+
+        if closed_dir:
+            still_open = any(
+                t.get("session") and t["session"].directory and str(t["session"].directory) == closed_dir
+                for t in self.tabs
+            )
+            if not still_open:
+                self.folder_watcher.unwatch(closed_dir)
 
         if self.active_tab_index == index:
             new_idx = min(index, len(self.tabs) - 1)
@@ -442,8 +454,14 @@ class ImageCullerApp(ctk.CTk):
             self.db.get_rejected_folder()
         )
 
+        load_stats = tab.get("load_stats") or {}
+        self.thumb_list.show_load_stats(load_stats.get("folder"), load_stats.get("thumb"))
+
         white_balance = self.toolbar.get_white_balance()
         self.thumb_list.update_items(self.current_items, selected_idx=self.current_index, white_balance=white_balance)
+
+        if self.current_items and load_stats.get("thumb") is None:
+            self.thumb_list.begin_thumb_timing()
 
         if self.current_items and 0 <= self.current_index < len(self.current_items):
             self._select_image(self.current_index, from_click=False)
@@ -453,16 +471,97 @@ class ImageCullerApp(ctk.CTk):
 
         self._update_status(f"Tab: {tab['tab_label']} | {len(self.current_items)} photos loaded")
 
+    def _unwatch_tab_directory(self, tab: Dict[str, Any], new_directory=None):
+        """Stop watching a tab's previous folder once it points somewhere else."""
+        session = tab.get("session")
+        previous = session.directory if session else None
+        if not previous:
+            return
+        if new_directory is not None:
+            try:
+                if Path(previous) == Path(new_directory):
+                    return
+            except (TypeError, ValueError):
+                return
+        previous_str = str(previous)
+        still_open = any(
+            t is not tab and t.get("session") and t["session"].directory
+            and str(t["session"].directory) == previous_str
+            for t in self.tabs
+        )
+        if not still_open:
+            self.folder_watcher.unwatch(previous_str)
+
+    def _watch_tab_directory(self, tab: Dict[str, Any]):
+        """Watch a loaded tab's folder so external edits trigger a reload."""
+        session = tab.get("session")
+        directory = session.directory if session else None
+        if not directory or not directory.exists():
+            return
+        try:
+            self.folder_watcher.watch(
+                directory,
+                lambda change, owner=tab: self.after(
+                    0, lambda ch=change, own=owner: self._on_folder_changed(own, ch)
+                ),
+            )
+        except Exception:
+            log_error("Failed to watch directory for changes", exc_info=True)
+
+    def _on_folder_changed(self, tab: Dict[str, Any], change: FolderChange):
+        """Reload a tab whose folder changed on disk outside the app."""
+        if tab not in self.tabs:
+            self.folder_watcher.unwatch(change.directory)
+            return
+
+        current_dir = tab.get("directory")
+        if not current_dir or Path(current_dir) != change.directory:
+            self.folder_watcher.unwatch(change.directory)
+            return
+
+        if tab.get("loading"):
+            self.folder_watcher.resync(change.directory)
+            return
+
+        self._update_status(f"Folder changed ({change.summary()}), reloading...")
+
+        if tab is self._get_active_tab():
+            self._load_directory(str(tab["directory"]))
+        else:
+            self._load_tab_directory(tab, show_progress=False)
+
+    def _suppress_folder_watch(self, directory, seconds: Optional[float] = None):
+        """Keep the app's own writes to a folder from triggering a redundant reload."""
+        if not directory:
+            return
+        try:
+            self.folder_watcher.suppress(directory, seconds)
+        except Exception:
+            log_error("Failed to suppress folder watch", exc_info=True)
+
+    def _on_load_stats_changed(self, stats: Dict[str, Optional[float]]):
+        """Persist the thumbnail list's timing totals onto the active tab."""
+        tab = self._get_active_tab()
+        if tab is None:
+            return
+        tab["load_stats"] = {"folder": stats.get("folder"), "thumb": stats.get("thumb")}
+
     def _load_tab_directory(self, tab: Dict[str, Any], show_progress: bool = True):
         directory = tab["directory"]
         if not directory or not os.path.exists(directory):
             return
 
+        self._unwatch_tab_directory(tab, directory)
+
         tab["loading"] = True
         tab["load_total"] = 0
         tab["load_current"] = 0
         tab["_placeholders_loaded"] = False
+        tab["_load_started_at"] = time.monotonic()
         self._update_tab_loading_indicator(tab)
+
+        if tab is self._get_active_tab():
+            self.thumb_list.start_load_timing(tab["_load_started_at"])
 
         white_balance = self.toolbar.get_white_balance()
 
@@ -476,16 +575,19 @@ class ImageCullerApp(ctk.CTk):
                 self.after(0, self._sync_loading_progress)
 
         def worker():
+            started_at = time.monotonic()
             try:
                 tab["session"].scan_directory(
                     directory,
                     stack_raw_jpg=True,
                     progress_callback=on_progress
                 )
+                tab["load_stats"]["folder"] = time.monotonic() - started_at
                 tab["is_loaded"] = True
                 tab["loading"] = False
                 self.after(0, lambda: self._on_tab_scan_complete(tab))
             except Exception as e:
+                tab["load_stats"]["folder"] = time.monotonic() - started_at
                 tab["loading"] = False
                 self.after(0, lambda err=e: self._on_tab_scan_error(tab, err))
 
@@ -518,6 +620,7 @@ class ImageCullerApp(ctk.CTk):
 
     def _on_tab_scan_complete(self, tab: Dict[str, Any]):
         self._update_tab_loading_indicator(tab)
+        self._watch_tab_directory(tab)
 
         session = tab["session"]
         self._apply_tab_filter_values(tab)
@@ -525,6 +628,7 @@ class ImageCullerApp(ctk.CTk):
         if tab is not self._get_active_tab():
             return
 
+        self.thumb_list.finish_folder_timing()
         self.thumb_list.progress_bar.set(0.0)
         self.thumb_list.lbl_progress_text.configure(text="")
 
@@ -542,6 +646,7 @@ class ImageCullerApp(ctk.CTk):
 
     def _on_tab_scan_error(self, tab: Dict[str, Any], err: Exception):
         self._update_tab_loading_indicator(tab)
+        self.thumb_list.finish_load_timing()
         self._update_status("Error loading directory.")
 
     def _sync_loading_progress(self):
@@ -686,6 +791,10 @@ class ImageCullerApp(ctk.CTk):
         )
         self.toolbar.pack(side="top", fill="x", padx=5, pady=5)
 
+        # Detects photos added/removed/edited on disk and reloads the owning tab
+        self.folder_watcher = FolderWatcher()
+        self.folder_watcher.start()
+
         # Main Container
         self.main_container = ctk.CTkFrame(self, corner_radius=0)
         self.main_container.pack(side="top", fill="both", expand=True, padx=5, pady=2)
@@ -695,7 +804,8 @@ class ImageCullerApp(ctk.CTk):
             self.main_container,
             on_select_image=self._select_image,
             on_select_all=self._select_all,
-            on_select_none=self._select_none
+            on_select_none=self._select_none,
+            on_load_stats_changed=self._on_load_stats_changed
         )
         self.thumb_list.pack(side="left", fill="y", padx=3, pady=3)
 
@@ -831,6 +941,11 @@ class ImageCullerApp(ctk.CTk):
 
     def _on_close(self):
         try:
+            self.folder_watcher.stop()
+        except Exception:
+            pass
+
+        try:
             import glob
             import os
             for f in glob.glob("yolo*.pt"):
@@ -888,6 +1003,7 @@ class ImageCullerApp(ctk.CTk):
             return
 
         self.db.set_setting("last_directory", str(folder_path))
+        self._unwatch_tab_directory(tab, folder_path)
         tab["directory"] = str(Path(folder_path).resolve())
         tab["tab_label"] = os.path.basename(folder_path) or folder_path
         tab["is_loaded"] = False
@@ -904,9 +1020,11 @@ class ImageCullerApp(ctk.CTk):
         tab["load_total"] = 0
         tab["load_current"] = 0
         tab["pending_target_image"] = target_image
+        tab["_load_started_at"] = time.monotonic()
 
         self.tab_bar.set_label(self.active_tab_index, tab["tab_label"] + " ⟳")
         self._update_status(f"Scanning directory: {folder_path}...")
+        self.thumb_list.start_load_timing(tab["_load_started_at"])
 
         def on_progress(current: int, total: int, filename: str = ""):
             tab["load_current"] = current
@@ -915,16 +1033,19 @@ class ImageCullerApp(ctk.CTk):
                 self.after(0, self._sync_loading_progress)
 
         def worker():
+            started_at = time.monotonic()
             try:
                 tab["session"].scan_directory(
                     folder_path,
                     stack_raw_jpg=True,
                     progress_callback=on_progress
                 )
+                tab["load_stats"]["folder"] = time.monotonic() - started_at
                 tab["is_loaded"] = True
                 tab["loading"] = False
                 self.after(0, lambda: self._on_scan_complete(tab))
             except Exception as e:
+                tab["load_stats"]["folder"] = time.monotonic() - started_at
                 tab["loading"] = False
                 self.after(0, lambda err=e: self._on_scan_error(tab, err))
 
@@ -932,10 +1053,12 @@ class ImageCullerApp(ctk.CTk):
 
     def _on_scan_complete(self, tab: Dict[str, Any]):
         self._update_tab_loading_indicator(tab)
+        self._watch_tab_directory(tab)
 
         if tab is not self._get_active_tab():
             return
 
+        self.thumb_list.finish_folder_timing()
         self.thumb_list.progress_bar.set(0.0)
         self.thumb_list.lbl_progress_text.configure(text="")
 
@@ -956,6 +1079,7 @@ class ImageCullerApp(ctk.CTk):
 
     def _on_scan_error(self, tab: Dict[str, Any], err: Exception):
         self._update_tab_loading_indicator(tab)
+        self.thumb_list.finish_load_timing()
         self._update_status("Error loading directory.")
 
     def _on_filter_changed(self, trigger_source: str = "filter"):
@@ -1389,6 +1513,7 @@ class ImageCullerApp(ctk.CTk):
             return
 
         moved_count = session.move_specific_files_to_trash(items, paths)
+        self.folder_watcher.resync(session.directory)
         self._update_status(f"Moved {moved_count} file(s) to Recycle Bin / Trash.")
         self._on_filter_changed()
 
@@ -2056,6 +2181,7 @@ class ImageCullerApp(ctk.CTk):
                 self._update_status(f"Saved JPG to {res_path.name}")
                 tab = self._get_active_tab()
                 if tab and tab["session"].directory:
+                    self._suppress_folder_watch(tab["session"].directory)
                     self._load_directory(str(tab["session"].directory))
         else:
             mb.showerror("Convert to JPG Failed", f"Failed to convert image: {reason}")
@@ -2067,6 +2193,7 @@ class ImageCullerApp(ctk.CTk):
         self._update_status(f"Converted {success_count} selected photos to JPG.")
         tab = self._get_active_tab()
         if tab and tab["session"].directory:
+            self._suppress_folder_watch(tab["session"].directory)
             self._load_directory(str(tab["session"].directory))
 
     def _on_set_jpg_folder(self):
@@ -2120,6 +2247,7 @@ class ImageCullerApp(ctk.CTk):
             try:
                 moved = session.move_items_by_flag(FlagState.PICK, folder_name)
                 mb.showinfo("Move Picked Complete", f"Successfully moved {len(moved)} PICK files into '{folder_name}'.")
+                self._suppress_folder_watch(session.directory)
                 self._load_directory(str(session.directory))
             except Exception as e:
                 mb.showerror("Move Error", f"Failed to move picked files: {e}")
@@ -2140,6 +2268,7 @@ class ImageCullerApp(ctk.CTk):
             try:
                 moved = session.move_items_by_flag(FlagState.REJECT, folder_name)
                 mb.showinfo("Move Rejected Complete", f"Successfully moved {len(moved)} REJECT files into '{folder_name}'.")
+                self._suppress_folder_watch(session.directory)
                 self._load_directory(str(session.directory))
             except Exception as e:
                 mb.showerror("Move Error", f"Failed to move rejected files: {e}")
@@ -2206,6 +2335,7 @@ class ImageCullerApp(ctk.CTk):
             try:
                 moved = session.move_items_by_flag(flag, folder_name)
                 mb.showinfo("Batch Move Complete", f"Moved {len(moved)} files into subfolder '{folder_name}'.")
+                self._suppress_folder_watch(session.directory)
                 self._load_directory(str(session.directory))
             except Exception as e:
                 mb.showerror("Batch Move Error", f"Failed to move files: {e}")
@@ -2230,6 +2360,7 @@ class ImageCullerApp(ctk.CTk):
 
         self._update_status("Syncing star ratings to EXIF metadata...")
         self.viewer.show_loading("Syncing Star Ratings to EXIF...")
+        self._suppress_folder_watch(session.directory, FolderWatcher.EXIF_SYNC_SUPPRESS_SECONDS)
 
         def worker():
             count = session.sync_exif_ratings()
@@ -2239,6 +2370,9 @@ class ImageCullerApp(ctk.CTk):
 
     def _on_sync_complete(self, count: int):
         self.viewer.hide_loading()
+        session = self._get_active_session()
+        if session and session.directory:
+            self.folder_watcher.resync(session.directory)
         mb.showinfo("Sync Complete", f"Successfully synced star ratings to EXIF metadata for {count} files.")
         self._update_status(f"Synced EXIF ratings for {count} files.")
 
