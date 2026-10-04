@@ -1,12 +1,14 @@
+import os
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Callable, Optional, Dict, Tuple, Set
+from typing import Callable, Deque, Dict, List, Optional, Set, Tuple, Union
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 
-from ..culler_engine import ImageItem, FlagState
+from ..culler_engine import ImageItem, FlagState, CullingSession
 from ..image_loader import ImageLoader
 from ..logger import log_debug, log_error
 
@@ -19,6 +21,9 @@ class ThumbnailList(ctk.CTkFrame):
     """
 
     BATCH_SIZE = 20
+    #: Wall-clock budget for one UI-thread row batch. Bounds the longest
+    #: uninterrupted stretch of Tk work during a tab switch.
+    ROW_BUILD_BUDGET_MS = 30
 
     def __init__(
         self,
@@ -38,12 +43,25 @@ class ThumbnailList(ctk.CTkFrame):
         self.on_select_none = on_select_none
         self.on_load_stats_changed = on_load_stats_changed
         self.image_loader = image_loader
-        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._executor = ThreadPoolExecutor(
+            max_workers=min(8, max(2, (os.cpu_count() or 4) // 2)),
+            thread_name_prefix="thumb",
+        )
 
         self._btn_map: Dict[str, ctk.CTkButton] = {}
         self._row_frame_map: Dict[int, ctk.CTkFrame] = {}
         self._indicator_map: Dict[int, ctk.CTkFrame] = {}
         self._label_map: Dict[int, Union[ctk.CTkLabel, ctk.CTkButton]] = {}
+        self._row_render_cache: Dict[int, Tuple[str, str]] = {}
+        # Decoded thumbnails land here from the worker threads; one UI tick drains
+        # the whole queue. Previously every thumbnail scheduled its own after(0),
+        # so a folder load queued one Tk task per photo.
+        self._thumb_result_queue: Deque[Tuple[str, Image.Image, int]] = deque()
+        self._thumb_result_after_id: Optional[str] = None
+        # path_str -> load_id of the request currently in flight. Without this, every
+        # soft refresh (switching away and back mid-load) re-queued work already in
+        # progress, so a folder load submitted each decode several times over.
+        self._inflight_thumbs: Dict[str, int] = {}
         self._checkbox_map: Dict[int, ctk.CTkCheckBox] = {}
         self._ctk_img_cache: Dict[str, ctk.CTkImage] = {}
 
@@ -54,6 +72,11 @@ class ThumbnailList(ctk.CTkFrame):
         self._total_thumbs: int = 0
         self._loaded_thumbs: int = 0
         self._load_id: int = 0
+        self._batch_index: int = 0
+        self._batch_selected_idx: int = 0
+        self._batch_white_balance: str = "camera"
+        self._batch_raw_requests: List[Tuple[Path, Tuple[int, int], str]] = []
+        self._batch_other_requests: List[Tuple[Path, Tuple[int, int], str]] = []
 
         self._folder_time_start: Optional[float] = None
         self._folder_time_final: Optional[float] = None
@@ -418,24 +441,41 @@ class ThumbnailList(ctk.CTkFrame):
         """
         Updates ONLY the flag indicator bar and star rating text for a single row
         without destroying or re-creating widgets (0ms, zero flickering!).
+
+        Widget updates are skipped when the rendered values are unchanged: a soft
+        refresh walks every row, and re-configuring 200 identical labels was the
+        single largest cost of switching tabs.
         """
         flag_color = "#2b9348" if item.flag == FlagState.PICK else (
             "#d90429" if item.flag == FlagState.REJECT else "#4a4e69"
         )
-        if idx in self._indicator_map:
-            self._indicator_map[idx].configure(fg_color=flag_color)
+        cached = self._row_render_cache.get(idx)
+        if cached is None or cached[0] != flag_color:
+            if idx in self._indicator_map:
+                self._indicator_map[idx].configure(fg_color=flag_color)
 
         stars = "★" * item.rating if item.rating > 0 else ""
+        text = None
 
-        if idx in self._label_map:
-            widget = self._label_map[idx]
+        widget = self._label_map.get(idx)
+        if widget is not None:
             if isinstance(widget, ctk.CTkLabel):
-                from ..culler_engine import CullingSession
                 primary_p = item.stacked_paths[0]
                 base_stem = CullingSession.extract_base_stem(primary_p.stem)
-                widget.configure(text=f"{base_stem.upper()} [{item.format_name}] {stars}")
+                text = f"{base_stem.upper()} [{item.format_name}] {stars}"
             elif isinstance(widget, ctk.CTkButton):
-                widget.configure(text=f"{item.filename}\n{stars}")
+                text = f"{item.filename}\n{stars}"
+            if text is not None and (cached is None or cached[1] != text):
+                widget.configure(text=text)
+
+        self._row_render_cache[idx] = (flag_color, text)
+
+    def _invalidate_row_render_cache(self, idx: Optional[int] = None):
+        """Forget cached render state so the next status update re-applies it."""
+        if idx is None:
+            self._row_render_cache.clear()
+        else:
+            self._row_render_cache.pop(idx, None)
 
     def _create_placeholder_image(self, size=(70, 70)) -> Image.Image:
         img = Image.new("RGB", size, color="#222222")
@@ -464,6 +504,20 @@ class ThumbnailList(ctk.CTkFrame):
                     count += 1
         return count
 
+    def _cancel_batch_chain(self):
+        """Stop any in-flight row batch and drop results queued for an older load.
+
+        Without this, switching tabs repeatedly left several batch chains running;
+        each one built rows for an item set that was no longer displayed.
+        """
+        if self._batch_after_id is not None:
+            try:
+                self.after_cancel(self._batch_after_id)
+            except Exception:
+                pass
+            self._batch_after_id = None
+        self._thumb_result_queue.clear()
+
     @staticmethod
     def _row_signature(items: List[ImageItem]):
         """Identity of what each grid row renders, for the soft-refresh check.
@@ -490,16 +544,15 @@ class ThumbnailList(ctk.CTkFrame):
 
         new_signature = self._row_signature(items)
         if hasattr(self, "_current_item_signature") and self._current_item_signature == new_signature:
+            self._cancel_batch_chain()
             self._pending_items = list(items)
             self._pending_selected_idx = selected_idx
             self._pending_white_balance = white_balance
             self._batch_raw_requests.clear()
             self._batch_other_requests.clear()
             self._batch_index = len(items)
-            self._loaded_thumbs = self._count_cached_thumb_requests(items)
-            self._total_thumbs = self._count_thumb_requests(items)
-            self.progress_bar.set(self._loaded_thumbs / max(1, self._total_thumbs))
-            self.lbl_progress_text.configure(text=f"{self._loaded_thumbs} / {self._total_thumbs}")
+            cached_count = self._count_cached_thumb_requests(items)
+            self._loaded_thumbs = cached_count
             self.start_thumb_timing()
 
             prev_selected = getattr(self, "_prev_selected_indices", set())
@@ -527,6 +580,8 @@ class ThumbnailList(ctk.CTkFrame):
                         ext = sub_p.suffix.lower()
                         if self.image_loader and str(sub_p) not in self._ctk_img_cache:
                             req = (sub_p, (90, 90), white_balance)
+                            if self._is_thumb_pending(str(sub_p), current_load_id):
+                                continue
                             if ext == ".arw":
                                 self._batch_raw_requests.append(req)
                             else:
@@ -535,6 +590,8 @@ class ThumbnailList(ctk.CTkFrame):
                     ext = item.path.suffix.lower()
                     if self.image_loader and str(item.path) not in self._ctk_img_cache:
                         req = (item.path, (80, 80), white_balance)
+                        if self._is_thumb_pending(str(item.path), current_load_id):
+                            continue
                         if ext == ".arw":
                             self._batch_raw_requests.append(req)
                         else:
@@ -544,25 +601,26 @@ class ThumbnailList(ctk.CTkFrame):
                     self._load_single_thumb_async(path, size, wb, current_load_id)
                 for path, size, wb in self._batch_other_requests:
                     self._load_single_thumb_async(path, size, wb, current_load_id)
+
+            self._total_thumbs = (cached_count
+                                  + len(self._batch_raw_requests)
+                                  + len(self._batch_other_requests))
             self._current_load_id = current_load_id
             self._update_progress_ui()
             return
 
         self._current_item_signature = new_signature
 
-        if self._batch_after_id is not None:
-            try:
-                self.after_cancel(self._batch_after_id)
-            except Exception:
-                pass
-            self._batch_after_id = None
+        self._cancel_batch_chain()
 
         self._btn_map.clear()
         self._row_frame_map.clear()
         self._indicator_map.clear()
         self._label_map.clear()
         self._checkbox_map.clear()
+        self._invalidate_row_render_cache()
         self._ctk_img_cache.clear()
+        self._inflight_thumbs.clear()
         self._prev_selected_indices = set()
         self._prev_active_idx = -1
         self._prev_active_path_str = None
@@ -605,8 +663,9 @@ class ThumbnailList(ctk.CTkFrame):
         self._batch_index = 0
         self._batch_selected_idx = selected_idx
         self._batch_white_balance = white_balance
-        self._batch_raw_requests: List[Tuple[Path, Tuple[int, int], str]] = []
-        self._batch_other_requests: List[Tuple[Path, Tuple[int, int], str]] = []
+        # Rebuilt for every load cycle; also cleared by the soft-refresh path.
+        self._batch_raw_requests = []
+        self._batch_other_requests = []
 
         self._process_next_batch(current_load_id)
 
@@ -617,6 +676,12 @@ class ThumbnailList(ctk.CTkFrame):
         end = min(start + self.BATCH_SIZE, len(items))
         selected_idx = self._batch_selected_idx
         white_balance = self._batch_white_balance
+
+        # Row construction costs ~10 ms per row, so a fixed 20-row batch blocked the
+        # UI for ~200 ms per tick and a full rebuild for seconds. Build until the time
+        # budget is spent, then yield, so a tab switch never freezes the app.
+        deadline = time.perf_counter() + (self.ROW_BUILD_BUDGET_MS / 1000.0)
+        built = 0
 
         for idx in range(start, end):
             item = items[idx]
@@ -678,6 +743,7 @@ class ThumbnailList(ctk.CTkFrame):
                 )
                 lbl_name.pack(side="left")
                 self._label_map[idx] = lbl_name
+                self._row_render_cache[idx] = (flag_color, f"{base_stem.upper()} [{item.format_name}] {stars}")
 
                 thumb_scroll = ctk.CTkScrollableFrame(
                     row_frame,
@@ -740,6 +806,7 @@ class ThumbnailList(ctk.CTkFrame):
                 btn.pack(side="left", fill="both", expand=True, padx=2, pady=1)
                 self._btn_map[str(item.path)] = btn
                 self._label_map[idx] = btn
+                self._row_render_cache[idx] = (flag_color, f"{item.filename}\n{stars}")
 
                 if self.image_loader and str(item.path) not in self._ctk_img_cache:
                     req = (item.path, (80, 80), white_balance)
@@ -748,6 +815,14 @@ class ThumbnailList(ctk.CTkFrame):
                         self._batch_raw_requests.append(req)
                     else:
                         self._batch_other_requests.append(req)
+
+        built += 1
+        if built >= 1 and time.perf_counter() >= deadline:
+            end = idx + 1
+            self._batch_index = end
+            self._update_progress_ui()
+            self._batch_after_id = self.after(1, lambda: self._process_next_batch(load_id))
+            return
 
         self._batch_index = end
         self._update_progress_ui()
@@ -763,22 +838,46 @@ class ThumbnailList(ctk.CTkFrame):
                     self._load_single_thumb_async(path, size, wb, load_id)
             self._batch_after_id = None
 
+    def _is_thumb_load_complete(self) -> bool:
+        """True when every row exists and no thumbnail request is outstanding.
+
+        Completion must not be derived from the loaded/total counters: requests that
+        were already in flight from an earlier load are painted but never counted, so
+        the counters can never meet and the duration timer would run forever.
+        """
+        return (self._batch_index >= len(self._pending_items)
+                and not self._inflight_thumbs
+                and not self._thumb_result_queue)
+
     def _update_progress_ui(self):
+        complete = self._is_thumb_load_complete()
+
         if self._total_thumbs <= 0:
-            self.progress_bar.set(0.0)
-            self.lbl_progress_text.configure(text="")
-            return
+            self.progress_bar.set(1.0 if complete else 0.0)
+            self.lbl_progress_text.configure(text="" if not complete else "Done")
+        else:
+            pct = min(1.0, self._loaded_thumbs / self._total_thumbs)
+            self.progress_bar.set(pct)
+            self.lbl_progress_text.configure(
+                text=f"{self._loaded_thumbs} / {self._total_thumbs}" if not complete else
+                f"{self._total_thumbs} / {self._total_thumbs}")
 
-        pct = self._loaded_thumbs / self._total_thumbs
-        self.progress_bar.set(pct)
-        self.lbl_progress_text.configure(text=f"{self._loaded_thumbs} / {self._total_thumbs}")
-
-        if self._loaded_thumbs >= self._total_thumbs and self._batch_index >= len(self._pending_items):
+        if complete:
             self.progress_bar.set(1.0)
             self.freeze_load_timing()
 
+    def _is_thumb_pending(self, path_str: str, load_id: int = 0) -> bool:
+        """True when this path is already queued or decoding.
+
+        Deliberately independent of ``load_id``: a decoded thumbnail is keyed by path
+        and reused by whichever load asks for it next, so switching away and back
+        mid-load must not queue the same decode again.
+        """
+        return path_str in self._inflight_thumbs
+
     def _load_single_thumb_async(self, file_path: Path, max_size: Tuple[int, int], white_balance: str, load_id: int):
         path_str = str(file_path)
+        self._inflight_thumbs[path_str] = load_id
 
         def worker():
             try:
@@ -789,23 +888,58 @@ class ThumbnailList(ctk.CTkFrame):
                     white_balance=white_balance
                 )
                 if pil_thumb:
-                    self.after(0, lambda: self._update_btn_image(path_str, pil_thumb, load_id))
+                    self._queue_thumb_result(path_str, pil_thumb, load_id)
             except Exception as e:
                 log_error(f"Error generating thumbnail for {file_path.name}", exc_info=True)
+            finally:
+                pass
 
         self._executor.submit(worker)
 
-    def _update_btn_image(self, path_str: str, pil_thumb: Image.Image, load_id: int):
-        if load_id != getattr(self, "_current_load_id", load_id):
+    def _queue_thumb_result(self, path_str: str, pil_thumb: Image.Image, load_id: int):
+        """Hand a decoded thumbnail to the UI thread (coalesced)."""
+        self._thumb_result_queue.append((path_str, pil_thumb, load_id))
+        if self._thumb_result_after_id is None:
+            self._thumb_result_after_id = self.after(1, self._drain_thumb_results)
+
+    def _drain_thumb_results(self):
+        """Apply every thumbnail that finished since the last tick, in one pass."""
+        self._thumb_result_after_id = None
+        if not self._thumb_result_queue:
             return
 
-        if path_str in self._btn_map:
-            btn = self._btn_map[path_str]
-            w, h = pil_thumb.size
-            ctk_img = ctk.CTkImage(light_image=pil_thumb, dark_image=pil_thumb, size=(w, h))
-            self._ctk_img_cache[path_str] = ctk_img
-            btn.configure(image=ctk_img)
+        current_load_id = getattr(self, "_current_load_id", None)
+        applied = 0
+        while self._thumb_result_queue:
+            path_str, pil_thumb, load_id = self._thumb_result_queue.popleft()
+            # Paint whenever a row for this path still exists: thumbnails are keyed by
+            # path, so a decode started for the previous tab is still valid here.
+            self._apply_thumb_image(path_str, pil_thumb)
+            self._inflight_thumbs.pop(path_str, None)
+            if current_load_id is not None and load_id != current_load_id:
+                continue
+            # Count only the current load, so progress still reaches 100%.
+            applied += 1
 
+        if applied:
+            self._loaded_thumbs += applied
+            self._update_progress_ui()
+
+    def _apply_thumb_image(self, path_str: str, pil_thumb: Image.Image) -> bool:
+        btn = self._btn_map.get(path_str)
+        if btn is None:
+            return False
+        w, h = pil_thumb.size
+        ctk_img = ctk.CTkImage(light_image=pil_thumb, dark_image=pil_thumb, size=(w, h))
+        self._ctk_img_cache[path_str] = ctk_img
+        btn.configure(image=ctk_img)
+        return True
+
+    def _update_btn_image(self, path_str: str, pil_thumb: Image.Image, load_id: int):
+        """Apply one thumbnail immediately (kept for direct callers and tests)."""
+        if load_id != getattr(self, "_current_load_id", load_id):
+            return
+        self._apply_thumb_image(path_str, pil_thumb)
         self._loaded_thumbs += 1
         self._update_progress_ui()
 
@@ -816,6 +950,12 @@ class ThumbnailList(ctk.CTkFrame):
             except Exception:
                 pass
             self._batch_after_id = None
+        if getattr(self, "_thumb_result_after_id", None) is not None:
+            try:
+                self.after_cancel(self._thumb_result_after_id)
+            except Exception:
+                pass
+            self._thumb_result_after_id = None
         if hasattr(self, "_executor"):
             self._executor.shutdown(wait=False, cancel_futures=True)
         self._reset_load_timing()

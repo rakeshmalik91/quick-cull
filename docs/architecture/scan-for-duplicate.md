@@ -1,11 +1,6 @@
----
-name: scan-for-duplicate
-description: Technical approach for perceptual image hashing (dHash), duplicate/burst shot detection, keeper selection, auto-flagging, and tagging in photo culling software.
----
-
 # Scan for Duplicate (Perceptual Hashing & Duplicate Detection Pipeline)
 
-This skill documents the approach for detecting duplicate, near-identical, or burst shot photos during photographic culling sessions, picking the sharpest shot as a `PICK`, and tagging/flagging all redundant duplicates as `REJECT`.
+This document details the approach for detecting duplicate, near-identical, or burst shot photos during photographic culling sessions, picking the sharpest shot as a `PICK`, and tagging/flagging all redundant duplicates as `REJECT`.
 
 ---
 

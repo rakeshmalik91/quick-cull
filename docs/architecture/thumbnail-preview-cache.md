@@ -1,11 +1,6 @@
----
-name: thumbnail-preview-cache
-description: Technical approach for thumbnail generation, preview loading, RAM caching, async UI updates, prefetching, multi-tab isolation, and non-blocking directory loading in photo culling software.
----
-
 # Thumbnail & Preview Loading/Caching Pipeline
 
-This skill documents the architecture for loading, generating, caching, and displaying thumbnails and preview images in photo culling software. It covers the core `ImageLoader` class, GUI widget caching, async loading, prefetch strategies, multi-tab isolation, and known performance characteristics.
+This document details the architecture for loading, generating, caching, and displaying thumbnails and preview images in photo culling software. It covers the core `ImageLoader` class, GUI widget caching, async loading, prefetch strategies, multi-tab isolation, and known performance characteristics.
 
 ---
 
@@ -24,19 +19,34 @@ The thumbnail/preview pipeline has four layers:
 
 `ImageLoader` is the central hub for all image decoding. It maintains two LRU caches using `OrderedDict`:
 
-| Cache | Max Items | Key | Purpose |
+| Cache | Limits | Key | Purpose |
 | :--- | :--- | :--- | :--- |
-| `_thumb_cache` | `MAX_THUMB_CACHE = 180` | `(file_path_str, raw_scale, white_balance)` | Canonical-sized thumbnails for sidebar grid |
-| `_full_cache` | `MAX_FULL_CACHE = 30` | `(file_path_str, raw_scale, white_balance)` | Full-resolution previews for center viewer and prefetch |
+| `_thumb_cache` | `MAX_THUMB_CACHE_BYTES = 192 MB`, then `MAX_THUMB_CACHE = 600` | `(file_path_str, raw_scale, white_balance)` | Canonical-sized thumbnails for sidebar grid |
+| `_full_cache` | `MAX_FULL_CACHE_BYTES = 512 MB`, then `MAX_FULL_CACHE = 30` | `(file_path_str, raw_scale, white_balance)` | Full-resolution previews for center viewer and prefetch |
+| `_preview_cache` | 8 entries | `(path, mtime_ns, size)` | Embedded ARW preview bytes |
 
-An auxiliary index `_thumb_cache_index` maps `file_path_str → cache_key` for O(1) thumbnail lookup without iterating the `OrderedDict`.
+There is no auxiliary index: the composite key is already the dict key, so a hit is one
+lookup. An earlier path-only index returned a thumbnail rendered for a different white
+balance or scale.
+
+One `ImageLoader` is created per application and shared by every tab
+(`gui.py:822-823`), so a photo shown in two tabs is decoded once and switching tabs keeps
+the other tabs' decoded images.
 
 ### Cache Policies
 
-- **Eviction**: LRU via `OrderedDict.popitem(last=False)` when the cache exceeds its max size.
+- **Byte budgets first**: entries are evicted oldest-first until the cache is under its byte
+  budget (and then under its item cap), so a folder of large decodes cannot blow past the
+  ceiling by item count alone.
+- **Single-flight**: concurrent requests for the same key decode once; the rest wait for
+  the in-flight result (`INFLIGHT_TIMEOUT_SECONDS` bounds the wait).
+- **Thread safety**: every cache mutation happens under one `RLock`, held only for dict
+  operations.
 - **Copy-on-read**: Every cache hit returns `img.copy()` so callers cannot mutate the cached PIL image.
+- **Tier discipline**: a thumbnail entry is never allowed to hold a full-resolution buffer;
+  non-JPEG sources are downscaled to 400 px before being cached.
 - **Invalidation**: `clear_cache()` purges all caches. It is called at the start of every `scan_directory()` and on app shutdown.
-- **Thread safety**: `OrderedDict` operations are atomic at the GIL level for single ops, but compound ops like `if key in d: d[key]` are not atomic. In practice the risk is low.
+- **Thread safety**: every cache mutation runs under one `RLock`, so compound operations like `if key in d: d[key]` are safe. Per-key single-flight means N concurrent requests for one path decode once.
 
 ---
 
@@ -145,7 +155,7 @@ The extracted bytes are opened via `Image.open(io.BytesIO(preview_bytes))` and d
 1. **Disk-based thumbnail cache**: No persistent cache across sessions. A `.thumbcache/` directory keyed by `(path, mtime, scale)` would eliminate regeneration.
 2. **Prefetch window**: Currently ±2 images. Expanding to ±5 and prefetching on Page Up/Down jumps would reduce cold-cache navigation.
 3. **mtime-based cache invalidation**: Cache keys do not include `os.path.getmtime(path)`. Overwritten files may return stale data.
-4. **Thread safety**: Wrap `_thumb_cache` and `_full_cache` access in a `threading.Lock` for strict correctness under concurrent prefetch.
+4. ~~Thread safety~~ - **done**: all cache access is behind one `RLock`, with per-key single-flight de-duplication.
 5. **Redundant `img.load()`**: In `load_full_image()`, `img.load()` is called unconditionally (line 123) then again in the try/except block (lines 130–132).
 6. **CTkImage widget cache never evicted**: `_ctk_img_cache` grows unbounded until `update_items()` is called.
 7. **Canvas resize cache**: No secondary cache keyed by `(zoom, width, height)`, so rapid zooming at the same scale re-renders redundantly.
@@ -250,6 +260,48 @@ Writers and readers:
 Ordering matters: `show_load_stats()` deactivates the load cycle before any widget rebuild runs. If `update_items()` ran first, a still-running cycle from the previous tab would restart its thumb timer and emit that stale folder time into the newly active tab.
 
 `show_load_stats()` restores frozen values only — it never starts a timer and never emits, so re-rendering a tab's thumbnails (`_ctk_img_cache` is cleared on every path-set change, so tab switches re-decode) cannot overwrite the totals it just restored.
+
+### Tab Switching While a Tab Is Loading
+
+Measured with a Tk latency probe (10 ms heartbeat, worst gap = longest freeze) against the
+three real ARW folders in this workspace, 105 / 194 / 203 photos.
+
+| Scenario | Before | After |
+|---|---|---|
+| Switch to a fully loaded tab (203 photos) | 33 ms | **16 ms** |
+| Switch away and back mid-scan | 177 ms | 192 ms |
+| Rapid switching (8 switches) during a load | 134-474 ms | **119 ms** |
+| Switch while thumbnails decode | 95 ms | **16 ms** |
+| Soft refresh of the same tab | 108 ms first, then 121 ms | **4-5 ms** |
+
+The dominant problem was not slow rendering but an **exception inside a Tk callback**:
+
+- `_batch_raw_requests` / `_batch_other_requests` were created as *local* variables in
+  `_process_next_batch`, yet the soft-refresh branch in `update_items` called
+  `self._batch_raw_requests.clear()`. Every soft refresh raised `AttributeError`, which
+  Tk swallowed, leaving the row batch chain dead and the UI unresponsive to further
+  updates. Both are now instance attributes initialised in `__init__`.
+- `update_single_item_status` re-imported `CullingSession` per row and re-configured every
+  label and indicator unconditionally. A `_row_render_cache` of what each row already
+  renders (seeded when the row is created) makes a no-op refresh free: 108 ms -> 4 ms.
+
+Other fixes on this path:
+
+- **One drain instead of one task per photo.** Workers push results onto a deque and a
+  single 1 ms tick applies the whole batch; previously every thumbnail scheduled its own
+  `after(0)`, so a folder load queued one Tk task per photo.
+- **Time-budgeted row batches.** `BATCH_SIZE` rows cost ~10 ms each, so a fixed 20-row
+  batch blocked the UI for ~200 ms per tick. `ROW_BUILD_BUDGET_MS` (30 ms) bounds every tick
+  regardless of row cost, at the price of more, shorter ticks.
+- **In-flight de-duplication keyed by path.** Switching away and back mid-load re-queued
+  every decode already running. Decoded thumbnails are path-keyed and reusable across load
+  ids, so `_is_thumb_pending` is path-based and the registry only resets on a true rebuild.
+- **Batch chains are cancelled in both paths.** The soft path did not cancel a pending chain,
+  so repeated switches left several chains building rows for item sets no longer displayed.
+
+Remaining: switching away and back mid-scan (~190 ms) is GIL contention with the scan
+thread's Python-side passes, and rapid switching (~120 ms) is the rebuild itself. Both are
+addressed by P1-16 (differential refresh) rather than by more UI tuning.
 
 ### Automatic Folder Reload
 
@@ -358,10 +410,26 @@ def _load_single_thumb_async(self, file_path, max_size, white_balance, load_id):
     def worker():
         pil_thumb = self.image_loader.get_thumbnail(...)
         if pil_thumb:
-            self.after(0, lambda: self._update_btn_image(path_str, pil_thumb, load_id))
+            self._queue_thumb_result(path_str, pil_thumb, load_id)
+
+# Workers never touch Tk directly: results land on a deque and one 1 ms tick paints
+# them all, instead of one after(0) per photo.
+def _queue_thumb_result(self, path_str, pil_thumb, load_id):
+    self._thumb_result_queue.append((path_str, pil_thumb, load_id))
+    if self._thumb_result_after_id is None:
+        self._thumb_result_after_id = self.after(1, self._drain_thumb_results)
 ```
 
-This prevents a delayed thumbnail from a previous `update_items()` call from overwriting a newer image after a tab switch.
+`_inflight_thumbs` maps `path -> load_id`, so switching tabs mid-load does not re-queue a
+decode that is already running. Decoded thumbnails are path-keyed, so a result started for
+an earlier load is still painted when a row for that path exists; only the progress counter
+is load-scoped. Completion is therefore decided by outstanding work
+(`_is_thumb_load_complete()`: rows built, nothing in flight, queue empty) rather than by
+counters - counters cannot be satisfied once de-duplication is in play, and deriving
+completion from them left the duration timer running forever.
+
+Row batches are additionally capped by `ROW_BUILD_BUDGET_MS` (30 ms) instead of a fixed row
+count, so no single tick blocks the UI for longer than the budget.
 
 ### Tab Switch & State Restoration
 
@@ -408,8 +476,11 @@ def _apply_tab_filter_values(self, tab):
 ```python
 # culler/image_loader.py - ImageLoader class
 class ImageLoader:
-    MAX_THUMB_CACHE = 180
+    MAX_THUMB_CACHE = 600
+    MAX_THUMB_CACHE_BYTES = 192 * 1024 * 1024
     MAX_FULL_CACHE = 30
+    MAX_FULL_CACHE_BYTES = 512 * 1024 * 1024
+    MAX_PREVIEW_CACHE = 8
 
     def get_cached_thumbnail(file_path) -> Optional[Image.Image]:  # O(1) lookup
     def get_cached_full_image(file_path, raw_scale, wb) -> Optional[Image.Image]:  # O(1) lookup

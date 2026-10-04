@@ -29,11 +29,12 @@ from culler.culler_engine import CullingSession, ImageItem, FlagState, resolve_i
 from culler.db_manager import DatabaseManager
 from culler.dataset_exporter import save_annotation, save_manual_annotation
 from culler.folder_watcher import FolderWatcher, FolderChange
+from culler.exif_wrapper import ExifToolWrapper
 from culler.image_loader import ImageLoader
 from culler.ml_trainer import train_custom_yolo
 from culler.paths import DATASET_DIR
 from bootstrap import APP_NAME, SplashScreen, adopt_default_root, apply_window_icon, launch_gui
-from culler.gui import HeaderToolbar, ThumbnailList, ImageCanvasViewer, MetadataPanel, MetadataCleanupDialog, SettingsDialog, BlurScanDialog, DuplicateScanDialog, ProgressDialog, TabBar
+from culler.gui import HeaderToolbar, ThumbnailList, ImageCanvasViewer, MetadataPanel, MetadataCleanupDialog, SettingsDialog, BlurScanDialog, DuplicateScanDialog, ProgressDialog, TabBar, AboutDialog
 from culler.logger import log_info, log_debug, log_error
 
 # Set modern dark UI theme
@@ -171,7 +172,11 @@ class ImageCullerApp(ctk.CTk):
         return {
             "directory": str(Path(directory).resolve()),
             "tab_label": folder_name,
-            "session": CullingSession(db_manager=self.db),
+            "session": CullingSession(
+                db_manager=self.db,
+                exif_wrapper=self.exif_wrapper,
+                image_loader=self.image_loader,
+            ),
             "filter_values": {
                 "flag": "All",
                 "rating": [],
@@ -761,6 +766,21 @@ class ImageCullerApp(ctk.CTk):
         if folder:
             self._add_tab(folder)
 
+    def _on_about_clicked(self):
+        if getattr(self, "_about_dialog", None) is not None:
+            try:
+                if self._about_dialog.winfo_exists():
+                    self._about_dialog.lift()
+                    self._about_dialog.focus_force()
+                    return
+            except Exception:
+                pass
+            self._about_dialog = None
+
+        import culler
+        dialog = AboutDialog(self, app_name="Quick Cull", version=getattr(culler, "__version__", ""))
+        self._about_dialog = dialog
+
     def _create_components(self):
         init_scale = self.db.get_raw_scale()
         init_wb = self.db.get_white_balance()
@@ -771,9 +791,11 @@ class ImageCullerApp(ctk.CTk):
             on_tab_selected=self._on_tab_selected,
             on_tab_closed=self._on_tab_closed,
             on_tab_reordered=self._on_tab_reordered,
-            on_new_tab=self._on_new_tab
+            on_new_tab=self._on_new_tab,
+            on_about=self._on_about_clicked
         )
         self.tab_bar.pack(side="top", fill="x", padx=0, pady=0)
+        self._about_dialog: Optional[AboutDialog] = None
 
         # Top Header Toolbar
         self.toolbar = HeaderToolbar(
@@ -794,6 +816,11 @@ class ImageCullerApp(ctk.CTk):
         # Detects photos added/removed/edited on disk and reloads the owning tab
         self.folder_watcher = FolderWatcher()
         self.folder_watcher.start()
+
+        # Shared decode services: every tab's session uses these, so one photo is
+        # decoded once and switching tabs keeps the decoded images of the other tabs.
+        self.exif_wrapper = ExifToolWrapper()
+        self.image_loader = ImageLoader(exif_wrapper=self.exif_wrapper)
 
         # Main Container
         self.main_container = ctk.CTkFrame(self, corner_radius=0)
@@ -1265,10 +1292,11 @@ class ImageCullerApp(ctk.CTk):
                         raw_scale=0.10,
                         white_balance=white_balance
                     )
-                    if req_id != self._load_request_id:
-                        return
                     if fast_thumb:
-                        self.after(0, lambda: self.viewer.set_image(fast_thumb, preserve_zoom=True))
+                        # Re-check inside the callback: a newer navigation may have
+                        # started between scheduling and running, and a late preview of
+                        # the previous photo would otherwise overwrite the current one.
+                        self.after(0, lambda img=fast_thumb: self._apply_fast_preview(img, req_id))
 
                 if req_id != self._load_request_id:
                     return
@@ -1295,6 +1323,18 @@ class ImageCullerApp(ctk.CTk):
             self._nav_timer = self.after(150, start_background_load)
         else:
             start_background_load()
+
+    def _apply_fast_preview(self, pil_img: Optional[Image.Image], req_id: int) -> bool:
+        """Show a fast preview, dropping it if navigation has already moved on.
+
+        Guards the gap between scheduling this on the loading thread and running it on
+        the UI thread: without the re-check, a preview of photo N can land after photo
+        N+1 is already displayed and stay there until N+1 finishes decoding.
+        """
+        if req_id != self._load_request_id:
+            return False
+        self.viewer.set_image(pil_img, preserve_zoom=True)
+        return True
 
     def _prefetch_surrounding_images(self, center_idx: int, is_continuous: bool = False):
         session = self._get_active_session()

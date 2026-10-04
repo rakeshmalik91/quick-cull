@@ -80,6 +80,7 @@ from .duplicate_dialog import DuplicateScanDialog
 from .progress_dialog import ProgressDialog
 from .tooltip import ToolTip
 from .tab_bar import TabBar
+from .about_dialog import AboutDialog
 
 __all__ = [
     "HeaderToolbar",
@@ -93,4 +94,5 @@ __all__ = [
     "ProgressDialog",
     "ToolTip",
     "TabBar",
+    "AboutDialog",
 ]

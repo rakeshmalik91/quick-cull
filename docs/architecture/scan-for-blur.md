@@ -1,11 +1,6 @@
----
-name: scan-for-blur
-description: Technical approach for automated edge sharpness detection, 2-level YOLO subject/eye detection, 4-stage recall, single-pass blur scan, auto-flagging, and image tagging in photo culling software.
----
-
 # Scan for Blur (Blur Detection, 2-Level YOLO & Tagging Pipeline)
 
-This skill documents all 3 algorithms for detecting out-of-focus or blurry photos during photographic culling sessions, auto-flagging them as `REJECT`, applying the `"Blur"` tag, and rendering 2-level bounding boxes (Level 1: Subject, Level 2: Eye/Face).
+This document details all 3 algorithms for detecting out-of-focus or blurry photos during photographic culling sessions, auto-flagging them as `REJECT`, applying the `"Blur"` tag, and rendering 2-level bounding boxes (Level 1: Subject, Level 2: Eye/Face).
 
 ```mermaid
 flowchart TD
@@ -66,13 +61,13 @@ $$\text{Sharpness Score} = \text{Var}(\nabla^2 I)$$
 - **Speed**: ⭐⭐⭐⭐⭐ (< 3ms / image)
 - **Detects**: General defocus blur and soft edges.
 - **Best For**: Rapid first-pass culling, general photography, landscape, studio.
-- **Implementation**: [culler/detectors/blur/laplacian.py](file:///d:/Projects/image-culler/culler/detectors/blur/laplacian.py)
+- **Implementation**: [culler/detectors/blur/laplacian.py](file:///d:/Projects/quick-cull/culler/detectors/blur/laplacian.py)
 
 ---
 
 ### 2. AI Subject Focus (`"ai_subject"`) - 2-Level YOLO + 4-Stage Recall + Multi-Layer Crop
 Unified intelligent algorithm combining YOLOv8 AI detection, multi-stage candidate recall, Level 2 Head/Eye zone extraction, and saliency fallback.
-- **Implementation**: [culler/detectors/blur/yolo_subject.py](file:///d:/Projects/image-culler/culler/detectors/blur/yolo_subject.py), [culler/detectors/blur/eye_detector.py](file:///d:/Projects/image-culler/culler/detectors/blur/eye_detector.py)
+- **Implementation**: [culler/detectors/blur/yolo_subject.py](file:///d:/Projects/quick-cull/culler/detectors/blur/yolo_subject.py), [culler/detectors/blur/eye_detector.py](file:///d:/Projects/quick-cull/culler/detectors/blur/eye_detector.py)
 
 - **4-Stage Candidate Recall Architecture**:
   1. **Stage 1 (High-Confidence Pass, `conf=0.15`)**: Runs YOLOv8 (`yolov8n.pt`) with candidate box selection algorithm (`select_best_subject_box`). Prioritizes portrait/wildlife classes (`person`, `bird`, `dog`, `cat`, `animals`) and applies a 15% edge margin penalty for non-subject corner clutter. Requires minimum `score=0.02` to prevent full-frame background selection.
@@ -100,7 +95,7 @@ Unified intelligent algorithm combining YOLOv8 AI detection, multi-stage candida
 - **Speed**: ⭐⭐⭐ (~25ms / image at 640px native YOLO resolution)
 - **Detects**: Subject & eye-aware focus sharpness — eyes, head, beak, and facial details.
 - **Best For**: Birding, wildlife, shallow depth-of-field portraits, off-center subjects, macro, nocturnal/flash photography, heavy camouflage, and dense background foliage.
-- **Backward Compat**: Old method names `"yolo_subject"`, `"bird_subject"`, `"local_var"` all redirect here in [culler/detectors/blur/__init__.py](file:///d:/Projects/image-culler/culler/detectors/blur/__init__.py).
+- **Backward Compat**: Old method names `"yolo_subject"`, `"bird_subject"`, `"local_var"` all redirect here in [culler/detectors/blur/__init__.py](file:///d:/Projects/quick-cull/culler/detectors/blur/__init__.py).
 
 ---
 
@@ -110,16 +105,15 @@ $$\text{FFT Score} = \text{mean}(|\text{FFTshift}(\mathcal{F}(I))|_{\text{high\_
 - **Speed**: ⭐⭐⭐ (~18ms / image)
 - **Detects**: High-frequency spectrum energy ratio (distinguishes motion blur/camera shake from soft focus).
 - **Best For**: Action shots, handheld low-light photos, and camera shake detection.
-- **Implementation**: [culler/detectors/blur/fft.py](file:///d:/Projects/image-culler/culler/detectors/blur/fft.py)
+- **Implementation**: [culler/detectors/blur/fft.py](file:///d:/Projects/quick-cull/culler/detectors/blur/fft.py)
 
 ---
 
 ## 🎨 Dual Bounding Box UI Rendering & Panning
-
 - **Level 1 (Subject / Body Box)**: Rendered in **Green (`#00ff00`, 3px line)**.
 - **Level 2 (Head / Eye / Face Box)**: Rendered in **Gold (`#ffb703`, 2px line)**.
 - **Hardware Canvas Sync**: `_on_drag_motion` calls `_draw_detection_rect()` so both boxes move in 1-to-1 sync with image dragging/panning.
-- **Renderer Location**: [culler/gui/canvas_viewer.py](file:///d:/Projects/image-culler/culler/gui/canvas_viewer.py#L167-L195)
+- **Renderer Location**: [culler/gui/canvas_viewer.py](file:///d:/Projects/quick-cull/culler/gui/canvas_viewer.py#L167-L195)
 
 ---
 
@@ -143,4 +137,3 @@ eye_box = extract_eye_face_box(rgb_img, subject_box, yolo_pose_model=yolo_pose_m
 # culler/gui/canvas_viewer.py - dual box canvas renderer
 viewer.set_detection_box(item.detection_box, item.eye_box)
 ```
-

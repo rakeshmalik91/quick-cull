@@ -1,5 +1,6 @@
 import io
 import os
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
@@ -44,19 +45,72 @@ class ImageLoader:
         ".heif": "HEIF / HEIC Image",
     }
 
-    MAX_THUMB_CACHE = 180  # Max cached thumbnail items in RAM
+    RAW_EXTENSIONS = (".arw",)
+
+    MAX_THUMB_CACHE = 600   # Max cached thumbnail items in RAM
     MAX_FULL_CACHE = 30    # Max full resolution preview items in RAM (Pre-fetch buffer)
+    MAX_THUMB_DIM = 400    # Longest edge of a cached thumbnail canonical
+
+    #: Byte budget for the thumbnail tier. Measured on the reference machine: a cached
+    #: 400x267 canonical is ~320 KB, so 192 MB holds ~600 of them - the three open
+    #: tabs (503 photos) stay fully resident and switching tabs decodes nothing.
+    MAX_THUMB_CACHE_BYTES = 192 * 1024 * 1024
+
+    #: Upper bound on how long a duplicate request waits for the in-flight decode.
+    INFLIGHT_TIMEOUT_SECONDS = 30.0
+
+    #: Extracted ARW preview blobs held in RAM (each is a few MB).
+    MAX_PREVIEW_CACHE = 8
+
+    #: Byte budget for decoded previews/full images. A 24 MP decode is ~72 MB, so an
+    #: item-counted cap of 30 could hold over 2 GB; this is the real ceiling.
+    MAX_FULL_CACHE_BYTES = 512 * 1024 * 1024
+
+    #: Scale/white-balance variants probed by the cheap path-only lookup, most likely first.
+    THUMB_LOOKUP_VARIANTS = ((0.10, "camera"), (0.10, "auto"))
 
     def __init__(self, exif_wrapper: Optional[ExifToolWrapper] = None):
         self.exif_wrapper = exif_wrapper or ExifToolWrapper()
         self._thumb_cache: OrderedDict[Tuple, Image.Image] = OrderedDict()
-        self._thumb_cache_index: Dict[str, Tuple] = {}
         self._full_cache: OrderedDict[Tuple, Image.Image] = OrderedDict()
+        self._preview_cache: OrderedDict[Tuple, bytes] = OrderedDict()
+        # Cache mutation happens on up to 6 threads (4 thumbnail workers, the scan
+        # thread, image-load and prefetch threads), so every dict touch is guarded.
+        self._cache_lock = threading.RLock()
+        self._inflight: Dict[Tuple, threading.Event] = {}
+        self.stats: Dict[str, int] = {
+            "thumb_hits": 0,
+            "thumb_misses": 0,
+            "full_hits": 0,
+            "full_misses": 0,
+            "waits_for_inflight": 0,
+        }
+
+    def _store_thumb(self, cache_key: Tuple, img: Image.Image) -> None:
+        """Insert a thumbnail canonical and evict until both budgets are satisfied."""
+        with self._cache_lock:
+            self._thumb_cache[cache_key] = img
+            self._thumb_cache.move_to_end(cache_key)
+            self._evict_thumb_cache()
+
+    def _evict_thumb_cache(self) -> None:
+        """Enforce the byte budget first, then the item cap."""
+        total = sum(self.estimate_bytes(v) for v in self._thumb_cache.values())
+        while self._thumb_cache and total > self.MAX_THUMB_CACHE_BYTES:
+            _, evicted = self._thumb_cache.popitem(last=False)
+            total -= self.estimate_bytes(evicted)
+        while len(self._thumb_cache) > self.MAX_THUMB_CACHE:
+            self._thumb_cache.popitem(last=False)
 
     @classmethod
     def is_supported(cls, file_path: Union[str, Path]) -> bool:
         ext = Path(file_path).suffix.lower()
         return ext in cls.SUPPORTED_EXTENSIONS
+
+    @classmethod
+    def is_raw(cls, file_path: Union[str, Path]) -> bool:
+        ext = Path(file_path).suffix.lower()
+        return ext in cls.RAW_EXTENSIONS
 
     @classmethod
     def get_format_type(cls, file_path: Union[str, Path]) -> str:
@@ -84,12 +138,21 @@ class ImageLoader:
     ) -> Optional[Image.Image]:
         """
         Instantly retrieve cached thumbnail from RAM (0ms lookup, zero disk I/O).
+
+        Returns the canonical cached render for the default scale/white balance, which is
+        what navigation wants for an instant first paint.
         """
         file_path_str = str(file_path)
-        cache_key = self._thumb_cache_index.get(file_path_str)
-        if cache_key and cache_key in self._thumb_cache:
-            self._thumb_cache.move_to_end(cache_key)
-            return self._thumb_cache[cache_key].copy()
+        for scale, wb in self.THUMB_LOOKUP_VARIANTS:
+            cache_key = (file_path_str, scale, wb)
+            with self._cache_lock:
+                cached = self._thumb_cache.get(cache_key)
+                if cached is not None:
+                    self._thumb_cache.move_to_end(cache_key)
+                    self.stats["thumb_hits"] += 1
+                    return cached.copy()
+        with self._cache_lock:
+            self.stats["thumb_misses"] += 1
         return None
 
     def load_full_image(
@@ -104,10 +167,47 @@ class ImageLoader:
         file_path_str = str(file_path)
         cache_key = (file_path_str, raw_scale, white_balance)
 
-        if cache_key in self._full_cache:
-            self._full_cache.move_to_end(cache_key)
-            return self._full_cache[cache_key].copy()
+        with self._cache_lock:
+            cached = self._full_cache.get(cache_key)
+            if cached is not None:
+                self._full_cache.move_to_end(cache_key)
+                self.stats["full_hits"] += 1
+                return cached.copy()
 
+        # Single-flight: concurrent requests for the same key decode once, the rest wait.
+        with self._cache_lock:
+            event = self._inflight.get(cache_key)
+            owner = event is None
+            if owner:
+                event = threading.Event()
+                self._inflight[cache_key] = event
+                self.stats["full_misses"] += 1
+            else:
+                self.stats["waits_for_inflight"] += 1
+
+        if not owner:
+            event.wait(timeout=self.INFLIGHT_TIMEOUT_SECONDS)
+            with self._cache_lock:
+                cached = self._full_cache.get(cache_key)
+                if cached is not None:
+                    self._full_cache.move_to_end(cache_key)
+                    return cached.copy()
+            return None
+
+        try:
+            return self._decode_and_store_full(file_path_str, cache_key, raw_scale, white_balance)
+        finally:
+            with self._cache_lock:
+                self._inflight.pop(cache_key, None)
+            event.set()
+
+    def _decode_and_store_full(
+        self,
+        file_path_str: str,
+        cache_key: Tuple,
+        raw_scale: float,
+        white_balance: str
+    ) -> Optional[Image.Image]:
         ext = Path(file_path_str).suffix.lower()
         img: Optional[Image.Image] = None
 
@@ -131,16 +231,47 @@ class ImageLoader:
             except Exception:
                 pass
 
-            self._full_cache[cache_key] = img
-            self._full_cache.move_to_end(cache_key)
-
-            # Evict oldest item if LRU limit reached (let GC handle memory release safely)
-            if len(self._full_cache) > self.MAX_FULL_CACHE:
-                self._full_cache.popitem(last=False)
-
+            self._store_full(cache_key, img)
             return img.copy()
 
         return None
+
+    @staticmethod
+    def estimate_bytes(img: Optional[Image.Image]) -> int:
+        """Rough RAM cost of a decoded RGB image."""
+        if img is None:
+            return 0
+        width, height = img.size
+        channels = len(img.getbands()) or 3
+        return int(width) * int(height) * channels
+
+    def _store_full(self, cache_key: Tuple, img: Image.Image) -> None:
+        """Insert a full/preview decode and evict until both budgets are satisfied."""
+        self._full_cache[cache_key] = img
+        self._full_cache.move_to_end(cache_key)
+        self._evict_full_cache()
+
+    def _evict_full_cache(self) -> None:
+        """Enforce the byte budget first, then the item cap."""
+        total = sum(self.estimate_bytes(v) for v in self._full_cache.values())
+        while self._full_cache and total > self.MAX_FULL_CACHE_BYTES:
+            _, evicted = self._full_cache.popitem(last=False)
+            total -= self.estimate_bytes(evicted)
+        while len(self._full_cache) > self.MAX_FULL_CACHE:
+            self._full_cache.popitem(last=False)
+
+    def cache_stats(self) -> Dict[str, int]:
+        """Introspection for the §6 counters."""
+        full_bytes = sum(self.estimate_bytes(v) for v in self._full_cache.values())
+        thumb_bytes = sum(self.estimate_bytes(v) for v in self._thumb_cache.values())
+        return {
+            "thumb_items": len(self._thumb_cache),
+            "thumb_bytes": thumb_bytes,
+            "thumb_budget_bytes": self.MAX_THUMB_CACHE_BYTES,
+            "full_items": len(self._full_cache),
+            "full_bytes": full_bytes,
+            "full_budget_bytes": self.MAX_FULL_CACHE_BYTES,
+        }
 
     @classmethod
     def apply_exif_orientation(cls, img: Image.Image, orientation: Optional[int] = None) -> Image.Image:
@@ -197,7 +328,7 @@ class ImageLoader:
 
         # ExifTool binary preview strategy (fast high-res embedded preview)
         if self.exif_wrapper and self.exif_wrapper.is_available():
-            preview_bytes = self.exif_wrapper.extract_preview_bytes(arw_path)
+            preview_bytes = self._get_cached_preview_bytes(arw_path)
             if preview_bytes:
                 try:
                     with Image.open(io.BytesIO(preview_bytes)) as p_img:
@@ -261,17 +392,20 @@ class ImageLoader:
         file_path_str = str(file_path)
         cache_key = (file_path_str, raw_scale, white_balance)
 
-        # O(1) index lookup first
-        indexed_key = self._thumb_cache_index.get(file_path_str)
-        if indexed_key and indexed_key in self._thumb_cache:
-            self._thumb_cache.move_to_end(indexed_key)
-            cached = self._thumb_cache[indexed_key]
-            if cached.size == max_size:
-                return cached.copy()
-            result = cached.copy()
-            result.thumbnail(max_size, Image.Resampling.BILINEAR)
-            result.load()
-            return result
+        # Composite-key hit. Scale and white balance are part of the key, so switching
+        # either re-renders instead of returning the previous render.
+        with self._cache_lock:
+            cached = self._thumb_cache.get(cache_key)
+            if cached is not None:
+                self._thumb_cache.move_to_end(cache_key)
+                self.stats["thumb_hits"] += 1
+                if cached.size == max_size:
+                    return cached.copy()
+                result = cached.copy()
+                result.thumbnail(max_size, Image.Resampling.BILINEAR)
+                result.load()
+                return result
+            self.stats["thumb_misses"] += 1
 
         ext = Path(file_path_str).suffix.lower()
 
@@ -283,8 +417,8 @@ class ImageLoader:
                     raw_img = ImageOps.exif_transpose(raw_img)
                     img = raw_img.convert("RGB")
                     img.load()
-                    if max(img.width, img.height) > 400:
-                        img.thumbnail((400, 400), Image.Resampling.BILINEAR)
+                    if max(img.width, img.height) > self.MAX_THUMB_DIM:
+                        img.thumbnail((self.MAX_THUMB_DIM, self.MAX_THUMB_DIM), Image.Resampling.BILINEAR)
                         img.load()
             except Exception as e:
                 print(f"Error extracting fast JPG thumbnail for {file_path_str}: {e}")
@@ -295,14 +429,13 @@ class ImageLoader:
         if img is None:
             return None
 
-        self._thumb_cache[cache_key] = img
-        self._thumb_cache_index[file_path_str] = cache_key
-        self._thumb_cache.move_to_end(cache_key)
+        # The non-JPEG branch decodes at full resolution, so normalize before caching:
+        # this tier must never hold a full-size buffer.
+        if max(img.size) > self.MAX_THUMB_DIM:
+            img.thumbnail((self.MAX_THUMB_DIM, self.MAX_THUMB_DIM), Image.Resampling.BILINEAR)
+            img.load()
 
-        if len(self._thumb_cache) > self.MAX_THUMB_CACHE:
-            oldest = next(iter(self._thumb_cache))
-            self._thumb_cache.popitem(last=False)
-            self._thumb_cache_index.pop(oldest[0], None)
+        self._store_thumb(cache_key, img)
 
         if img.size == max_size:
             return img.copy()
@@ -376,10 +509,41 @@ class ImageLoader:
             print(f"Error computing sharpness: {e}")
             return 0.0
 
+    def _get_cached_preview_bytes(self, arw_path: str) -> Optional[bytes]:
+        """Embedded preview bytes, memoised per (path, mtime, size).
+
+        Extraction reads the whole ARW and runs again for every thumbnail *and* every
+        full decode of the same file, so this is cached with a small LRU.
+        """
+        try:
+            st = os.stat(arw_path)
+            cache_key = (str(arw_path), st.st_mtime_ns, st.st_size)
+        except OSError:
+            cache_key = None
+
+        if cache_key is not None:
+            with self._cache_lock:
+                cached = self._preview_cache.get(cache_key)
+                if cached is not None:
+                    self._preview_cache.move_to_end(cache_key)
+                    return cached
+
+        data = self.exif_wrapper.extract_preview_bytes(arw_path)
+
+        if cache_key is not None and data:
+            with self._cache_lock:
+                self._preview_cache[cache_key] = data
+                self._preview_cache.move_to_end(cache_key)
+                while len(self._preview_cache) > self.MAX_PREVIEW_CACHE:
+                    self._preview_cache.popitem(last=False)
+        return data
+
     def clear_cache(self):
         """
         Purge all cached PIL image references from memory.
         """
-        self._thumb_cache.clear()
-        self._thumb_cache_index.clear()
-        self._full_cache.clear()
+        with self._cache_lock:
+            self._thumb_cache.clear()
+            self._full_cache.clear()
+            self._preview_cache.clear()
+            self._inflight.clear()

@@ -765,6 +765,7 @@ class TestTabBarDynamicIndex(unittest.TestCase):
         bar._tab_labels = ["Tab 0", "Tab 1", "Tab 2"]
         bar._tab_count = 3
         bar._active_index = 0
+        bar._btn_add = MagicMock()
         bar._update_scroll_region = MagicMock()
 
         btn0, btn1, btn2 = bar._close_buttons[0], bar._close_buttons[1], bar._close_buttons[2]
@@ -793,6 +794,7 @@ class TestTabBarDynamicIndex(unittest.TestCase):
         bar._tab_labels = ["A", "B", "C"]
         bar._tab_count = 3
         bar._active_index = 0
+        bar._btn_add = MagicMock()
         bar._update_scroll_region = MagicMock()
 
         bar.reorder(0, 2)  # Move A to position 2: [B, C, A]

@@ -288,10 +288,43 @@ class DatabaseManager:
         detection_box: Optional[Tuple[float, float, float, float]] = None,
         eye_box: Optional[Tuple[float, float, float, float]] = None
     ):
-        box_str = json.dumps(list(detection_box)) if detection_box else ""
-        eye_str = json.dumps(list(eye_box)) if eye_box else ""
+        self.save_image_records([{
+            "file_path": file_path,
+            "filename": filename,
+            "flag": flag,
+            "rating": rating,
+            "sharpness": sharpness,
+            "tags": tags,
+            "detection_box": detection_box,
+            "eye_box": eye_box,
+        }])
+
+    def save_image_records(self, records: List[Dict[str, Any]]):
+        """Upsert many records in one connection and one transaction.
+
+        A folder scan calls this once per photo; one connection + commit per row made
+        scanning cost thousands of transactions.
+        """
+        if not records:
+            return
+
+        rows = []
+        for rec in records:
+            box = rec.get("detection_box")
+            eye = rec.get("eye_box")
+            rows.append((
+                rec["file_path"],
+                rec.get("filename", ""),
+                rec.get("flag", "UNFLAGGED"),
+                rec.get("rating", 0),
+                rec.get("sharpness", 0.0),
+                rec.get("tags", ""),
+                json.dumps(list(box)) if box else "",
+                json.dumps(list(eye)) if eye else "",
+            ))
+
         with self._get_connection() as conn:
-            conn.execute("""
+            conn.executemany("""
                 INSERT INTO image_records (file_path, filename, flag, rating, sharpness, tags, detection_box, eye_box)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(file_path) DO UPDATE SET
@@ -302,7 +335,7 @@ class DatabaseManager:
                     detection_box = excluded.detection_box,
                     eye_box = excluded.eye_box,
                     last_updated = CURRENT_TIMESTAMP
-            """, (file_path, filename, flag, rating, sharpness, tags, box_str, eye_str))
+            """, rows)
             conn.commit()
 
     def get_all_records_for_dir(self, dir_path: str) -> Dict[str, Dict[str, Any]]:

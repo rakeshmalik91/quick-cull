@@ -161,16 +161,60 @@ class TestThumbnailList(unittest.TestCase):
 
     def test_progress_bar_initialized_on_update(self):
         """
-        Verify progress bar resets to 0.0 on update_items call.
+        Verify a fresh load reports incomplete progress, not a completed one.
         """
-        items = [self._make_item(f"IMG_{i:03d}.JPG") for i in range(3)]
-        self.list_widget.update_items(items, selected_idx=0)
+        items = [self._make_item(f"IMG_{i:03d}.JPG") for i in range(60)]
+        original = self.list_widget.ROW_BUILD_BUDGET_MS
+        self.list_widget.ROW_BUILD_BUDGET_MS = 0
+        try:
+            self.list_widget.update_items(items, selected_idx=0)
+        finally:
+            self.list_widget.ROW_BUILD_BUDGET_MS = original
+
+        self.assertFalse(self.list_widget._is_thumb_load_complete())
         self.assertEqual(self.list_widget.progress_bar.get(), 0.0)
+
+    def test_progress_complete_when_nothing_outstanding(self):
+        """With no rows to build and no requests in flight, the load is complete."""
+        self.list_widget._pending_items = []
+        self.list_widget._batch_index = 0
+        self.list_widget._inflight_thumbs.clear()
+        self.list_widget._thumb_result_queue.clear()
+        self.list_widget._total_thumbs = 0
+
+        self.list_widget._update_progress_ui()
+
+        self.assertTrue(self.list_widget._is_thumb_load_complete())
+        self.assertEqual(self.list_widget.progress_bar.get(), 1.0)
+
+    def test_thumb_timer_freezes_once_everything_loaded(self):
+        """
+        Regression: the Thumbs duration timer ran forever because completion was
+        derived from counters that de-duplicated requests could never satisfy.
+        """
+        self.list_widget.start_load_timing()
+        self.list_widget.start_thumb_timing()
+        self.list_widget._pending_items = []
+        self.list_widget._batch_index = 0
+        self.list_widget._inflight_thumbs.clear()
+        self.list_widget._thumb_result_queue.clear()
+        self.list_widget._total_thumbs = 0
+
+        self.list_widget._update_progress_ui()
+
+        self.assertFalse(self.list_widget._load_cycle_active,
+                         "the load cycle must end once no work is outstanding")
+        self.assertIsNone(self.list_widget._timing_after_id,
+                          "the refresh timer must be cancelled, not left running")
+        self.assertIsNotNone(self.list_widget._thumb_time_final)
 
     def test_update_btn_image_tracks_progress(self):
         """
-        Verify _update_btn_image increments loaded count and updates progress UI.
+        Verify _update_btn_image increments the loaded count and advances the bar.
         """
+        # Two rows still to build, so the load is not complete and the fraction shows.
+        self.list_widget._pending_items = [object(), object()]
+        self.list_widget._batch_index = 0
         self.list_widget._total_thumbs = 2
         self.list_widget._loaded_thumbs = 0
 
@@ -180,6 +224,7 @@ class TestThumbnailList(unittest.TestCase):
 
         self.assertEqual(self.list_widget._loaded_thumbs, 1)
         self.assertEqual(self.list_widget.progress_bar.get(), 0.5)
+        self.assertFalse(self.list_widget._is_thumb_load_complete())
 
     def test_progress_stats_persist_after_completion(self):
         """
@@ -196,14 +241,70 @@ class TestThumbnailList(unittest.TestCase):
 
     def test_batch_cancel_on_new_update(self):
         """
-        Verify that calling update_items with different paths cancels any pending batch after callbacks.
+        Verify that calling update_items with different items cancels a pending batch chain.
         """
         items1 = [self._make_item(f"IMG_{i:03d}.JPG") for i in range(3)]
         self.list_widget.update_items(items1, selected_idx=0)
-        self.list_widget._batch_after_id = "after_id_123"
-        items2 = [self._make_item(f"OTHER_{i:03d}.JPG") for i in range(3)]
-        self.list_widget.update_items(items2, selected_idx=0)
-        self.assertIsNone(self.list_widget._batch_after_id)
+
+        cancelled = []
+        real_cancel = self.list_widget.after_cancel
+
+        def recording_cancel(ident):
+            cancelled.append(ident)
+            return real_cancel(ident)
+
+        self.list_widget._batch_after_id = "after_id_stale"
+        self.list_widget.after_cancel = recording_cancel
+        try:
+            items2 = [self._make_item(f"OTHER_{i:03d}.JPG") for i in range(3)]
+            self.list_widget.update_items(items2, selected_idx=0)
+        finally:
+            self.list_widget.after_cancel = real_cancel
+
+        self.assertIn("after_id_stale", cancelled,
+                      "a pending batch chain must be cancelled on a new load")
+
+    def test_soft_refresh_also_cancels_pending_chain(self):
+        """
+        Switching away and back (same items, soft refresh) must also stop the old chain.
+        """
+        items = [self._make_item(f"IMG_{i:03d}.JPG") for i in range(3)]
+        self.list_widget.update_items(items, selected_idx=0)
+        self.list_widget._batch_after_id = "after_id_stale"
+
+        cancelled = []
+        real_cancel = self.list_widget.after_cancel
+
+        def recording_cancel(ident):
+            cancelled.append(ident)
+            return real_cancel(ident)
+
+        self.list_widget.after_cancel = recording_cancel
+        try:
+            self.list_widget.update_items(items, selected_idx=0)
+        finally:
+            self.list_widget.after_cancel = real_cancel
+
+        self.assertIn("after_id_stale", cancelled)
+
+    def test_row_build_yields_to_the_event_loop(self):
+        """
+        A large item set must not build every row in one call: the budget forces a yield.
+        """
+        items = [self._make_item(f"BULK_{i:03d}.JPG") for i in range(60)]
+        original_budget = self.list_widget.ROW_BUILD_BUDGET_MS
+        self.list_widget.ROW_BUILD_BUDGET_MS = 0
+        try:
+            self.list_widget.update_items(items, selected_idx=0)
+        finally:
+            self.list_widget.ROW_BUILD_BUDGET_MS = original_budget
+
+        self.assertLess(len(self.list_widget._row_frame_map), len(items),
+                        "the batch must stop early so the event loop can run")
+        self.assertIsNotNone(self.list_widget._batch_after_id,
+                             "an unfinished build must reschedule itself")
+        self.list_widget.update()
+        self.assertGreater(len(self.list_widget._row_frame_map), 0)
 
     def test_soft_update_skips_rebuild_when_paths_match(self):
         """
@@ -219,16 +320,28 @@ class TestThumbnailList(unittest.TestCase):
 
     def test_soft_update_submits_thumbnails(self):
         """
-        Verify soft update submits thumbnail loads for items not yet cached.
+        Verify soft update submits thumbnail loads for items not yet cached, and that
+        the totals still cover every item.
         """
         items = [self._make_item(f"IMG_{i:03d}.JPG") for i in range(3)]
         self.list_widget.update_items(items, selected_idx=0)
-        self.list_widget._total_thumbs = 0
-        self.list_widget._loaded_thumbs = 0
-        self.list_widget._batch_raw_requests.clear()
-        self.list_widget._batch_other_requests.clear()
+
+        # Pretend the thumbnails decoded and were cached, then clear the registry so the
+        # soft refresh has to reason about cached vs outstanding work again.
+        for item in items:
+            self.list_widget._ctk_img_cache[str(item.path)] = object()
+            self.list_widget._inflight_thumbs.pop(str(item.path), None)
+
+        submitted = []
+        self.list_widget._load_single_thumb_async = (
+            lambda path, size, wb, load_id: submitted.append(str(path)))
+
         self.list_widget.update_items(items, selected_idx=1)
-        self.assertGreater(self.list_widget._total_thumbs, 0)
+
+        self.assertEqual(submitted, [], "cached thumbnails must not be re-submitted")
+        self.assertEqual(self.list_widget._total_thumbs, len(items),
+                         "totals must cover cached items too")
+        self.assertEqual(self.list_widget._loaded_thumbs, len(items))
 
     def test_placeholder_ctk_images_created(self):
         """

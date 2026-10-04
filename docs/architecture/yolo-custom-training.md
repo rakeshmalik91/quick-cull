@@ -1,11 +1,6 @@
----
-name: yolo-custom-training
-description: Technical approach for fine-tuning YOLOv8 Nano on custom annotated datasets for subject and eye detection, including dataset structure, training trigger flow, progress tracking, model persistence, and automatic reuse in photo culling software.
----
-
 # YOLO Custom Training (Fine-Tuning Pipeline)
 
-This skill documents the end-to-end pipeline for fine-tuning a YOLOv8 Nano model on user-annotated bounding boxes for subject and eye detection in photo culling workflows.
+This document details the end-to-end pipeline for fine-tuning a YOLOv8 Nano model on user-annotated bounding boxes for subject and eye detection in photo culling workflows.
 
 ```mermaid
 flowchart TD

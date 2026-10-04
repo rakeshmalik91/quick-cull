@@ -11,6 +11,10 @@ from culler.paths import DATASET_DIR
 
 ANNOTATIONS_FILENAME = "annotations.json"
 
+#: (annotations path, mtime_ns) -> parsed annotations. Avoids re-reading and re-resolving
+#: every key on each directory scan.
+_ANNOTATION_CACHE: Dict[Tuple[str, int], Dict[str, Dict[str, Any]]] = {}
+
 
 def get_dataset_dir(dataset_dir: Optional[str] = None) -> Path:
     """Returns the base dataset directory Path."""
@@ -59,40 +63,58 @@ def load_manual_annotations(dataset_dir: Optional[str] = None) -> Dict[str, Dict
             "updated_at": "..."
         }
     }
+
+    Cached by (path, mtime_ns): this runs on every directory scan, and the resolve()
+    per stored key made each scan scale with the size of the annotation file.
     """
     json_path = get_annotations_file(dataset_dir)
     if not json_path.exists():
         return {}
-    
+
+    try:
+        stamp = json_path.stat().st_mtime_ns
+    except OSError:
+        return {}
+
+    cached = _ANNOTATION_CACHE.get((str(json_path), stamp))
+    if cached is not None:
+        return cached
+
     try:
         with open(json_path, "r", encoding="utf-8") as f:
             raw_data = json.load(f)
-            
-        annotations: Dict[str, Dict[str, Any]] = {}
-        for raw_path, record in raw_data.items():
-            norm_path = str(Path(raw_path).resolve())
-            det_box = None
-            if record.get("manual_detection_box"):
-                b = record["manual_detection_box"]
-                if isinstance(b, (list, tuple)) and len(b) == 4:
-                    det_box = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
-                    
-            eye_box = None
-            if record.get("manual_eye_box"):
-                eb = record["manual_eye_box"]
-                if isinstance(eb, (list, tuple)) and len(eb) == 4:
-                    eye_box = (float(eb[0]), float(eb[1]), float(eb[2]), float(eb[3]))
-                    
-            annotations[norm_path] = {
-                "manual_detection_box": det_box,
-                "manual_eye_box": eye_box,
-                "filename": record.get("filename", Path(raw_path).name),
-                "updated_at": record.get("updated_at", "")
-            }
-        return annotations
+
+            annotations: Dict[str, Dict[str, Any]] = {}
+            for raw_path, record in raw_data.items():
+                norm_path = str(Path(raw_path).resolve())
+                det_box = None
+                if record.get("manual_detection_box"):
+                    b = record["manual_detection_box"]
+                    if isinstance(b, (list, tuple)) and len(b) == 4:
+                        det_box = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+
+                eye_box = None
+                if record.get("manual_eye_box"):
+                    eb = record["manual_eye_box"]
+                    if isinstance(eb, (list, tuple)) and len(eb) == 4:
+                        eye_box = (float(eb[0]), float(eb[1]), float(eb[2]), float(eb[3]))
+
+                annotations[norm_path] = {
+                    "manual_detection_box": det_box,
+                    "manual_eye_box": eye_box,
+                    "filename": record.get("filename", Path(raw_path).name),
+                    "updated_at": record.get("updated_at", "")
+                }
+            _ANNOTATION_CACHE[(str(json_path), stamp)] = annotations
+            return annotations
     except Exception as e:
         print(f"Error loading manual annotations from {json_path}: {e}")
         return {}
+
+
+def clear_manual_annotation_cache() -> None:
+    """Drop the memoised annotations (call after writing annotations.json)."""
+    _ANNOTATION_CACHE.clear()
 
 
 def get_manual_annotation(image_path: str, dataset_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -141,7 +163,8 @@ def save_manual_annotation(
             
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(raw_data, f, indent=2)
-            
+
+        _ANNOTATION_CACHE.clear()
         return True
     except Exception as e:
         print(f"Error saving manual annotation to {dataset_dir}: {e}")
@@ -163,6 +186,7 @@ def delete_manual_annotation(image_path: str, dataset_dir: Optional[str] = None)
             del raw_data[norm_path]
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(raw_data, f, indent=2)
+            _ANNOTATION_CACHE.clear()
         return True
     except Exception as e:
         print(f"Error deleting manual annotation: {e}")

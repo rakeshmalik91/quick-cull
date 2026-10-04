@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import threading
+import time
 from enum import Enum
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Callable, Union, Tuple
@@ -13,8 +14,55 @@ from .exif_wrapper import ExifToolWrapper
 from .image_loader import ImageLoader
 from .db_manager import DatabaseManager
 from .dataset_exporter import load_manual_annotations
+from .logger import log_error
 
 Union_Path_Str = Union[Path, str]
+
+
+class _ProgressThrottle:
+    """Emit at most one progress update per interval (or per percent step).
+
+    Folder scans call back once per photo, and the GUI turns each callback into an
+    ``after(0, ...)``; a 5000-photo folder queued 5000 UI tasks for a progress bar that
+    only changes by 0.02% between them.
+    """
+
+    def __init__(self, callback: Optional[Callable[..., None]], interval: float = 0.1):
+        self._callback = callback
+        self._interval = interval
+        self._last_emit = 0.0
+        self._last_done = -1
+        self._last_total = -1
+
+    def __call__(self, done: int, total: int, filename: str = "") -> None:
+        if self._callback is None:
+            return
+
+        now = time.monotonic()
+        percent = int(done * 100 / total) if total else 0
+        percent_changed = percent != int(self._last_done * 100 / self._last_total) if self._last_total else True
+        if done != self._last_done and not percent_changed and (now - self._last_emit) < self._interval:
+            return
+
+        self._last_emit = now
+        self._last_done = done
+        self._last_total = total
+
+        try:
+            self._callback(done, total, filename)
+        except TypeError:
+            self._callback(done, total)
+
+
+def _emit_progress(callback: Optional[Callable[..., None]], done: int, total: int,
+                   filename: str = "") -> None:
+    """Fire a progress callback with the 2- or 3-argument signature it accepts."""
+    if callback is None:
+        return
+    try:
+        callback(done, total, filename)
+    except TypeError:
+        callback(done, total)
 
 
 def resolve_input_path(path_input: Union_Path_Str) -> Tuple[Path, Optional[Path]]:
@@ -174,10 +222,18 @@ class CullingSession:
     tagging (Scan for Blur & Scan for Duplicate), batch operations, and reporting.
     """
 
-    def __init__(self, exif_wrapper: Optional[ExifToolWrapper] = None, db_manager: Optional[DatabaseManager] = None):
+    def __init__(
+        self,
+        exif_wrapper: Optional[ExifToolWrapper] = None,
+        db_manager: Optional[DatabaseManager] = None,
+        image_loader: Optional[ImageLoader] = None,
+    ):
+        # Sessions are per tab, but decoding services are shared app-wide: one cache
+        # means a photo shown in two tabs is decoded once, and switching tabs does not
+        # throw away the decoded images of the tab you are leaving.
         self.exif_wrapper = exif_wrapper or ExifToolWrapper()
         self.db = db_manager or DatabaseManager()
-        self.image_loader = ImageLoader(exif_wrapper=self.exif_wrapper)
+        self.image_loader = image_loader or ImageLoader(exif_wrapper=self.exif_wrapper)
         self.items: List[ImageItem] = []
         self.directory: Optional[Path] = None
 
@@ -300,6 +356,8 @@ class CullingSession:
             except TypeError:
                 progress_callback(0, len(self.items))
 
+        throttled = _ProgressThrottle(progress_callback)
+
         # Fetch saved DB records for this directory
         db_records = self.db.get_all_records_for_dir(str(dir_path))
         manual_annos = load_manual_annotations(dataset_dir=str(self.db.dataset_dir) if self.db else None)
@@ -347,10 +405,7 @@ class CullingSession:
                 item.manual_eye_box = m_anno.get("manual_eye_box")
 
             if progress_callback:
-                try:
-                    progress_callback(i + 1, len(self.items), item.filename)
-                except TypeError:
-                    progress_callback(i + 1, len(self.items))
+                throttled(i + 1, len(self.items), item.filename)
 
         return self.items
 
@@ -358,18 +413,33 @@ class CullingSession:
         """
         Save/update image item record in SQLite DB (handles stacked pairs, tags, & detection boxes).
         """
-        if self.db:
+        self.save_item_records([item])
+
+    def save_item_records(self, items: List[ImageItem]):
+        """Persist many items in a single connection and transaction.
+
+        A folder scan upserts every photo, so per-item transactions made scanning cost
+        one connection plus one commit per photo.
+        """
+        if not self.db:
+            return
+
+        records: List[Dict[str, Any]] = []
+        for item in items:
             for p in item.stacked_paths:
-                self.db.save_image_record(
-                    file_path=str(p),
-                    filename=p.name,
-                    flag=item.flag.value,
-                    rating=item.rating,
-                    sharpness=item.sharpness_score,
-                    tags=item.tags_str,
-                    detection_box=item.detection_box,
-                    eye_box=item.eye_box
-                )
+                records.append({
+                    "file_path": str(p),
+                    "filename": p.name,
+                    "flag": item.flag.value,
+                    "rating": item.rating,
+                    "sharpness": item.sharpness_score,
+                    "tags": item.tags_str,
+                    "detection_box": item.detection_box,
+                    "eye_box": item.eye_box,
+                })
+
+        if records:
+            self.db.save_image_records(records)
 
     def unflag_all_items(self) -> int:
         """
@@ -610,21 +680,24 @@ class CullingSession:
                     with yolo_lock:
                         item.sharpness_score = calc_blur(img, method=blur_method, yolo_model=yolo_model, eye_detection_method=eye_det_method)
             except Exception:
-                item.sharpness_score = 0.0
-            self.save_item_record(item)
+                    item.sharpness_score = 0.0
             return item
 
         with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as executor:
             completed = 0
-            for item in executor.map(calc_item, enumerate(items_to_process)):
-                completed += 1
-                if cancel_event and cancel_event.is_set():
-                    break
-                if progress_callback:
-                    try:
-                        progress_callback(completed, len(items_to_process), item.filename)
-                    except TypeError:
-                        progress_callback(completed, len(items_to_process))
+            changed: List[ImageItem] = []
+            try:
+                for item in executor.map(calc_item, enumerate(items_to_process)):
+                    completed += 1
+                    changed.append(item)
+                    if cancel_event and cancel_event.is_set():
+                        break
+                    if progress_callback:
+                        _emit_progress(progress_callback, completed, len(items_to_process), item.filename)
+            finally:
+                # One connection and one transaction for the whole pass, instead of one
+                # per photo from inside the worker.
+                self.save_item_records(changed)
 
     def _filter_items_by_file_type(self, file_type_filter: Optional[str]) -> List['ImageItem']:
         if not file_type_filter or file_type_filter == "All":
@@ -1097,13 +1170,28 @@ class CullingSession:
         return self.move_items_by_flag(FlagState.REJECT, trash_dir_name)
 
     def sync_exif_ratings(self) -> int:
-        success_count = 0
+        """Write star ratings back into the files, one ExifTool call per rating value.
+
+        Ratings are written per distinct value rather than per file: exiftool applies
+        one value to every path in an invocation, so a folder of 200 three-star photos
+        costs one process instead of 200.
+        """
+        entries: List[Tuple[str, int]] = []
         for item in self.items:
             if item.rating > 0:
                 for p in item.stacked_paths:
-                    if self.exif_wrapper.write_rating(str(p), item.rating):
-                        success_count += 1
-        return success_count
+                    entries.append((str(p), item.rating))
+
+        if not entries:
+            return 0
+
+        if hasattr(self.exif_wrapper, "write_ratings_batch"):
+            outcomes = self.exif_wrapper.write_ratings_batch(entries)
+        else:
+            # Fall back to the per-file writer for a stubbed/older wrapper.
+            outcomes = {path: self.exif_wrapper.write_rating(path, rating)
+                        for path, rating in entries}
+        return sum(1 for ok in outcomes.values() if ok)
 
     def export_manifest(self, output_path: Union_Path_Str, format_type: str = "json") -> str:
         out_path = Path(output_path)

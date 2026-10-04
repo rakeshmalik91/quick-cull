@@ -2,6 +2,13 @@ from typing import Callable, Optional, List
 import tkinter as tk
 import customtkinter as ctk
 
+from .tooltip import ToolTip
+
+
+ABOUT_ICON = "\u24d8"  # circled small i
+
+ADD_TAB_ICON = "+"
+
 
 class TabBar(ctk.CTkFrame):
     def __init__(
@@ -11,6 +18,7 @@ class TabBar(ctk.CTkFrame):
         on_tab_closed: Callable[[int], None] = None,
         on_tab_reordered: Callable[[int, int], None] = None,
         on_new_tab: Callable[[], None] = None,
+        on_about: Callable[[], None] = None,
         **kwargs
     ):
         super().__init__(master, height=36, corner_radius=0, **kwargs)
@@ -20,6 +28,7 @@ class TabBar(ctk.CTkFrame):
         self.on_tab_closed = on_tab_closed
         self.on_tab_reordered = on_tab_reordered
         self.on_new_tab = on_new_tab
+        self.on_about = on_about
 
         self._tab_buttons: List[ctk.CTkButton] = []
         self._close_buttons: List[ctk.CTkButton] = []
@@ -43,20 +52,50 @@ class TabBar(ctk.CTkFrame):
         self._inner_frame = ctk.CTkFrame(self._canvas, fg_color="transparent")
         self._canvas_window = self._canvas.create_window((0, 0), window=self._inner_frame, anchor="nw")
 
-        self._btn_add = ctk.CTkButton(
+        self._btn_about = ctk.CTkButton(
             self,
-            text="Open New Folder",
-            width=110,
-            height=28,
+            text=ABOUT_ICON,
+            width=30,
+            height=30,
             fg_color="#2b2b2b",
             hover_color="#3a3a3a",
-            font=ctk.CTkFont(size=11, weight="bold"),
+            font=ctk.CTkFont(size=13),
+            command=self._handle_about
+        )
+        self._btn_about.pack(side="right", padx=(2, 6), pady=3)
+        ToolTip(self._btn_about, "About")
+
+        # Lives inside the scrolling strip so it always sits right after the last tab.
+        self._btn_add = ctk.CTkButton(
+            self._inner_frame,
+            text=ADD_TAB_ICON,
+            width=30,
+            height=30,
+            fg_color="#2b2b2b",
+            hover_color="#3a3a3a",
+            font=ctk.CTkFont(size=16, weight="bold"),
             command=self._handle_new_tab
         )
-        self._btn_add.pack(side="right", padx=(2, 6), pady=3)
+        ToolTip(self._btn_add, "Open New Folder")
+        self._btn_add.pack(side="left", padx=(6, 2), pady=3)
 
     def _on_canvas_configure(self, event):
         self._canvas.itemconfig(self._canvas_window, width=event.width)
+
+    def _relayout(self):
+        """Re-pack the strip so tab buttons keep their order and '+' stays last."""
+        for btn in self._tab_buttons:
+            btn.pack_forget()
+        for close_btn in self._close_buttons:
+            close_btn.pack_forget()
+        self._btn_add.pack_forget()
+
+        for index, btn in enumerate(self._tab_buttons):
+            btn.pack(side="left", padx=(2, 0), pady=3)
+            self._close_buttons[index].pack(side="left", padx=(0, 4), pady=3)
+
+        self._btn_add.pack(side="left", padx=(6, 2), pady=3)
+        self._update_scroll_region()
 
     def add_tab(self, label: str) -> int:
         idx = self._tab_count
@@ -92,11 +131,10 @@ class TabBar(ctk.CTkFrame):
             command=lambda cb=None: None  # Set below with current reference
         )
         close_btn.configure(command=lambda cb=close_btn: self._handle_close_btn_click(cb))
-        close_btn.pack(side="left", padx=(0, 4), pady=3)
 
         self._tab_buttons.append(btn)
         self._close_buttons.append(close_btn)
-        self._update_scroll_region()
+        self._relayout()
         return idx
 
     def remove_tab(self, index: int):
@@ -112,6 +150,7 @@ class TabBar(ctk.CTkFrame):
 
         if self._tab_count == 0:
             self._active_index = 0
+            self._relayout()
             return
 
         if self._active_index >= self._tab_count:
@@ -126,7 +165,7 @@ class TabBar(ctk.CTkFrame):
                 text_color="#cccccc" if i != self._active_index else "#ffffff"
             )
 
-        self._update_scroll_region()
+        self._relayout()
 
     def set_active(self, index: int):
         if not (0 <= index < self._tab_count):
@@ -176,6 +215,7 @@ class TabBar(ctk.CTkFrame):
             b.pack_forget()
         for cb in self._close_buttons:
             cb.pack_forget()
+        self._btn_add.pack_forget()
         for i, b in enumerate(self._tab_buttons):
             b.pack(side="left", padx=(2, 0), pady=3)
             self._close_buttons[i].pack(side="left", padx=(0, 4), pady=3)
@@ -184,6 +224,7 @@ class TabBar(ctk.CTkFrame):
                 hover_color="#3a3a3a" if i != self._active_index else "#2b6cb0",
                 text_color="#cccccc" if i != self._active_index else "#ffffff"
             )
+        self._btn_add.pack(side="left", padx=(6, 2), pady=3)
         self._update_scroll_region()
 
     def _format_label(self, label: str, max_len: int = 40) -> str:
@@ -223,6 +264,10 @@ class TabBar(ctk.CTkFrame):
     def _handle_new_tab(self):
         if self.on_new_tab:
             self.on_new_tab()
+
+    def _handle_about(self):
+        if self.on_about:
+            self.on_about()
 
     def _on_drag_start(self, event):
         idx = self._get_index_for_widget(event.widget)
