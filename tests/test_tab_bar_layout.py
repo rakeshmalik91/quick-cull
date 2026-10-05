@@ -181,6 +181,9 @@ class TestTabBarCloseAll(_TabBarTestCase):
             on_tab_closed=lambda idx: None,
         )
 
+    def test_close_all_button_text_is_close_all_tabs(self):
+        self.assertEqual(self.bar._btn_close_all.cget("text"), "Close All Tabs")
+
     def test_close_all_button_is_hidden_with_no_tabs(self):
         self.assertFalse(self.bar._btn_close_all.winfo_ismapped())
 

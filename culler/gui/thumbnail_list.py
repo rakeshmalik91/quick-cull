@@ -20,6 +20,25 @@ from .row_pool import (
 )
 
 
+def get_consumed_memory_mb(image_loader: Optional[ImageLoader] = None) -> float:
+    """Return process RSS memory consumption in megabytes, with fallback."""
+    try:
+        import psutil
+        rss = psutil.Process().memory_info().rss / (1024.0 * 1024.0)
+        if rss > 0:
+            return rss
+    except Exception:
+        pass
+    if image_loader is not None and hasattr(image_loader, "cache_stats"):
+        try:
+            stats = image_loader.cache_stats()
+            total_bytes = stats.get("thumb_bytes", 0) + stats.get("full_bytes", 0)
+            return total_bytes / (1024.0 * 1024.0)
+        except Exception:
+            pass
+    return 0.0
+
+
 class ThumbnailList(ctk.CTkFrame):
     """
     Left sidebar displaying image thumbnails.
@@ -170,7 +189,7 @@ class ThumbnailList(ctk.CTkFrame):
         self.progress_frame.pack(side="bottom", fill="x", padx=4, pady=(0, 2))
         self.progress_frame.pack_propagate(False)
 
-        self.lbl_load_timing = ctk.CTkLabel(
+        self.lbl_pool_stats = ctk.CTkLabel(
             self.progress_frame,
             text="",
             height=14,
@@ -178,7 +197,8 @@ class ThumbnailList(ctk.CTkFrame):
             text_color="#6f8ba6",
             anchor="w"
         )
-        self.lbl_load_timing.pack(side="top", fill="x", padx=(2, 0))
+        self.lbl_pool_stats.pack(side="top", fill="x", padx=(2, 0))
+        self.lbl_load_timing = self.lbl_pool_stats
 
     @staticmethod
     def _format_elapsed(seconds: float) -> str:
@@ -301,18 +321,23 @@ class ThumbnailList(ctk.CTkFrame):
             return time.monotonic() - self._thumb_time_start
         return None
 
-    def _update_load_timing(self):
-        if self._folder_time_final is None and self._folder_time_start is None:
-            self.lbl_load_timing.configure(text="")
+    @property
+    def items(self) -> List:
+        return self.row_pool.items if hasattr(self, "row_pool") else []
+
+    def _update_pool_stats(self):
+        """Update footer label with loaded pool size and consumed memory."""
+        items = self.items
+        if not items and self._folder_time_final is None and self._folder_time_start is None:
+            self.lbl_pool_stats.configure(text="")
             return
-        parts = []
-        folder_elapsed = self._elapsed_folder()
-        if folder_elapsed is not None:
-            parts.append(f"Folder: {self._format_elapsed(folder_elapsed)}")
-        thumb_elapsed = self._elapsed_thumb()
-        if thumb_elapsed is not None:
-            parts.append(f"Thumbs: {self._format_elapsed(thumb_elapsed)}")
-        self.lbl_load_timing.configure(text="   |   ".join(parts))
+        loaded = self.row_pool.loaded_pool_size if hasattr(self, "row_pool") else 0
+        mem_mb = get_consumed_memory_mb(self.image_loader)
+        text = f"Loaded Pool: {loaded}   |   Memory: {int(round(mem_mb))} MB"
+        self.lbl_pool_stats.configure(text=text)
+
+    def _update_load_timing(self):
+        self._update_pool_stats()
 
     def _ensure_timing_tick(self):
         if self._timing_after_id is not None:
@@ -342,7 +367,7 @@ class ThumbnailList(ctk.CTkFrame):
         self._thumb_time_final = None
         self._folder_scan_active = False
         self._load_cycle_active = False
-        self.lbl_load_timing.configure(text="")
+        self._update_pool_stats()
 
     def _handle_select_all(self):
         if self.on_select_all:
@@ -899,6 +924,7 @@ class ThumbnailList(ctk.CTkFrame):
         if applied:
             self._loaded_thumbs += applied
             self._update_progress_ui()
+            self._update_pool_stats()
 
     def _apply_thumb_image(self, path_str: str, pil_thumb: Image.Image) -> bool:
         btn = self._btn_map.get(path_str)
@@ -917,6 +943,7 @@ class ThumbnailList(ctk.CTkFrame):
         self._apply_thumb_image(path_str, pil_thumb)
         self._loaded_thumbs += 1
         self._update_progress_ui()
+        self._update_pool_stats()
 
     def destroy(self):
         if hasattr(self, "_batch_after_id") and self._batch_after_id is not None:

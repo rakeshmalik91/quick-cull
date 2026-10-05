@@ -682,7 +682,7 @@ class TestThumbnailList(unittest.TestCase):
         items = [self._make_item(f"IMG_{i:03d}.JPG") for i in range(3)]
         self.list_widget.update_items(items, selected_idx=0)
         self.assertIsNone(self.list_widget._thumb_time_start)
-        self.assertEqual(self.list_widget.lbl_load_timing.cget("text"), "")
+        self.assertIn("Loaded Pool: 3", self.list_widget.lbl_load_timing.cget("text"))
 
     def test_load_timing_shows_folder_and_thumb_durations(self):
         """
@@ -690,10 +690,10 @@ class TestThumbnailList(unittest.TestCase):
         """
         started = time.monotonic() - 3.0
         self.list_widget.start_load_timing(started)
-        self.assertIn("Folder:", self.list_widget.lbl_load_timing.cget("text"))
+        self.assertIn("Loaded Pool:", self.list_widget.lbl_load_timing.cget("text"))
 
         self.list_widget.start_thumb_timing()
-        self.assertIn("Thumbs:", self.list_widget.lbl_load_timing.cget("text"))
+        self.assertIn("Memory:", self.list_widget.lbl_load_timing.cget("text"))
 
         self.list_widget.finish_folder_timing()
         self.assertAlmostEqual(self.list_widget._folder_time_final, 3.0, delta=0.5)
@@ -719,8 +719,8 @@ class TestThumbnailList(unittest.TestCase):
 
         self.list_widget._update_progress_ui()
         text = self.list_widget.lbl_load_timing.cget("text")
-        self.assertIn("Folder:", text)
-        self.assertIn("Thumbs:", text)
+        self.assertIn("Loaded Pool:", text)
+        self.assertIn("Memory:", text)
         self.assertFalse(self.list_widget._load_cycle_active,
                          "the duration must stop once the load settles")
 
@@ -745,7 +745,7 @@ class TestThumbnailList(unittest.TestCase):
         thumb_final = self.list_widget._thumb_time_final
 
         self.list_widget.update_items([self._make_item("FILTERED.JPG")], selected_idx=0)
-        self.assertEqual(self.list_widget.lbl_load_timing.cget("text"), text)
+        self.assertIn("Loaded Pool: 1", self.list_widget.lbl_load_timing.cget("text"))
         self.assertEqual(self.list_widget._thumb_time_final, thumb_final)
 
     def test_finish_load_timing_freezes_folder_and_thumb(self):
@@ -760,7 +760,7 @@ class TestThumbnailList(unittest.TestCase):
         self.assertAlmostEqual(self.list_widget._folder_time_final, 2.0, delta=0.5)
         self.assertIsNotNone(self.list_widget._thumb_time_final)
         self.assertIsNone(self.list_widget._timing_after_id)
-        self.assertIn("Folder:", self.list_widget.lbl_load_timing.cget("text"))
+        self.assertIn("Loaded Pool:", self.list_widget.lbl_load_timing.cget("text"))
 
     def test_show_load_stats_restores_saved_totals(self):
         """
@@ -768,7 +768,8 @@ class TestThumbnailList(unittest.TestCase):
         """
         self.list_widget.show_load_stats(4.5, 1.25)
         text = self.list_widget.lbl_load_timing.cget("text")
-        self.assertEqual(text, "Folder: 4.5s   |   Thumbs: 1.2s")
+        self.assertIn("Loaded Pool:", text)
+        self.assertIn("Memory:", text)
         self.assertIsNone(self.list_widget._timing_after_id)
         self.assertFalse(self.list_widget._load_cycle_active)
         self.assertFalse(self.list_widget._folder_scan_active)
@@ -797,7 +798,7 @@ class TestThumbnailList(unittest.TestCase):
         self.list_widget.freeze_load_timing()
         self.assertIsNotNone(self.list_widget._thumb_time_final)
         self.assertEqual(self.list_widget._folder_time_final, 4.5)
-        self.assertIn("Folder: 4.5s", self.list_widget.lbl_load_timing.cget("text"))
+        self.assertIn("Loaded Pool:", self.list_widget.lbl_load_timing.cget("text"))
 
     def test_load_stats_emitted_on_freeze(self):
         """
@@ -831,9 +832,19 @@ class TestThumbnailList(unittest.TestCase):
         """
         self.list_widget.start_load_timing(time.monotonic() - 1.0)
         self.list_widget.update_items([], selected_idx=0)
-        self.assertIn("Folder:", self.list_widget.lbl_load_timing.cget("text"))
+        self.assertIn("Loaded Pool:", self.list_widget.lbl_load_timing.cget("text"))
         self.assertIsNotNone(self.list_widget._folder_time_final)
         self.assertIsNone(self.list_widget._timing_after_id)
+
+    def test_pool_stats_shows_loaded_pool_size_and_memory(self):
+        items = [self._make_item(f"IMG_{i:03d}.JPG") for i in range(15)]
+        self.list_widget.start_load_timing()
+        self.list_widget.update_items(items, selected_idx=0)
+        self.root.update()
+        text = self.list_widget.lbl_pool_stats.cget("text")
+        self.assertIn("Loaded Pool: 15", text)
+        self.assertIn("Memory:", text)
+        self.assertIn("MB", text)
 
 
     def test_scrolling_repositions_container_window_in_canvas(self):

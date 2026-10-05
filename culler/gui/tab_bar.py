@@ -9,7 +9,8 @@ ABOUT_ICON = "\u24d8"  # circled small i
 
 ADD_TAB_ICON = "+"
 
-CLOSE_ALL_ICON = "\u2715\u2715"  # ✕✕
+CLOSE_ALL_LABEL = "Close All Tabs"
+CLOSE_ALL_ICON = CLOSE_ALL_LABEL
 
 
 class TabBar(ctk.CTkFrame):
@@ -78,12 +79,12 @@ class TabBar(ctk.CTkFrame):
 
         self._btn_close_all = ctk.CTkButton(
             self,
-            text=CLOSE_ALL_ICON,
-            width=30,
+            text=CLOSE_ALL_LABEL,
+            width=105,
             height=30,
             fg_color="#2b2b2b",
             hover_color="#3a3a3a",
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=11),
             command=self._handle_close_all
         )
         self._btn_close_all.pack(side="right", padx=2, pady=3)

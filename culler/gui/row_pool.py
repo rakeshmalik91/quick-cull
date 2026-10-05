@@ -301,6 +301,16 @@ class RowPool:
 
     # ------------------------------------------------------------------ syncing
 
+    @property
+    def loaded_pool_size(self) -> int:
+        """Number of slots in the pool that are currently bound to an item."""
+        return sum(1 for it in self._slot_items if it is not None)
+
+    @property
+    def pool_size(self) -> int:
+        """Total number of slots allocated in the pool."""
+        return len(self._slots)
+
     def desired_pool_size(self) -> int:
         """Slots needed to cover the viewport plus overscan (capped at POOL_TARGET_ROWS)."""
         return min(POOL_TARGET_ROWS, max(1, len(self.items)))
@@ -360,6 +370,8 @@ class RowPool:
         first_bound = self._slot_items[0] if self._slot_items and self._slot_items[0] is not None else first
         self._update_window_position(self.offset_of(first_bound))
         self.start_scroll_polling()
+        if hasattr(self.owner, "_update_pool_stats"):
+            self.owner._update_pool_stats()
 
     def _reconcile(self, target: List[int], budget: int = REBIND_ROWS_PER_TICK) -> None:
         """Bind the fewest slots that cover ``target``, in index order.
@@ -493,6 +505,8 @@ class RowPool:
     def _release_all_slots(self) -> None:
         for slot_index in range(len(self._slots)):
             self._release_slot(slot_index)
+        if hasattr(self.owner, "_update_pool_stats"):
+            self.owner._update_pool_stats()
 
     def _release_slot(self, slot_index: int) -> None:
         slot = self._slots[slot_index]
