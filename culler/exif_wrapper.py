@@ -4,10 +4,14 @@ import json
 import io
 import struct
 import subprocess
+import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from PIL import Image
+
+from .logger import log_error
 
 
 def _run_cli(cmd, **kwargs):
@@ -52,12 +56,19 @@ class ExifToolWrapper:
     #: has not been closed yet (a full-resolution JpgFromRaw can be several MB).
     PREVIEW_TAIL_BYTES = 8 * 1024 * 1024
 
+    #: Orientation is read on every RAW decode, from up to 8 thumbnail workers at once.
+    #: The cache was a plain dict that was never pruned, so a long session accumulated
+    #: one entry per (path, mtime) it had ever seen. It is now an LRU keyed by content
+    #: identity, capped well above the largest tab (600 entries ~ 3000 photos).
+    MAX_ORIENTATION_CACHE = 600
+
     def __init__(self, exiftool_path: Optional[str] = None):
         if exiftool_path:
             self.exiftool_path = str(Path(exiftool_path).resolve())
         else:
             self.exiftool_path = self._find_default_exiftool()
-        self._orientation_cache: Dict[Tuple[str, float], int] = {}
+        self._orientation_cache: "OrderedDict[Tuple[str, int, int], int]" = OrderedDict()
+        self._orientation_lock = threading.RLock()
         self._is_available: Optional[bool] = None
 
     def _find_default_exiftool(self) -> str:
@@ -130,19 +141,77 @@ class ExifToolWrapper:
             pass
         return None
 
-    def get_orientation(self, image_path: str) -> int:
+    @staticmethod
+    def content_identity(file_path: Any) -> Tuple[str, int, int]:
+        """``(normcased path, mtime_ns, size)`` in a single stat.
+
+        One identity for every cache in the app, so an externally edited file is a miss
+        and a case-only rename does not silently hit a stale entry. An unstattable path
+        still yields a usable key with zeroed stamps, so caches stay deterministic for
+        paths that do not exist (and for tests).
+        """
+        path_str = os.fspath(file_path) if hasattr(os, "fspath") else str(file_path)
+        try:
+            st = os.stat(path_str)
+            return (os.path.normcase(path_str), st.st_mtime_ns, int(st.st_size))
+        except (OSError, ValueError):
+            return (os.path.normcase(path_str), 0, 0)
+
+    def _orientation_cached(self, cache_key: Tuple[str, int, int]) -> Optional[int]:
+        with self._orientation_lock:
+            hit = self._orientation_cache.get(cache_key)
+            if hit is not None:
+                self._orientation_cache.move_to_end(cache_key)
+            return hit
+
+    def _orientation_store(self, cache_key: Tuple[str, int, int], orientation: int) -> None:
+        with self._orientation_lock:
+            self._orientation_cache[cache_key] = orientation
+            self._orientation_cache.move_to_end(cache_key)
+            while len(self._orientation_cache) > self.MAX_ORIENTATION_CACHE:
+                self._orientation_cache.popitem(last=False)
+
+    def clear_orientation_cache(self) -> None:
+        with self._orientation_lock:
+            self._orientation_cache.clear()
+
+    def invalidate_orientation_paths(self, file_paths) -> int:
+        """Forget cached orientations for the given files. Returns entries removed."""
+        targets = {os.path.normcase(str(p)) for p in file_paths}
+        if not targets:
+            return 0
+        removed = 0
+        with self._orientation_lock:
+            for key in [k for k in self._orientation_cache if k[0] in targets]:
+                self._orientation_cache.pop(key, None)
+                removed += 1
+        return removed
+
+    def get_orientation(self, image_path: str, cache_key: Optional[Tuple[str, int, int]] = None) -> int:
         """
         Extract EXIF orientation integer (1..8) for an image file.
         Fast lookup using pure Python TIFF header parsing for RAW/TIFF files (< 0.05ms),
         PIL getexif for JPEGs/PNGs (< 0.1ms), falling back to ExifTool CLI process only if needed.
-        Results are cached by (path, mtime) to avoid repeated I/O.
+        Results are cached by content identity ``(path, mtime_ns, size)`` so repeated
+        decodes of one file cost no I/O, and the cache is bounded (see
+        :attr:`MAX_ORIENTATION_CACHE`).
+
+        ``cache_key`` lets a caller that already stat'ed the file pass the identity in
+        instead of paying for another stat.
         """
-        if not image_path or not os.path.exists(image_path):
+        if not image_path:
             return 1
 
-        cache_key = (str(Path(image_path).resolve()), os.path.getmtime(image_path))
-        if cache_key in self._orientation_cache:
-            return self._orientation_cache[cache_key]
+        if cache_key is None:
+            try:
+                st = os.stat(image_path)
+            except (OSError, ValueError):
+                return 1
+            cache_key = (os.path.normcase(str(image_path)), st.st_mtime_ns, int(st.st_size))
+
+        hit = self._orientation_cached(cache_key)
+        if hit is not None:
+            return hit
 
         result = 1
 
@@ -152,9 +221,8 @@ class ExifToolWrapper:
             if ext in [".arw", ".tif", ".tiff", ".dng", ".nef", ".cr2", ".cr3"]:
                 orient = self._get_tiff_orientation_pure_py(image_path)
                 if orient is not None:
-                    result = orient
-                    self._orientation_cache[cache_key] = result
-                    return result
+                    self._orientation_store(cache_key, orient)
+                    return orient
         except Exception:
             pass
 
@@ -165,9 +233,8 @@ class ExifToolWrapper:
                 if exif and 0x0112 in exif:
                     val_int = int(exif[0x0112])
                     if 1 <= val_int <= 8:
-                        result = val_int
-                        self._orientation_cache[cache_key] = result
-                        return result
+                        self._orientation_store(cache_key, val_int)
+                        return val_int
         except Exception:
             pass
 
@@ -196,7 +263,7 @@ class ExifToolWrapper:
             except Exception:
                 pass
 
-        self._orientation_cache[cache_key] = result
+        self._orientation_store(cache_key, result)
         return result
 
     def extract_preview_bytes(self, arw_path: str, min_width: int = 1200) -> Optional[bytes]:
@@ -325,7 +392,9 @@ class ExifToolWrapper:
             return [{} for _ in image_paths]
 
         if not self.is_available():
-            return [self._get_pil_fallback_metadata(p) for p in image_paths]
+            # ExifTool is the fast path; when it is unavailable the PIL reader is all
+            # there is, and it used to run serially over the whole folder.
+            return self._pil_fallback_metadata_many(image_paths)
 
         limit = max(1, self.BATCH_ARGV_LIMIT)
         chunks = [image_paths[i:i + limit] for i in range(0, len(image_paths), limit)]
@@ -506,13 +575,28 @@ class ExifToolWrapper:
             print(f"ExifTool batch metadata error: {e}")
             return [self._get_pil_fallback_metadata(p) for p in image_paths]
 
+    def _pil_fallback_metadata_many(self, image_paths: List[str]) -> List[Dict[str, Any]]:
+        """Pure-PIL metadata for a batch, on a bounded pool.
+
+        Only reached when the ExifTool binary is missing. It is pure Python and
+        I/O-bound per file, so it scales like the ExifTool path instead of running
+        one file at a time.
+        """
+        if not image_paths:
+            return []
+        workers = min(self.BATCH_CONCURRENCY, len(image_paths))
+        if workers <= 1:
+            return [self._get_pil_fallback_metadata(p) for p in image_paths]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(self._get_pil_fallback_metadata, image_paths))
+
     def _get_pil_fallback_metadata(self, image_path: str) -> Dict[str, Any]:
         """
         Pure Python PIL fallback for extracting EXIF metadata when ExifTool is unavailable.
         """
         res = {
             "file_type": Path(image_path).suffix.upper().lstrip("."),
-            "orientation": self.get_orientation(image_path),
+            "orientation": 1,
             "width": 0,
             "height": 0,
             "rating": 0,
@@ -524,6 +608,17 @@ class ExifToolWrapper:
             "focal_length": "N/A",
             "date_taken": "N/A",
         }
+
+        # One stat, then hand the identity to get_orientation so the orientation lookup
+        # does not stat again. A path that does not exist keeps the defaults: going on
+        # to the ExifTool branch there would spawn one process per missing file.
+        try:
+            st = os.stat(image_path)
+        except (OSError, ValueError):
+            return res
+        identity = (os.path.normcase(str(image_path)), st.st_mtime_ns, int(st.st_size))
+        res["orientation"] = self.get_orientation(image_path, cache_key=identity)
+
         try:
             with Image.open(image_path) as img:
                 res["width"], res["height"] = img.size

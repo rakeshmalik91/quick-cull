@@ -51,11 +51,11 @@ class TestSharedDecodeServices(unittest.TestCase):
 
     def test_one_decode_is_visible_from_every_tab(self):
         thumb = Image.new("RGB", (400, 267), "blue")
-        key = ("D:/Photos/SHARED.JPG", 0.10, "camera")
-        self.loader._store_thumb(key, thumb)
+        shared = Path("D:/Photos/SHARED.JPG")
+        self.loader._store_thumb(self.loader.tier_key(shared, 0.10, "camera"), thumb)
 
         for session in self.sessions:
-            self.assertEqual(session.image_loader.get_cached_thumbnail(key[0]).size, (400, 267))
+            self.assertEqual(session.image_loader.get_cached_thumbnail(shared).size, (400, 267))
 
     def test_photo_in_two_tabs_is_decoded_once(self):
         temp_dir = tempfile.mkdtemp()
@@ -66,9 +66,9 @@ class TestSharedDecodeServices(unittest.TestCase):
             decodes = []
             original = ImageLoader._decode_and_store_full
 
-            def counting(self_, file_path_str, cache_key, raw_scale, white_balance):
+            def counting(self_, file_path_str, cache_key, raw_scale, white_balance, content=None):
                 decodes.append(cache_key)
-                return original(self_, file_path_str, cache_key, raw_scale, white_balance)
+                return original(self_, file_path_str, cache_key, raw_scale, white_balance, content)
 
             ImageLoader._decode_and_store_full = counting
             try:
@@ -108,10 +108,10 @@ class TestThumbCacheByteBudget(unittest.TestCase):
         resident = {}
         for tag, count in (("T1", 106), ("T2", 194), ("T3", 203)):
             for item in _items(count, tag):
-                self.loader._store_thumb((str(item.path), 0.10, "camera"), thumb)
+                self.loader._store_thumb(self.loader.tier_key(item.path, 0.10, "camera"), thumb)
             resident[tag] = sum(
                 1 for it in _items(count, tag)
-                if (str(it.path), 0.10, "camera") in self.loader._thumb_cache
+                if self.loader.tier_key(it.path, 0.10, "camera") in self.loader._thumb_cache
             )
 
         self.assertEqual(resident, {"T1": 106, "T2": 194, "T3": 203})
@@ -121,7 +121,7 @@ class TestThumbCacheByteBudget(unittest.TestCase):
         self.loader.MAX_THUMB_CACHE = 1000
 
         for i in range(8):
-            self.loader._store_thumb((f"D:/Photos/BIG_{i}.JPG", 0.10, "camera"),
+            self.loader._store_thumb(self.loader.tier_key(f"D:/Photos/BIG_{i}.JPG", 0.10, "camera"),
                                     Image.new("RGB", (1200, 800)))
 
         stats = self.loader.cache_stats()
@@ -132,7 +132,7 @@ class TestThumbCacheByteBudget(unittest.TestCase):
         self.loader.MAX_THUMB_CACHE_BYTES = 512 * 1024 * 1024
         self.loader.MAX_THUMB_CACHE = 5
         for i in range(12):
-            self.loader._store_thumb((f"D:/Photos/S_{i}.JPG", 0.10, "camera"),
+            self.loader._store_thumb(self.loader.tier_key(f"D:/Photos/S_{i}.JPG", 0.10, "camera"),
                                     Image.new("RGB", (8, 8)))
         self.assertEqual(len(self.loader._thumb_cache), 5)
 

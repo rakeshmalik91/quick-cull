@@ -10,6 +10,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog as fd, messagebox as mb, simpledialog
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set, Union
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ from culler.dataset_exporter import save_annotation, save_manual_annotation
 from culler.folder_watcher import FolderWatcher, FolderChange
 from culler.exif_wrapper import ExifToolWrapper
 from culler.image_loader import ImageLoader
+from culler.gui.metadata_panel import BAG_SETTINGS_KEY
 from culler.ml_trainer import train_custom_yolo
 from culler.paths import DATASET_DIR
 from bootstrap import APP_NAME, SplashScreen, adopt_default_root, apply_window_icon, launch_gui
@@ -99,6 +101,11 @@ class ImageCullerApp(ctk.CTk):
             self.after(10, lambda: self.state("zoomed"))
 
         self._load_request_id: int = 0
+        self._load_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="imgload")
+        # Speculative work is strictly subordinate to the photo on screen: one thread,
+        # so a burst of navigation cannot fan out into a decode of every neighbour.
+        self._prefetch_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefetch")
+        self._prefetch_generation: int = 0
 
         self.current_items: List[ImageItem] = []
         self.current_index: int = -1
@@ -392,13 +399,52 @@ class ImageCullerApp(ctk.CTk):
             log_error(f"Failed to handle dropped path '{path}': {e}")
         return False
 
+    def _release_tab_resources(self, tab: Dict[str, Any]) -> None:
+        """Drop everything a closed tab was holding.
+
+        The session holds an ``ImageItem`` per photo (metadata dict, stacked paths, tags),
+        the shared ``ImageLoader`` holds decoded pixels for every file it ever touched, and
+        the grid holds a ``CTkImage`` per painted thumbnail. Closing a tab without any of
+        that means the memory keeps growing for the life of the process, which is exactly
+        what a user who opens and closes folders notices.
+        """
+        session = tab.get("session")
+        if session is None:
+            return
+
+        paths = []
+        for item in list(session.items):
+            paths.extend(item.stacked_paths)
+            if item.path not in item.stacked_paths:
+                paths.append(item.path)
+
+        try:
+            self.image_loader.invalidate_paths(paths)
+        except Exception:
+            log_error("Failed to release image caches for a closed tab", exc_info=True)
+
+        try:
+            self.thumb_list.forget_paths(paths)
+        except Exception:
+            log_error("Failed to release thumbnail widgets for a closed tab", exc_info=True)
+
+        try:
+            session.release()
+        except Exception:
+            log_error("Failed to release a closed tab's session", exc_info=True)
+
     def _close_tab(self, index: int):
-        if len(self.tabs) <= 1:
+        if not (0 <= index < len(self.tabs)):
             return
 
         tab = self.tabs[index]
         session = tab["session"]
         closed_dir = str(session.directory) if session and session.directory else None
+
+        if tab.get("loading"):
+            # The scan worker keeps a reference to this tab dict and will fire
+            # _on_tab_scan_complete into it; let it finish, but stop it touching the UI.
+            tab["_released"] = True
 
         self.tab_bar.remove_tab(index)
         self.tabs.pop(index)
@@ -411,19 +457,69 @@ class ImageCullerApp(ctk.CTk):
             if not still_open:
                 self.folder_watcher.unwatch(closed_dir)
 
+        self._release_tab_resources(tab)
+
         if self.active_tab_index == index:
-            new_idx = min(index, len(self.tabs) - 1)
-            self.active_tab_index = new_idx
-            self.tab_bar.set_active(new_idx)
-            target = self.tabs[new_idx]
-            if not target["is_loaded"]:
-                self._load_tab_directory(target, show_progress=True)
+            # 0 with no tabs left is the app's empty-workspace convention; _get_active_tab
+            # returns None either way.
+            self.active_tab_index = max(0, min(index, len(self.tabs) - 1))
+            if self.tabs:
+                self.tab_bar.set_active(self.active_tab_index)
+                target = self.tabs[self.active_tab_index]
+                if not target["is_loaded"]:
+                    self._load_tab_directory(target, show_progress=True)
+                else:
+                    self._apply_tab_state(target)
             else:
-                self._apply_tab_state(target)
+                self._show_no_tabs_state()
         elif self.active_tab_index > index:
             self.active_tab_index -= 1
 
+        self._sync_loading_progress()
         self._persist_tabs_state()
+
+    def _close_all_tabs(self):
+        """Close every tab and release all of their memory."""
+        if not self.tabs:
+            return
+
+        tabs, self.tabs = self.tabs, []
+        for tab in tabs:
+            session = tab.get("session")
+            directory = str(session.directory) if session and session.directory else None
+            tab["_released"] = True
+            if directory:
+                self.folder_watcher.unwatch(directory)
+            self._release_tab_resources(tab)
+
+        self.tab_bar.remove_all_tabs()
+        self.active_tab_index = 0
+        self._show_no_tabs_state()
+        self._sync_loading_progress()
+        self._persist_tabs_state()
+        self._update_status("Closed all tabs and released their memory.")
+
+    def _show_no_tabs_state(self):
+        """Reset the workspace to empty after the last tab is closed."""
+        self.current_items = []
+        self.current_index = -1
+        self.selected_indices = set()
+        self.selection_anchor_idx = 0
+
+        try:
+            self.thumb_list.set_image_loader(None)
+            self.thumb_list.update_items([], selected_idx=-1)
+        except Exception:
+            log_error("Failed to clear the grid after closing tabs", exc_info=True)
+
+        try:
+            self.viewer.clear()
+            self.meta_panel.clear()
+        except Exception:
+            log_error("Failed to clear the viewer after closing tabs", exc_info=True)
+
+        self._sync_loading_progress()
+        self._update_status("No folder open. Use + to open one.")
 
     def _switch_tab(self, index: int):
         if index == self.active_tab_index:
@@ -514,7 +610,13 @@ class ImageCullerApp(ctk.CTk):
             log_error("Failed to watch directory for changes", exc_info=True)
 
     def _on_folder_changed(self, tab: Dict[str, Any], change: FolderChange):
-        """Reload a tab whose folder changed on disk outside the app."""
+        """Refresh a tab whose folder changed on disk outside the app.
+
+        Goes through the tab's own loader, not ``_load_directory``: a watcher-triggered
+        reload must not throw away the tab's filters, selection and scroll position, and
+        the session's manifest makes the rescan differential, so the cost is one scandir
+        pass plus EXIF for the files that actually changed.
+        """
         if tab not in self.tabs:
             self.folder_watcher.unwatch(change.directory)
             return
@@ -530,10 +632,8 @@ class ImageCullerApp(ctk.CTk):
 
         self._update_status(f"Folder changed ({change.summary()}), reloading...")
 
-        if tab is self._get_active_tab():
-            self._load_directory(str(tab["directory"]))
-        else:
-            self._load_tab_directory(tab, show_progress=False)
+        is_active = tab is self._get_active_tab()
+        self._load_tab_directory(tab, show_progress=is_active)
 
     def _suppress_folder_watch(self, directory, seconds: Optional[float] = None):
         """Keep the app's own writes to a folder from triggering a redundant reload."""
@@ -573,7 +673,7 @@ class ImageCullerApp(ctk.CTk):
         def on_progress(current: int, total: int, filename: str = ""):
             tab["load_current"] = current
             tab["load_total"] = total
-            if tab is self._get_active_tab():
+            if tab is self._get_active_tab() and not tab.get("_released"):
                 if current == 0 and total > 0 and not tab.get("_placeholders_loaded"):
                     tab["_placeholders_loaded"] = True
                     self.after(50, lambda: self._preload_placeholder_items(tab, white_balance))
@@ -599,6 +699,8 @@ class ImageCullerApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _preload_placeholder_items(self, tab: Dict[str, Any], white_balance: str):
+        if tab.get("_released") or tab not in self.tabs:
+            return
         session = tab["session"]
         if not session or not session.items:
             return
@@ -624,6 +726,9 @@ class ImageCullerApp(ctk.CTk):
         self.thumb_list.update_items(placeholder_items, selected_idx=sel_idx, white_balance=white_balance)
 
     def _on_tab_scan_complete(self, tab: Dict[str, Any]):
+        # A tab closed mid-scan: the worker thread still holds a reference to its dict.
+        if tab.get("_released") or tab not in self.tabs:
+            return
         self._update_tab_loading_indicator(tab)
         self._watch_tab_directory(tab)
 
@@ -634,9 +739,6 @@ class ImageCullerApp(ctk.CTk):
             return
 
         self.thumb_list.finish_folder_timing()
-        self.thumb_list.progress_bar.set(0.0)
-        self.thumb_list.lbl_progress_text.configure(text="")
-
         self.thumb_list.set_image_loader(session.image_loader)
         self._on_filter_changed()
         stats = tab["session"].get_summary_stats()
@@ -650,11 +752,20 @@ class ImageCullerApp(ctk.CTk):
             )
 
     def _on_tab_scan_error(self, tab: Dict[str, Any], err: Exception):
+        if tab.get("_released") or tab not in self.tabs:
+            return
         self._update_tab_loading_indicator(tab)
         self.thumb_list.finish_load_timing()
         self._update_status("Error loading directory.")
 
     def _sync_loading_progress(self):
+        """Reflect scan progress in the status bar.
+
+        This used to drive the grid's own progress bar and "Loading N/M" label. Both were
+        removed from the grid footer - the count was of *visible* rows decoded, so it moved
+        as you scrolled and said nothing about the folder. The scan progress is folder-wide
+        information, so it belongs on the status bar with the rest of it.
+        """
         tab = self._get_active_tab()
         if not tab or not tab.get("loading"):
             return
@@ -662,12 +773,9 @@ class ImageCullerApp(ctk.CTk):
         total = tab.get("load_total", 0)
         current = tab.get("load_current", 0)
         if total > 0:
-            pct = current / total
-            self.thumb_list.progress_bar.set(pct)
-            self.thumb_list.lbl_progress_text.configure(text=f"Loading {current}/{total}")
+            self._update_status(f"Loading {current}/{total}...")
         else:
-            self.thumb_list.progress_bar.set(0.0)
-            self.thumb_list.lbl_progress_text.configure(text="Loading...")
+            self._update_status("Loading...")
 
     def _update_tab_loading_indicator(self, tab: Dict[str, Any]):
         idx = self.tabs.index(tab) if tab in self.tabs else -1
@@ -792,6 +900,7 @@ class ImageCullerApp(ctk.CTk):
             on_tab_closed=self._on_tab_closed,
             on_tab_reordered=self._on_tab_reordered,
             on_new_tab=self._on_new_tab,
+            on_close_all=self._close_all_tabs,
             on_about=self._on_about_clicked
         )
         self.tab_bar.pack(side="top", fill="x", padx=0, pady=0)
@@ -860,7 +969,9 @@ class ImageCullerApp(ctk.CTk):
             on_move_rejected=self._on_move_rejected,
             on_config_output_folders=self._on_config_output_folders,
             initial_picked_folder=init_picked_folder,
-            initial_rejected_folder=init_rejected_folder
+            initial_rejected_folder=init_rejected_folder,
+            bag_order=self._load_meta_panel_bag_order(),
+            on_bag_order_changed=self._save_meta_panel_bag_order
         )
         self.meta_panel.pack(side="right", fill="y", padx=3, pady=3)
         self.meta_panel.refresh_tag_buttons(self.db.get_custom_tags())
@@ -971,6 +1082,15 @@ class ImageCullerApp(ctk.CTk):
             self.folder_watcher.stop()
         except Exception:
             pass
+
+        for pool_name in ("_load_pool", "_prefetch_pool"):
+            pool = getattr(self, pool_name, None)
+            if pool is None:
+                continue
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
         try:
             import glob
@@ -1086,8 +1206,6 @@ class ImageCullerApp(ctk.CTk):
             return
 
         self.thumb_list.finish_folder_timing()
-        self.thumb_list.progress_bar.set(0.0)
-        self.thumb_list.lbl_progress_text.configure(text="")
 
         self._on_filter_changed()
         stats = tab["session"].get_summary_stats()
@@ -1310,7 +1428,11 @@ class ImageCullerApp(ctk.CTk):
                     self.after(0, lambda: self._on_image_loaded(item, pil_img, full_res=False, active_path=load_path, req_id=req_id))
                     self._prefetch_surrounding_images(index, is_continuous=is_continuous)
 
-            threading.Thread(target=load_worker, daemon=True).start()
+            # A bounded pool, not a thread per navigation: holding the arrow key down
+            # used to start a new OS thread for every photo, all of which stayed alive
+            # until their decode finished. Two workers keep the current photo moving and
+            # let a superseded one drain instead of piling up.
+            self._load_pool.submit(load_worker)
 
         if hasattr(self, "_nav_timer") and self._nav_timer is not None:
             try:
@@ -1342,11 +1464,6 @@ class ImageCullerApp(ctk.CTk):
             return
 
         current_req = self._load_request_id
-        indices_to_prefetch = [
-            center_idx + 1,
-            center_idx + 2,
-            center_idx - 1,
-        ]
         raw_scale = self.toolbar.get_raw_scale()
         white_balance = self.toolbar.get_white_balance()
 
@@ -1357,46 +1474,49 @@ class ImageCullerApp(ctk.CTk):
                 pass
             self._prefetch_timer = None
 
-        def start_prefetch_thread():
+        def start_prefetch():
             if current_req != self._load_request_id:
                 return
 
             self.after(0, lambda: self._update_prefetch_progress(0.1, is_done=False))
 
             def prefetch_worker():
-                total = len(indices_to_prefetch)
-                completed = 0
+                items = self.current_items
+                # Only the immediate neighbours, and only their primary path: the
+                # stacked variants are reachable by clicking, and prefetching them
+                # tripled the decode count of every single arrow-key press.
+                targets = [
+                    items[i].path
+                    for i in (center_idx + 1, center_idx - 1, center_idx + 2)
+                    if 0 <= i < len(items)
+                ]
 
-                for idx in indices_to_prefetch:
+                for position, path in enumerate(targets, start=1):
                     if current_req != self._load_request_id:
-                        break
-                    if 0 <= idx < len(self.current_items):
-                        item = self.current_items[idx]
-                        for p in item.stacked_paths:
-                            if current_req != self._load_request_id:
-                                break
-                            try:
-                                session.image_loader.load_full_image(
-                                    p,
-                                    raw_scale=raw_scale,
-                                    white_balance=white_balance
-                                )
-                            except Exception:
-                                pass
-                    completed += 1
-                    frac = completed / float(total)
+                        return
+                    try:
+                        session.image_loader.load_full_image(
+                            path,
+                            raw_scale=raw_scale,
+                            white_balance=white_balance
+                        )
+                    except Exception:
+                        log_debug(f"Prefetch decode failed for {path.name}")
                     if current_req == self._load_request_id:
-                        self.after(0, lambda f=frac: self._update_prefetch_progress(f, is_done=False))
+                        fraction = position / float(len(targets))
+                        self.after(0, lambda f=fraction: self._update_prefetch_progress(f, is_done=False))
 
                 if current_req == self._load_request_id:
                     self.after(0, lambda: self._update_prefetch_progress(1.0, is_done=True))
 
-            threading.Thread(target=prefetch_worker, daemon=True).start()
+            # One worker: the pool makes the newest request the only one queued, so
+            # navigation supersedes prefetch instead of running alongside it.
+            self._prefetch_pool.submit(prefetch_worker)
 
         if is_continuous:
-            self._prefetch_timer = self.after(80, start_prefetch_thread)
+            self._prefetch_timer = self.after(80, start_prefetch)
         else:
-            start_prefetch_thread()
+            start_prefetch()
 
     def _update_prefetch_progress(self, fraction: float, is_done: bool):
         self.prefetch_bar.set(fraction)
@@ -2312,6 +2432,23 @@ class ImageCullerApp(ctk.CTk):
                 self._load_directory(str(session.directory))
             except Exception as e:
                 mb.showerror("Move Error", f"Failed to move rejected files: {e}")
+
+    def _load_meta_panel_bag_order(self):
+        """Restore the order the user dragged the action bags into."""
+        try:
+            stored = self.db.get_setting(BAG_SETTINGS_KEY, None)
+        except Exception:
+            log_error("Failed to read the metadata panel section order", exc_info=True)
+            return None
+        if isinstance(stored, list):
+            return [k for k in stored if isinstance(k, str)]
+        return None
+
+    def _save_meta_panel_bag_order(self, order: List[str]):
+        try:
+            self.db.set_setting(BAG_SETTINGS_KEY, list(order))
+        except Exception:
+            log_error("Failed to save the metadata panel section order", exc_info=True)
 
     def _on_config_output_folders(self):
         self._on_open_settings()

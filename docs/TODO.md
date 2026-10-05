@@ -5,6 +5,9 @@ Do not add any new details here. only use this for checking/unchecking the TODO 
 Make corrections optionally, if required.
 ---------------------
 
+- [x] virtualize the thumbnail grid rows (recycled row pool + scroll-driven rebinding). needed for folders above ~1500 photos: 2771 rows currently take ~111s to build and freeze the app. see docs/analysis/ui-framework-assessment.md
+- [x] if there is only one tab open, not able to close it. ensure closing a tab clears the memory completely. add a close all tabs button too. 
+- [x] tab button and tab close buttons are glitching all the time. thumbnail list glitching during folder/thumbnail loading. verify our ui framework is correctly being used or requires any replacement.
 - [x] create a doc for improving the folder and thumbnail load time
     - it should happen in background, shouldnt block ui. goal is to load images fastest possible without any glitches or freezing
     - moving between multiple tabs should not load same stuffs multiple times, should be cached

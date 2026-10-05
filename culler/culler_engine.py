@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 
 from .exif_wrapper import ExifToolWrapper
+from .folder_index import FileEntry, FolderDiff, FolderIndex, entry_key, scan_entries
 from .image_loader import ImageLoader
 from .db_manager import DatabaseManager
 from .dataset_exporter import load_manual_annotations
@@ -48,6 +49,23 @@ class _ProgressThrottle:
         self._last_done = done
         self._last_total = total
 
+        try:
+            self._callback(done, total, filename)
+        except TypeError:
+            self._callback(done, total)
+
+
+    def flush(self, done: int, total: int, filename: str = "") -> None:
+        """Emit unconditionally, bypassing the interval.
+
+        A loop that finishes inside one interval otherwise leaves the progress bar at
+        whatever the first sample said - 0 of N - while the scan is already done.
+        """
+        if self._callback is None:
+            return
+        self._last_emit = time.monotonic()
+        self._last_done = done
+        self._last_total = total
         try:
             self._callback(done, total, filename)
         except TypeError:
@@ -141,18 +159,54 @@ class FlagState(Enum):
         return self.value
 
 
+class _RowSpec:
+    """The folder scan's view of one grid row, before it becomes an ``ImageItem``."""
+
+    __slots__ = ("primary", "stacked_paths", "filename", "format_name", "size_bytes", "entry")
+
+    def __init__(self, primary: Path, stacked_paths: List[Path], filename: str,
+                 format_name: str, size_bytes: int, entry: Optional[FileEntry] = None):
+        self.primary = primary
+        self.stacked_paths = stacked_paths
+        self.filename = filename
+        self.format_name = format_name
+        self.size_bytes = size_bytes
+        self.entry = entry
+
+    @property
+    def primary_key(self) -> str:
+        return entry_key(self.primary)
+
+    @property
+    def path_keys(self) -> List[str]:
+        return [entry_key(p) for p in self.stacked_paths]
+
+
 class ImageItem:
     """
     Represents a single image item in a culling session.
     Supports RAW+JPG pair stacking and customizable tagging (Blur, Duplicate, Dark, Over-exposed, Custom).
     """
 
-    def __init__(self, file_path: Union_Path_Str):
-        self.path = Path(file_path).resolve()
+    def __init__(self, file_path: Union_Path_Str, size_bytes: Optional[int] = None,
+                 resolved: bool = False):
+        path = Path(file_path)
+        # A scan already holds canonical absolute paths and has stat'ed every file, so
+        # it passes both: on Windows Path.resolve() costs two extra filesystem calls per
+        # photo, which was the last per-item syscall a scan still paid.
+        self.path = path if resolved else path.resolve()
         self.filename = self.path.name
         self.extension = self.path.suffix.lower()
         self.format_name = ImageLoader.get_format_type(self.path)
-        self.size_bytes = self.path.stat().st_size if self.path.exists() else 0
+        # The scan's manifest already carries each file's size; accepting it here saves
+        # another stat (and, before, a separate exists() probe) per photo.
+        if size_bytes is not None:
+            self.size_bytes = int(size_bytes)
+        else:
+            try:
+                self.size_bytes = self.path.stat().st_size
+            except OSError:
+                self.size_bytes = 0
 
         self.stacked_paths: List[Path] = [self.path]
         self.is_stacked: bool = False
@@ -236,6 +290,12 @@ class CullingSession:
         self.image_loader = image_loader or ImageLoader(exif_wrapper=self.exif_wrapper)
         self.items: List[ImageItem] = []
         self.directory: Optional[Path] = None
+        # Manifest of the last scan, so a refresh of the same folder is differential.
+        self._index: Optional[FolderIndex] = None
+        self._indexed_dir: Optional[Path] = None
+        self._scan_options: Optional[Tuple[bool, bool]] = None
+        self._expected_row_count: Optional[int] = None
+        self.last_scan_stats: Dict[str, Any] = {}
 
     @staticmethod
     def extract_base_stem(stem: str) -> str:
@@ -270,6 +330,19 @@ class CullingSession:
         """
         return find_item_index_by_path(self.items, target_path)
 
+    def release(self) -> None:
+        """Drop the items and manifest this session is holding.
+
+        Called when the tab is closed. An ``ImageItem`` carries a metadata dict and its
+        stacked paths, so a session for a few thousand photos is not free to keep.
+        """
+        self.items = []
+        self._index = None
+        self._indexed_dir = None
+        self._scan_options = None
+        self._expected_row_count = None
+        self.last_scan_stats = {}
+
     def scan_directory(
         self,
         directory_path: Union_Path_Str,
@@ -282,132 +355,384 @@ class CullingSession:
         Automatically stacks matching RAW, JPG, and edited variant pairs into 1 item.
         Reads EXIF metadata in high-speed batches using ExifTool.
         Restores saved flags, ratings, & tags from local SQLite database.
+
+        A rescan of the same folder with the same options is differential: the session
+        keeps a manifest of ``(size, mtime_ns)`` per file, so unchanged photos keep
+        their item object, their decoded pixels and their EXIF, and only what really
+        changed is re-read. A folder that produced no change at all returns immediately
+        after one ``scandir`` pass, with no ExifTool call and no cache eviction.
         """
         dir_path = Path(directory_path).resolve()
         if not dir_path.exists() or not dir_path.is_dir():
             raise ValueError(f"Directory standard path does not exist: {directory_path}")
 
         self.directory = dir_path
-        self.items.clear()
-        self.image_loader.clear_cache()
+        entries = scan_entries(dir_path, recursive)
 
-        # Find all files matching supported extensions
-        pattern = "**/*" if recursive else "*"
-        found_paths: List[Path] = []
-        for p in dir_path.glob(pattern):
-            if p.is_file() and ImageLoader.is_supported(p):
-                found_paths.append(p)
+        options = (bool(recursive), bool(stack_raw_jpg))
+        can_diff = (
+            self._index is not None
+            and self._indexed_dir == dir_path
+            and self._scan_options == options
+            and self._expected_row_count is not None
+        )
 
-        if not found_paths:
-            return []
+        if not entries:
+            if can_diff and self.items:
+                self._forget_records([p for it in self.items for p in it.stacked_paths])
+            self.items = []
+            self._reset_manifest(options)
+            _emit_progress(progress_callback, 0, 0)
+            return self.items
 
-        self.items = []
+        diff: Optional[FolderDiff] = None
+        previous_items: List[ImageItem] = []
+        if can_diff:
+            diff = self._index.diff(entries)
+            previous_items = list(self.items)
+            if diff.is_noop and len(previous_items) == self._expected_row_count:
+                # Nothing on disk moved: no rebuild, no EXIF, no cache eviction, and the
+                # item objects the grid is bound to stay valid.
+                _emit_progress(progress_callback, 0, len(self.items))
+                _emit_progress(progress_callback, len(self.items), len(self.items))
+                self.last_scan_stats = self._stats(len(entries), diff)
+                return self.items
 
-        if stack_raw_jpg:
-            # Group found paths by parent directory and extracted base stem
-            groups: Dict[Tuple[Path, str], List[Path]] = {}
-            for p in found_paths:
-                base_stem = self.extract_base_stem(p.stem)
-                key = (p.parent, base_stem)
-                if key not in groups:
-                    groups[key] = []
-                groups[key].append(p)
+        row_specs = self._build_row_specs(entries, stack_raw_jpg)
+        self._expected_row_count = len(row_specs)
+        items = self._reconcile_items(row_specs, previous_items, diff, progress_callback)
 
-            for (parent, base_stem), group_paths in groups.items():
-                raw_paths = [p for p in group_paths if p.suffix.lower() == ".arw"]
+        # Only files whose bytes changed lose their decoded pixels; everything else stays
+        # resident, so a one-file reload does not re-decode the whole folder.
+        if diff is not None and diff.stale_paths:
+            self.image_loader.invalidate_paths(diff.stale_paths)
+        if diff is not None and diff.vanished_paths:
+            self._forget_records(diff.vanished_paths)
+        self._index = FolderIndex.from_entries(entries)
+        self._indexed_dir = dir_path
+        self._scan_options = options
+        self.items = items
+        # After the assignment: the rename rows are built from the new names.
+        if diff is not None and diff.renamed:
+            self._persist_renames(diff.renamed)
+        self.last_scan_stats = self._stats(len(entries), diff)
+        return items
 
-                if len(raw_paths) == 1 and len(group_paths) > 1:
-                    group_paths.sort(key=lambda p: (
-                        0 if p.suffix.lower() == ".arw" else
-                        1 if p.suffix.lower() in (".jpg", ".jpeg") else
-                        2
-                    ))
-                    primary = group_paths[0]
-                    item = ImageItem(primary)
-                    item.stacked_paths = list(group_paths)
-                    item.is_stacked = True
-                    display_stem = self.extract_base_stem(primary.stem).upper()
-                    raw_n = sum(1 for p in group_paths if p.suffix.lower() == ".arw")
-                    jpg_n = sum(1 for p in group_paths if p.suffix.lower() in (".jpg", ".jpeg"))
-                    parts = []
-                    if raw_n:
-                        parts.append(f"{raw_n} ARW")
-                    if jpg_n:
-                        parts.append(f"{jpg_n} JPG")
-                    comp = ", ".join(parts)
-                    item.filename = f"{display_stem} [Stacked: {comp}]"
-                    item.format_name = f"Stacked ({comp})"
-                    item.size_bytes = sum(p.stat().st_size for p in item.stacked_paths if p.exists())
-                    self.items.append(item)
-                else:
-                    for p in group_paths:
-                        self.items.append(ImageItem(p))
-        else:
-            # Unstacked mode: Load every supported file as an independent ImageItem
-            for p in found_paths:
-                self.items.append(ImageItem(p))
+    def _stats(self, file_count: int, diff: Optional[FolderDiff]) -> Dict[str, Any]:
+        return {
+            "files": file_count,
+            "items": len(self.items),
+            "differential": diff is not None,
+            "added": len(diff.added) if diff else file_count,
+            "removed": len(diff.removed) if diff else 0,
+            "changed": len(diff.changed) if diff else 0,
+            "renamed": len(diff.renamed) if diff else 0,
+        }
 
-        # Sort naturally by primary filename
-        self.items.sort(key=lambda x: x.path.name.lower())
+    def _reset_manifest(self, options) -> None:
+        self._index = None
+        self._indexed_dir = None
+        self._scan_options = options
+        self._expected_row_count = 0
 
-        if progress_callback:
-            try:
-                progress_callback(0, len(self.items), f"Found {len(self.items)} photos")
-            except TypeError:
-                progress_callback(0, len(self.items))
+    def _build_row_specs(
+        self,
+        entries: Dict[str, FileEntry],
+        stack_raw_jpg: bool,
+    ) -> List[_RowSpec]:
+        """Group the scan into rows: one per photo, or one per RAW+JPG stack."""
+        specs: List[_RowSpec] = []
+        ordered = [entries[k] for k in sorted(entries)]
 
+        if not stack_raw_jpg:
+            for entry in ordered:
+                specs.append(_RowSpec(entry.path, [entry.path], entry.path.name,
+                                      ImageLoader.get_format_type(entry.path),
+                                      entry.size, entry))
+            return specs
+
+        groups: Dict[Tuple[Path, str], List[FileEntry]] = {}
+        for entry in ordered:
+            base_stem = self.extract_base_stem(entry.path.stem)
+            groups.setdefault((entry.path.parent, base_stem), []).append(entry)
+
+        for (_parent, base_stem), group in groups.items():
+            raw_paths = [e for e in group if e.path.suffix.lower() == ".arw"]
+
+            if len(raw_paths) == 1 and len(group) > 1:
+                group.sort(key=lambda e: (
+                    0 if e.path.suffix.lower() == ".arw" else
+                    1 if e.path.suffix.lower() in (".jpg", ".jpeg") else
+                    2
+                ))
+                primary = group[0]
+                raw_n = sum(1 for e in group if e.path.suffix.lower() == ".arw")
+                jpg_n = sum(1 for e in group if e.path.suffix.lower() in (".jpg", ".jpeg"))
+                comp = ", ".join(p for p in (f"{raw_n} ARW" if raw_n else "",
+                                             f"{jpg_n} JPG" if jpg_n else "") if p)
+                display_stem = self.extract_base_stem(primary.path.stem).upper()
+                specs.append(_RowSpec(
+                    primary=primary.path,
+                    stacked_paths=[e.path for e in group],
+                    filename=f"{display_stem} [Stacked: {comp}]",
+                    format_name=f"Stacked ({comp})",
+                    size_bytes=sum(e.size for e in group),
+                    entry=primary,
+                ))
+            else:
+                for entry in group:
+                    specs.append(_RowSpec(entry.path, [entry.path], entry.path.name,
+                                          ImageLoader.get_format_type(entry.path),
+                                          entry.size, entry))
+
+        specs.sort(key=lambda s: s.primary.name.lower())
+        return specs
+
+    @staticmethod
+    def _row_shape(spec: _RowSpec) -> Tuple:
+        return (tuple(entry_key(p) for p in spec.stacked_paths), spec.filename)
+
+    def _reconcile_items(
+        self,
+        specs: List[_RowSpec],
+        previous_items: List[ImageItem],
+        diff: Optional[FolderDiff],
+        progress_callback: Optional[Callable[[int, int], None]],
+    ) -> List[ImageItem]:
+        """Reuse item objects for unchanged rows, build the rest, read EXIF once."""
+        total = len(specs)
+        _emit_progress(progress_callback, 0, total, f"Found {total} photos")
         throttled = _ProgressThrottle(progress_callback)
 
-        # Fetch saved DB records for this directory
-        db_records = self.db.get_all_records_for_dir(str(dir_path))
-        manual_annos = load_manual_annotations(dataset_dir=str(self.db.dataset_dir) if self.db else None)
+        donors: Dict[str, ImageItem] = {}
+        for item in previous_items:
+            for p in item.stacked_paths:
+                donors.setdefault(entry_key(p), item)
 
-        # Batch fetch metadata via ExifTool
-        str_paths = [str(item.path) for item in self.items]
-        metadata_list = self.exif_wrapper.get_batch_metadata(str_paths)
+        # A renamed file has no row under its new name, so point the new name at the
+        # state of the old one before looking for a donor: without this a rename is
+        # indistinguishable from an unrelated new photo and loses its flags.
+        rename_sources: Dict[str, str] = {}
+        if diff is not None:
+            for old, new in diff.renamed:
+                rename_sources[entry_key(new.path)] = entry_key(old.path)
 
-        for i, item in enumerate(self.items):
-            if i < len(metadata_list):
-                item.metadata = metadata_list[i]
-                item.rating = metadata_list[i].get("rating", 0)
+        touched_keys = set()
+        if diff is not None:
+            touched_keys = {entry_key(p) for p in diff.touched_paths}
 
-            # Overlay saved SQLite DB record if available
-            item_path_str = str(item.path)
-            if item_path_str in db_records:
-                rec = db_records[item_path_str]
-                try:
-                    item.flag = FlagState(rec["flag"])
-                except ValueError:
-                    pass
-                item.rating = rec.get("rating", 0)
-                if rec.get("sharpness", 0.0) > 0:
-                    item.sharpness_score = rec["sharpness"]
-                tags_raw = rec.get("tags", "")
-                item.tags.clear()
-                if tags_raw:
-                    for t in tags_raw.split(","):
-                        if t.strip():
-                            item.add_tag(t.strip())
-                if rec.get("detection_box"):
-                    item.detection_box = rec["detection_box"]
-                if rec.get("eye_box"):
-                    item.eye_box = rec["eye_box"]
+        # Which rows still need an EXIF read: a full rebuild reads all of them, a
+        # differential one only reads the rows that gained or changed a file.
+        needs_exif: Dict[str, _RowSpec] = {}
+        for spec in specs:
+            if diff is None or any(k in touched_keys for k in spec.path_keys):
+                needs_exif[spec.primary_key] = spec
 
-            # Overlay manual bounding box annotations from _DATASET/annotations.json
-            resolved_key = str(item.path.resolve())
-            if resolved_key in manual_annos:
-                m_anno = manual_annos[resolved_key]
-                item.manual_detection_box = m_anno.get("manual_detection_box")
-                item.manual_eye_box = m_anno.get("manual_eye_box")
-            elif item_path_str in manual_annos:
-                m_anno = manual_annos[item_path_str]
-                item.manual_detection_box = m_anno.get("manual_detection_box")
-                item.manual_eye_box = m_anno.get("manual_eye_box")
+        items: List[ImageItem] = []
+        reused_ids: set = set()
+        carried_ids: set = set()
+        for spec in specs:
+            donor = donors.get(spec.primary_key)
+            if donor is None:
+                source_key = rename_sources.get(spec.primary_key)
+                donor = donors.get(source_key) if source_key else None
+            if donor is not None and self._row_shape_of_item(donor) == self._row_shape(spec):
+                # Identical row, unchanged files: keep the very same object, so the grid
+                # stays bound to it and its decoded thumbnails stay valid.
+                donor.size_bytes = spec.size_bytes
+                reused_ids.add(id(donor))
+                items.append(donor)
+                continue
+            donor = donor or next((donors[k] for k in spec.path_keys if k in donors), None)
+            items.append(self._build_item(spec, donor))
+            if donor is not None:
+                carried_ids.add(id(items[-1]))
 
-            if progress_callback:
-                throttled(i + 1, len(self.items), item.filename)
+        # EXIF for the rows that need it, in one batched call.
+        metadata_by_key: Dict[str, Dict[str, Any]] = {}
+        if needs_exif:
+            paths = [spec.primary for spec in needs_exif.values()]
+            metadata_list = self.exif_wrapper.get_batch_metadata([str(p) for p in paths])
+            for path, meta in zip(paths, metadata_list):
+                metadata_by_key[entry_key(path)] = meta
 
-        return self.items
+        # A row with no prior state is the only one whose rating should come from the
+        # file: once the app has decided a rating, re-reading EXIF must not undo it.
+        # Rows whose files changed still get their saved record applied, because that is
+        # what the full-scan path did and what keeps a rating stable across a reload.
+        state_ids = reused_ids | carried_ids
+        needs_record = [it for it in items if id(it) not in state_ids or entry_key(it.path) in metadata_by_key]
+        records = self._records_for(needs_record)
+
+        manual_annos: Optional[Dict[str, Dict[str, Any]]] = None
+        anno_index: Optional[Dict[str, Dict[str, Any]]] = None
+        for index, item in enumerate(items):
+            had_state = id(item) in state_ids
+            meta = metadata_by_key.get(entry_key(item.path))
+
+            if meta is not None:
+                item.metadata = meta
+                if not had_state:
+                    item.rating = meta.get("rating", 0)
+
+            if not had_state or meta is not None:
+                self._overlay_record(item, self._lookup_record(records, item))
+
+            if not had_state:
+                if manual_annos is None:
+                    manual_annos = load_manual_annotations(
+                        dataset_dir=str(self.db.dataset_dir) if self.db else None
+                    )
+                    anno_index = self._annotation_index(manual_annos)
+                self._overlay_manual_annotation(item, manual_annos or {}, anno_index)
+
+            throttled(index + 1, total, item.filename)
+
+        throttled.flush(total, total)
+        return items
+
+    @staticmethod
+    def _row_shape_of_item(item: ImageItem) -> Tuple:
+        return (tuple(entry_key(p) for p in item.stacked_paths), item.filename)
+
+    def _build_item(self, spec: _RowSpec, donor: Optional[ImageItem]) -> ImageItem:
+        """Create an item for a row, carrying over state from the row it replaces."""
+        item = ImageItem(spec.primary, size_bytes=spec.size_bytes, resolved=True)
+        item.filename = spec.filename
+        item.format_name = spec.format_name
+        item.stacked_paths = list(spec.stacked_paths)
+        item.is_stacked = len(spec.stacked_paths) > 1
+        if donor is not None:
+            self._adopt_state(item, donor)
+        return item
+
+    @staticmethod
+    def _adopt_state(item: ImageItem, donor: ImageItem) -> None:
+        """Carry flags, rating, scores, tags and boxes from the item being replaced.
+
+        This is what makes a rename, or a JPG joining its RAW, keep the photo's
+        culling decisions instead of resetting it to a fresh, unflagged row.
+        """
+        item.flag = donor.flag
+        item.rating = donor.rating
+        item.sharpness_score = donor.sharpness_score
+        item.tags = set(donor.tags)
+        item.dhash = donor.dhash
+        item.metadata = dict(donor.metadata) if donor.metadata else {}
+        item.detection_box = donor.detection_box
+        item.eye_box = donor.eye_box
+        item.manual_detection_box = donor.manual_detection_box
+        item.manual_eye_box = donor.manual_eye_box
+
+    def _records_for(self, items: List[ImageItem]) -> Dict[str, Dict[str, Any]]:
+        if self.db is None or not items:
+            return {}
+        getter = getattr(self.db, "get_records_for_paths", None)
+        if getter is None:
+            return self.db.get_all_records_for_dir(str(self.directory)) if self.directory else {}
+        return getter([str(it.path) for it in items])
+
+    @staticmethod
+    def _lookup_record(records: Dict[str, Dict[str, Any]], item: ImageItem) -> Dict[str, Any]:
+        """DB rows are keyed by the resolved path; match on both forms."""
+        if not records:
+            return {}
+        for candidate in (str(item.path), str(item.path.resolve())):
+            rec = records.get(candidate)
+            if rec is not None:
+                return rec
+        return {}
+
+    def _overlay_record(self, item: ImageItem, rec: Dict[str, Any]) -> None:
+        if not rec:
+            return
+        try:
+            item.flag = FlagState(rec["flag"])
+        except (ValueError, KeyError, TypeError):
+            pass
+        item.rating = rec.get("rating", 0)
+        if rec.get("sharpness", 0.0) > 0:
+            item.sharpness_score = rec["sharpness"]
+        tags_raw = rec.get("tags", "")
+        item.tags.clear()
+        if tags_raw:
+            for t in tags_raw.split(","):
+                if t.strip():
+                    item.add_tag(t.strip())
+        if rec.get("detection_box"):
+            item.detection_box = rec["detection_box"]
+        if rec.get("eye_box"):
+            item.eye_box = rec["eye_box"]
+
+    @staticmethod
+    def _annotation_index(manual_annos: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """Case-normalised view of the annotation keys.
+
+        The file is keyed by resolved path, and matching an item against it used to mean
+        ``Path.resolve()`` per item, i.e. two filesystem calls per photo on Windows, for
+        a lookup that almost never hits anyway.
+        """
+        import os
+
+        return {os.path.normcase(str(k)): v for k, v in manual_annos.items()}
+
+    @classmethod
+    def _overlay_manual_annotation(cls, item: ImageItem, manual_annos: Dict[str, Dict[str, Any]],
+                                   anno_index: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+        import os
+
+        anno = manual_annos.get(str(item.path))
+        if anno is None:
+            index = anno_index if anno_index is not None else cls._annotation_index(manual_annos)
+            anno = index.get(os.path.normcase(str(item.path)))
+        if not anno:
+            return
+        item.manual_detection_box = anno.get("manual_detection_box")
+        item.manual_eye_box = anno.get("manual_eye_box")
+
+    def _forget_records(self, paths: List[Path]) -> None:
+        if self.db is None or not paths:
+            return
+        forget = getattr(self.db, "delete_image_records", None)
+        if forget is None:
+            return
+        try:
+            forget([str(p) for p in paths])
+        except Exception:
+            log_error("Failed to remove records for files that disappeared", exc_info=True)
+
+    def _persist_renames(self, renamed: List[Tuple[FileEntry, FileEntry]]) -> None:
+        """Point the DB rows of renamed files at their new names."""
+        if self.db is None or not renamed:
+            return
+        save = getattr(self.db, "save_image_records", None)
+        if save is None:
+            return
+        owners: Dict[str, ImageItem] = {}
+        for it in self.items:
+            for p in it.stacked_paths:
+                owners.setdefault(entry_key(p), it)
+
+        rows = []
+        for _old, new in renamed:
+            owner = owners.get(entry_key(new.path))
+            if owner is None:
+                continue
+            rows.append({
+                "file_path": str(new.path),
+                "filename": new.path.name,
+                "flag": owner.flag.value,
+                "rating": owner.rating,
+                "sharpness": owner.sharpness_score,
+                "tags": owner.tags_str,
+                "detection_box": owner.detection_box,
+                "eye_box": owner.eye_box,
+            })
+        if rows:
+            try:
+                save(rows)
+            except Exception:
+                log_error("Failed to persist renamed files", exc_info=True)
 
     def save_item_record(self, item: ImageItem):
         """

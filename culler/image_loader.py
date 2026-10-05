@@ -78,6 +78,11 @@ class ImageLoader:
         # thread, image-load and prefetch threads), so every dict touch is guarded.
         self._cache_lock = threading.RLock()
         self._inflight: Dict[Tuple, threading.Event] = {}
+        # Running resident-byte totals. Recomputing them by walking the whole cache on
+        # every insert was O(n) per insert, i.e. O(n^2) per folder load, and the
+        # walk itself raced with concurrent inserts.
+        self._thumb_bytes = 0
+        self._full_bytes = 0
         self.stats: Dict[str, int] = {
             "thumb_hits": 0,
             "thumb_misses": 0,
@@ -86,21 +91,64 @@ class ImageLoader:
             "waits_for_inflight": 0,
         }
 
+    @staticmethod
+    def content_key(file_path: Union[str, Path]) -> Tuple[str, int, int]:
+        """``(normcased path, mtime_ns, size)`` for a file, from a single stat.
+
+        Every decoded tier is keyed by this, so a file that changed on disk (or was
+        renamed with a different case) is a miss instead of a stale hit. An
+        unstattable path still produces a deterministic key, so callers holding a
+        not-yet-existing path (tests, output paths) behave consistently.
+        """
+        path_str = str(file_path)
+        try:
+            st = os.stat(path_str)
+            return (os.path.normcase(path_str), st.st_mtime_ns, int(st.st_size))
+        except (OSError, ValueError):
+            return (os.path.normcase(path_str), 0, 0)
+
+    @classmethod
+    def tier_key(
+        cls,
+        file_path: Union[str, Path],
+        raw_scale: float,
+        white_balance: str,
+        content: Optional[Tuple[str, int, int]] = None,
+    ) -> Tuple:
+        """Full cache key: content identity plus the render variant."""
+        identity = content if content is not None else cls.content_key(file_path)
+        return (identity[0], identity[1], identity[2], raw_scale, white_balance)
+
+    @staticmethod
+    def _same_content(key: Tuple, identity: Tuple[str, int, int]) -> bool:
+        """True when a cache key belongs to the same file content as ``identity``."""
+        return (
+            isinstance(key, tuple)
+            and len(key) >= 3
+            and key[0] == identity[0]
+            and key[1] == identity[1]
+        )
+
     def _store_thumb(self, cache_key: Tuple, img: Image.Image) -> None:
         """Insert a thumbnail canonical and evict until both budgets are satisfied."""
+        size = self.estimate_bytes(img)
         with self._cache_lock:
+            previous = self._thumb_cache.get(cache_key)
+            if previous is not None:
+                self._thumb_bytes -= self.estimate_bytes(previous)
             self._thumb_cache[cache_key] = img
             self._thumb_cache.move_to_end(cache_key)
+            self._thumb_bytes += size
             self._evict_thumb_cache()
 
     def _evict_thumb_cache(self) -> None:
-        """Enforce the byte budget first, then the item cap."""
-        total = sum(self.estimate_bytes(v) for v in self._thumb_cache.values())
-        while self._thumb_cache and total > self.MAX_THUMB_CACHE_BYTES:
+        """Enforce the byte budget first, then the item cap. Caller holds the lock."""
+        while self._thumb_cache and self._thumb_bytes > self.MAX_THUMB_CACHE_BYTES:
             _, evicted = self._thumb_cache.popitem(last=False)
-            total -= self.estimate_bytes(evicted)
+            self._thumb_bytes -= self.estimate_bytes(evicted)
         while len(self._thumb_cache) > self.MAX_THUMB_CACHE:
-            self._thumb_cache.popitem(last=False)
+            _, evicted = self._thumb_cache.popitem(last=False)
+            self._thumb_bytes -= self.estimate_bytes(evicted)
 
     @classmethod
     def is_supported(cls, file_path: Union[str, Path]) -> bool:
@@ -126,11 +174,14 @@ class ImageLoader:
         """
         Check if full image is ALREADY cached in RAM buffer and return a copy instantly (0ms delay).
         """
-        cache_key = (str(file_path), raw_scale, white_balance)
-        if cache_key in self._full_cache:
+        cache_key = self.tier_key(file_path, raw_scale, white_balance)
+        with self._cache_lock:
+            cached = self._full_cache.get(cache_key)
+            if cached is None:
+                return None
             self._full_cache.move_to_end(cache_key)
-            return self._full_cache[cache_key].copy()
-        return None
+            self.stats["full_hits"] += 1
+            return cached.copy()
 
     def get_cached_thumbnail(
         self,
@@ -142,18 +193,52 @@ class ImageLoader:
         Returns the canonical cached render for the default scale/white balance, which is
         what navigation wants for an instant first paint.
         """
-        file_path_str = str(file_path)
-        for scale, wb in self.THUMB_LOOKUP_VARIANTS:
-            cache_key = (file_path_str, scale, wb)
-            with self._cache_lock:
+        identity = self.content_key(file_path)
+        with self._cache_lock:
+            for scale, wb in self.THUMB_LOOKUP_VARIANTS:
+                cache_key = self.tier_key(file_path, scale, wb, content=identity)
                 cached = self._thumb_cache.get(cache_key)
                 if cached is not None:
                     self._thumb_cache.move_to_end(cache_key)
                     self.stats["thumb_hits"] += 1
                     return cached.copy()
-        with self._cache_lock:
             self.stats["thumb_misses"] += 1
-        return None
+            return None
+
+    def invalidate_paths(self, file_paths) -> int:
+        """Drop every cached tier for the given files. Returns entries removed.
+
+        A differential refresh calls this for the files that changed or disappeared, so
+        the next request re-decodes them. Matching is on the normcased path alone: a
+        file that was edited has a different mtime than the key it is cached under, so
+        keying the sweep on content identity would miss exactly the files that need
+        dropping. Files that did not change keep their decoded pixels, which is the
+        whole point of a manifest.
+        """
+        targets = {os.path.normcase(str(p)) for p in file_paths}
+        if not targets:
+            return 0
+
+        removed = 0
+        with self._cache_lock:
+            for key in [k for k in self._thumb_cache if k and k[0] in targets]:
+                self._thumb_bytes -= self.estimate_bytes(self._thumb_cache.pop(key))
+                removed += 1
+            for key in [k for k in self._full_cache if k and k[0] in targets]:
+                self._full_bytes -= self.estimate_bytes(self._full_cache.pop(key))
+                removed += 1
+            for key in [k for k in self._preview_cache if k and k[0] in targets]:
+                self._preview_cache.pop(key, None)
+                removed += 1
+            self._thumb_bytes = max(0, self._thumb_bytes)
+            self._full_bytes = max(0, self._full_bytes)
+
+        if self.exif_wrapper is not None:
+            try:
+                self.exif_wrapper.invalidate_orientation_paths(file_paths)
+            except Exception:
+                pass
+        return removed
 
     def load_full_image(
         self,
@@ -164,8 +249,8 @@ class ImageLoader:
         """
         Load image as standalone PIL.Image object with LRU caching.
         """
-        file_path_str = str(file_path)
-        cache_key = (file_path_str, raw_scale, white_balance)
+        content = self.content_key(file_path)
+        cache_key = self.tier_key(file_path, raw_scale, white_balance, content=content)
 
         with self._cache_lock:
             cached = self._full_cache.get(cache_key)
@@ -195,7 +280,7 @@ class ImageLoader:
             return None
 
         try:
-            return self._decode_and_store_full(file_path_str, cache_key, raw_scale, white_balance)
+            return self._decode_and_store_full(str(file_path), cache_key, raw_scale, white_balance, content)
         finally:
             with self._cache_lock:
                 self._inflight.pop(cache_key, None)
@@ -206,13 +291,19 @@ class ImageLoader:
         file_path_str: str,
         cache_key: Tuple,
         raw_scale: float,
-        white_balance: str
+        white_balance: str,
+        content: Optional[Tuple[str, int, int]] = None
     ) -> Optional[Image.Image]:
         ext = Path(file_path_str).suffix.lower()
         img: Optional[Image.Image] = None
 
         if ext == ".arw":
-            img = self._load_arw_image(file_path_str, raw_scale=raw_scale, white_balance=white_balance)
+            img = self._load_arw_image(
+                file_path_str,
+                raw_scale=raw_scale,
+                white_balance=white_balance,
+                content=content,
+            )
         else:
             try:
                 with Image.open(file_path_str) as raw_img:
@@ -247,31 +338,37 @@ class ImageLoader:
 
     def _store_full(self, cache_key: Tuple, img: Image.Image) -> None:
         """Insert a full/preview decode and evict until both budgets are satisfied."""
-        self._full_cache[cache_key] = img
-        self._full_cache.move_to_end(cache_key)
-        self._evict_full_cache()
+        size = self.estimate_bytes(img)
+        with self._cache_lock:
+            previous = self._full_cache.get(cache_key)
+            if previous is not None:
+                self._full_bytes -= self.estimate_bytes(previous)
+            self._full_cache[cache_key] = img
+            self._full_cache.move_to_end(cache_key)
+            self._full_bytes += size
+            self._evict_full_cache()
 
     def _evict_full_cache(self) -> None:
-        """Enforce the byte budget first, then the item cap."""
-        total = sum(self.estimate_bytes(v) for v in self._full_cache.values())
-        while self._full_cache and total > self.MAX_FULL_CACHE_BYTES:
+        """Enforce the byte budget first, then the item cap. Caller holds the lock."""
+        while self._full_cache and self._full_bytes > self.MAX_FULL_CACHE_BYTES:
             _, evicted = self._full_cache.popitem(last=False)
-            total -= self.estimate_bytes(evicted)
+            self._full_bytes -= self.estimate_bytes(evicted)
         while len(self._full_cache) > self.MAX_FULL_CACHE:
-            self._full_cache.popitem(last=False)
+            _, evicted = self._full_cache.popitem(last=False)
+            self._full_bytes -= self.estimate_bytes(evicted)
 
     def cache_stats(self) -> Dict[str, int]:
         """Introspection for the §6 counters."""
-        full_bytes = sum(self.estimate_bytes(v) for v in self._full_cache.values())
-        thumb_bytes = sum(self.estimate_bytes(v) for v in self._thumb_cache.values())
-        return {
-            "thumb_items": len(self._thumb_cache),
-            "thumb_bytes": thumb_bytes,
-            "thumb_budget_bytes": self.MAX_THUMB_CACHE_BYTES,
-            "full_items": len(self._full_cache),
-            "full_bytes": full_bytes,
-            "full_budget_bytes": self.MAX_FULL_CACHE_BYTES,
-        }
+        with self._cache_lock:
+            return {
+                "thumb_items": len(self._thumb_cache),
+                "thumb_bytes": self._thumb_bytes,
+                "thumb_budget_bytes": self.MAX_THUMB_CACHE_BYTES,
+                "full_items": len(self._full_cache),
+                "full_bytes": self._full_bytes,
+                "full_budget_bytes": self.MAX_FULL_CACHE_BYTES,
+                "preview_items": len(self._preview_cache),
+            }
 
     @classmethod
     def apply_exif_orientation(cls, img: Image.Image, orientation: Optional[int] = None) -> Image.Image:
@@ -300,13 +397,16 @@ class ImageLoader:
         self,
         arw_path: str,
         raw_scale: float = 0.25,
-        white_balance: str = "camera"
+        white_balance: str = "camera",
+        content: Optional[Tuple[str, int, int]] = None
     ) -> Optional[Image.Image]:
         """
         Load Sony ARW photo using ExifTool high-res preview or RawPy demosaicing.
         """
         img: Optional[Image.Image] = None
-        orientation = self.exif_wrapper.get_orientation(arw_path) if self.exif_wrapper else 1
+        if content is None:
+            content = self.content_key(arw_path)
+        orientation = self.exif_wrapper.get_orientation(arw_path, cache_key=content) if self.exif_wrapper else 1
 
         # 100% Full scale request: Use RawPy for maximum demosaiced detail if available
         if raw_scale >= 1.0 and rawpy is not None:
@@ -390,7 +490,8 @@ class ImageLoader:
         Returns a standalone image copy safely loaded in RAM.
         """
         file_path_str = str(file_path)
-        cache_key = (file_path_str, raw_scale, white_balance)
+        content = self.content_key(file_path_str)
+        cache_key = self.tier_key(file_path_str, raw_scale, white_balance, content=content)
 
         # Composite-key hit. Scale and white balance are part of the key, so switching
         # either re-renders instead of returning the previous render.
@@ -512,25 +613,22 @@ class ImageLoader:
     def _get_cached_preview_bytes(self, arw_path: str) -> Optional[bytes]:
         """Embedded preview bytes, memoised per (path, mtime, size).
 
-        Extraction reads the whole ARW and runs again for every thumbnail *and* every
-        full decode of the same file, so this is cached with a small LRU.
+        Extraction reads the head of the ARW and runs again for every thumbnail *and*
+        every full decode of the same file, so this is cached with a small LRU.
         """
-        try:
-            st = os.stat(arw_path)
-            cache_key = (str(arw_path), st.st_mtime_ns, st.st_size)
-        except OSError:
-            cache_key = None
+        cache_key = self.content_key(arw_path) if os.path.exists(arw_path) else None
+        if cache_key is None:
+            return self.exif_wrapper.extract_preview_bytes(arw_path)
 
-        if cache_key is not None:
-            with self._cache_lock:
-                cached = self._preview_cache.get(cache_key)
-                if cached is not None:
-                    self._preview_cache.move_to_end(cache_key)
-                    return cached
+        with self._cache_lock:
+            cached = self._preview_cache.get(cache_key)
+            if cached is not None:
+                self._preview_cache.move_to_end(cache_key)
+                return cached
 
         data = self.exif_wrapper.extract_preview_bytes(arw_path)
 
-        if cache_key is not None and data:
+        if data:
             with self._cache_lock:
                 self._preview_cache[cache_key] = data
                 self._preview_cache.move_to_end(cache_key)
@@ -541,9 +639,15 @@ class ImageLoader:
     def clear_cache(self):
         """
         Purge all cached PIL image references from memory.
+
+        Note that the loader is app-wide and shared by every tab, so this is not
+        something a folder scan should do: prefer :meth:`invalidate_paths`, which drops
+        only the files that actually changed.
         """
         with self._cache_lock:
             self._thumb_cache.clear()
             self._full_cache.clear()
             self._preview_cache.clear()
             self._inflight.clear()
+            self._thumb_bytes = 0
+            self._full_bytes = 0

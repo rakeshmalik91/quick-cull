@@ -3,6 +3,8 @@ import tkinter as tk
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
+from .view_transform import FitResult, RenderPyramid, contain_fit
+
 
 class ImageCanvasViewer(ctk.CTkFrame):
     """
@@ -22,8 +24,11 @@ class ImageCanvasViewer(ctk.CTkFrame):
         self.current_pil_img: Optional[Image.Image] = None
         self.current_tk_img: Optional[ImageTk.PhotoImage] = None
         self.canvas_img_id: Optional[int] = None
-        self._last_rendered_state: Optional[Tuple[float, float, float]] = None
+        self._last_rendered_state: Optional[Tuple[float, int, int]] = None
         self._zoom_timer: Optional[str] = None
+        self._configure_after_id: Optional[str] = None
+        # Resized renders of the current image, reused across redraws and zoom levels.
+        self._pyramid = RenderPyramid()
 
         # Crop Mode Variables
         self.is_cropping: bool = False
@@ -61,7 +66,7 @@ class ImageCanvasViewer(ctk.CTkFrame):
         self.canvas.bind("<ButtonRelease-3>", self._on_right_drag_release)
         self.canvas.bind("<MouseWheel>", self._on_zoom)
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
-        self.canvas.bind("<Configure>", lambda e: self.redraw(force_resize=True))
+        self.canvas.bind("<Configure>", lambda e: self._on_geometry_change())
 
         # Centered Progress Overlay
         self.overlay_frame: Optional[ctk.CTkFrame] = None
@@ -74,6 +79,35 @@ class ImageCanvasViewer(ctk.CTkFrame):
         # Top Annotation Toolbar Overlay
         self.anno_toolbar: Optional[ctk.CTkFrame] = None
         self._create_anno_toolbar()
+
+    def _on_geometry_change(self):
+        """Re-fit on a viewport resize.
+
+        Coalesced: a window drag emits a long burst of ``<Configure>`` events, and
+        resizing plus repainting on each one is what made the viewer stutter while the
+        window was being sized. The final geometry always gets rendered.
+        """
+        if getattr(self, "_configure_after_id", None) is None:
+            self._configure_after_id = self.after(16, self._flush_geometry_change)
+
+    def _flush_geometry_change(self):
+        self._configure_after_id = None
+        self.redraw(force_resize=True)
+
+    def current_fit(self) -> Optional[FitResult]:
+        """The geometry currently on screen, or ``None`` before the first layout."""
+        if self.current_pil_img is None:
+            return None
+        img_w, img_h = self.current_pil_img.size
+        return contain_fit(
+            img_w,
+            img_h,
+            self.canvas.winfo_width(),
+            self.canvas.winfo_height(),
+            zoom=self.zoom_level,
+            pan_x=self.pan_x,
+            pan_y=self.pan_y,
+        )
 
     def _create_loading_overlay(self):
         self.overlay_frame = ctk.CTkFrame(
@@ -131,6 +165,7 @@ class ImageCanvasViewer(ctk.CTkFrame):
     def set_image(self, pil_img: Optional[Image.Image], preserve_zoom: bool = True):
         self.hide_loading()
         self.current_pil_img = pil_img
+        self._pyramid.set_source(pil_img)
         if not preserve_zoom:
             self.zoom_level = 1.0
             self.pan_x = 0.0
@@ -194,31 +229,16 @@ class ImageCanvasViewer(ctk.CTkFrame):
             self.canvas.delete(self._manual_eye_rect_id)
             self._manual_eye_rect_id = None
 
-        if self.current_pil_img is None:
+        fit = self.current_fit()
+        if fit is None:
             return
-
-        canvas_w = self.canvas.winfo_width()
-        canvas_h = self.canvas.winfo_height()
-        if canvas_w <= 10 or canvas_h <= 10:
-            return
-
-        img_w, img_h = self.current_pil_img.size
-        ratio = min(canvas_w / img_w, canvas_h / img_h) * self.zoom_level
-        new_w = max(10, int(img_w * ratio))
-        new_h = max(10, int(img_h * ratio))
-        center_x = (canvas_w / 2) + self.pan_x
-        center_y = (canvas_h / 2) + self.pan_y
 
         def _draw_rect(box, outline, width, dash=None):
             nx1, ny1, nx2, ny2 = box
-            x1, y1 = nx1 * img_w, ny1 * img_h
-            x2, y2 = nx2 * img_w, ny2 * img_h
-            cx1 = center_x - (new_w / 2) + (x1 * ratio)
-            cy1 = center_y - (new_h / 2) + (y1 * ratio)
-            cx2 = center_x - (new_w / 2) + (x2 * ratio)
-            cy2 = center_y - (new_h / 2) + (y2 * ratio)
+            x1, y1 = fit.canvas_from_normalized(nx1, ny1)
+            x2, y2 = fit.canvas_from_normalized(nx2, ny2)
             return self.canvas.create_rectangle(
-                cx1, cy1, cx2, cy2,
+                x1, y1, x2, y2,
                 outline=outline, width=width, dash=dash
             )
 
@@ -243,49 +263,45 @@ class ImageCanvasViewer(ctk.CTkFrame):
             self._last_rendered_state = None
             return
 
-        canvas_w = self.canvas.winfo_width()
-        canvas_h = self.canvas.winfo_height()
-
-        if canvas_w <= 10 or canvas_h <= 10:
+        img_w, img_h = self.current_pil_img.size
+        fit = contain_fit(
+            img_w,
+            img_h,
+            self.canvas.winfo_width(),
+            self.canvas.winfo_height(),
+            zoom=self.zoom_level,
+            pan_x=self.pan_x,
+            pan_y=self.pan_y,
+        )
+        if fit is None:
             return
 
-        img_w, img_h = self.current_pil_img.size
-        ratio = min(canvas_w / img_w, canvas_h / img_h) * self.zoom_level
+        state_key = (round(self.zoom_level, 3), fit.width, fit.height)
 
-        new_w = max(10, int(img_w * ratio))
-        new_h = max(10, int(img_h * ratio))
-
-        center_x = (canvas_w / 2) + self.pan_x
-        center_y = (canvas_h / 2) + self.pan_y
-
-        state_key = (round(self.zoom_level, 3), new_w, new_h)
-
-        # FAST PATH: If image size hasn't changed (e.g. simple mouse drag panning),
-        # update canvas item coordinates directly with hardware compositor (0ms CPU cost!)
+        # FAST PATH: If the render size hasn't changed (e.g. simple mouse drag panning),
+        # move the existing canvas item with the compositor instead of rebuilding a
+        # PhotoImage from scratch.
         if not force_resize and self._last_rendered_state == state_key and self.canvas_img_id is not None:
-            self.canvas.coords(self.canvas_img_id, center_x, center_y)
+            self.canvas.coords(self.canvas_img_id, fit.center_x, fit.center_y)
             self._draw_detection_rect()
             return
 
-        # Standard full-image resize with fast BILINEAR / NEAREST resampling
-        # Cap max render dimensions to 3500px so PIL resize is sub-millisecond
-        max_dim = 3500
-        if new_w > max_dim or new_h > max_dim:
-            scale_down = min(max_dim / new_w, max_dim / new_h)
-            new_w = int(new_w * scale_down)
-            new_h = int(new_h * scale_down)
-
         resample = Image.Resampling.NEAREST if fast_mode else Image.Resampling.BILINEAR
-        resized = self.current_pil_img.resize((new_w, new_h), resample)
+        # Capped, and reused across redraws: the pyramid serves a size it has already
+        # rendered and otherwise derives the new size from the smallest cached render
+        # rather than from the full-resolution source.
+        resized = self._pyramid.render((fit.width, fit.height), resample)
         self.current_tk_img = ImageTk.PhotoImage(resized)
         self._last_rendered_state = state_key
 
         if self.canvas_img_id is not None and self.canvas.type(self.canvas_img_id):
             self.canvas.itemconfig(self.canvas_img_id, image=self.current_tk_img)
-            self.canvas.coords(self.canvas_img_id, center_x, center_y)
+            self.canvas.coords(self.canvas_img_id, fit.center_x, fit.center_y)
         else:
             self.canvas.delete("all")
-            self.canvas_img_id = self.canvas.create_image(center_x, center_y, anchor="center", image=self.current_tk_img)
+            self.canvas_img_id = self.canvas.create_image(
+                fit.center_x, fit.center_y, anchor="center", image=self.current_tk_img
+            )
 
         self._draw_detection_rect()
 
@@ -465,25 +481,19 @@ class ImageCanvasViewer(ctk.CTkFrame):
     def _on_confirm_anno(self):
         if self.on_save_anno_cb and self.current_image_path and self.current_pil_img:
             img_w, img_h = self.current_pil_img.size
-            
-            # Convert canvas px back to image coords
+
+            fit = self.current_fit()
+            if fit is None:
+                return
+
+            # Convert canvas px back to source-image pixels
             def to_img_box(px_box):
-                if not px_box: return None
+                if not px_box:
+                    return None
                 x1, y1, x2, y2 = px_box
-                canvas_w = self.canvas.winfo_width()
-                canvas_h = self.canvas.winfo_height()
-                ratio = min(canvas_w / img_w, canvas_h / img_h) * self.zoom_level
-                new_w = max(10, int(img_w * ratio))
-                new_h = max(10, int(img_h * ratio))
-                center_x = (canvas_w / 2) + self.pan_x
-                center_y = (canvas_h / 2) + self.pan_y
-                
-                # Reverse transform
-                img_x1 = (x1 - (center_x - new_w / 2)) / ratio
-                img_y1 = (y1 - (center_y - new_h / 2)) / ratio
-                img_x2 = (x2 - (center_x - new_w / 2)) / ratio
-                img_y2 = (y2 - (center_y - new_h / 2)) / ratio
-                
+                img_x1, img_y1 = fit.image_from_canvas(x1, y1, img_w, img_h)
+                img_x2, img_y2 = fit.image_from_canvas(x2, y2, img_w, img_h)
+
                 return (int(min(img_x1, img_x2)), int(min(img_y1, img_y2)), 
                         int(max(img_x1, img_x2)), int(max(img_y1, img_y2)))
 
@@ -664,43 +674,12 @@ class ImageCanvasViewer(ctk.CTkFrame):
         if not self.crop_box or self.current_pil_img is None:
             return
 
-        canvas_w = self.canvas.winfo_width()
-        canvas_h = self.canvas.winfo_height()
-        img_w, img_h = self.current_pil_img.size
-        ratio = min(canvas_w / img_w, canvas_h / img_h) * self.zoom_level
-
-        new_w = max(10, int(img_w * ratio))
-        new_h = max(10, int(img_h * ratio))
-
-        # Max dimension scaling check
-        max_dim = 3500
-        if new_w > max_dim or new_h > max_dim:
-            scale_down = min(max_dim / new_w, max_dim / new_h)
-            new_w = int(new_w * scale_down)
-            new_h = int(new_h * scale_down)
-
-        center_x = (canvas_w / 2) + self.pan_x
-        center_y = (canvas_h / 2) + self.pan_y
-        img_left = center_x - (new_w / 2.0)
-        img_top = center_y - (new_h / 2.0)
-
-        cx1, cy1, cx2, cy2 = self.crop_box
-        left_box = min(cx1, cx2)
-        right_box = max(cx1, cx2)
-        top_box = min(cy1, cy2)
-        bottom_box = max(cy1, cy2)
-
-        # Calculate percentage crop box relative to full source image
-        pct_x1 = max(0.0, min(1.0, (left_box - img_left) / float(new_w)))
-        pct_y1 = max(0.0, min(1.0, (top_box - img_top) / float(new_h)))
-        pct_x2 = max(0.0, min(1.0, (right_box - img_left) / float(new_w)))
-        pct_y2 = max(0.0, min(1.0, (bottom_box - img_top) / float(new_h)))
-
+        percentages = self.get_crop_box_percentages()
         cb = self.on_confirm_crop_cb
         self.exit_crop_mode()
 
-        if cb:
-            cb(pct_x1, pct_y1, pct_x2, pct_y2)
+        if cb and percentages:
+            cb(*percentages)
 
     def get_crop_box_percentages(self) -> Optional[Tuple[float, float, float, float]]:
         """
@@ -710,27 +689,9 @@ class ImageCanvasViewer(ctk.CTkFrame):
         if not self.is_cropping or self.crop_box is None or self.current_pil_img is None:
             return None
 
-        canvas_w = self.canvas.winfo_width()
-        canvas_h = self.canvas.winfo_height()
-        if canvas_w <= 10 or canvas_h <= 10:
+        fit = self.current_fit()
+        if fit is None:
             return None
-
-        img_w, img_h = self.current_pil_img.size
-        ratio = min(canvas_w / img_w, canvas_h / img_h) * self.zoom_level
-
-        new_w = max(10, int(img_w * ratio))
-        new_h = max(10, int(img_h * ratio))
-
-        max_dim = 3500
-        if new_w > max_dim or new_h > max_dim:
-            scale_down = min(max_dim / new_w, max_dim / new_h)
-            new_w = int(new_w * scale_down)
-            new_h = int(new_h * scale_down)
-
-        center_x = (canvas_w / 2) + self.pan_x
-        center_y = (canvas_h / 2) + self.pan_y
-        img_left = center_x - (new_w / 2.0)
-        img_top = center_y - (new_h / 2.0)
 
         cx1, cy1, cx2, cy2 = self.crop_box
         left_box = min(cx1, cx2)
@@ -738,10 +699,13 @@ class ImageCanvasViewer(ctk.CTkFrame):
         top_box = min(cy1, cy2)
         bottom_box = max(cy1, cy2)
 
-        pct_x1 = max(0.0, min(1.0, (left_box - img_left) / float(new_w)))
-        pct_y1 = max(0.0, min(1.0, (top_box - img_top) / float(new_h)))
-        pct_x2 = max(0.0, min(1.0, (right_box - img_left) / float(new_w)))
-        pct_y2 = max(0.0, min(1.0, (bottom_box - img_top) / float(new_h)))
+        nx1, ny1 = fit.normalized_from_canvas(left_box, top_box)
+        nx2, ny2 = fit.normalized_from_canvas(right_box, bottom_box)
+
+        pct_x1 = max(0.0, min(1.0, nx1))
+        pct_y1 = max(0.0, min(1.0, ny1))
+        pct_x2 = max(0.0, min(1.0, nx2))
+        pct_y2 = max(0.0, min(1.0, ny2))
 
         if pct_x2 <= pct_x1 or pct_y2 <= pct_y1:
             return None
@@ -791,3 +755,14 @@ class ImageCanvasViewer(ctk.CTkFrame):
             self.pan_y = 0.0
 
         self.redraw(force_resize=True)
+
+    def destroy(self):
+        self._cancel_zoom_timer()
+        if getattr(self, "_configure_after_id", None) is not None:
+            try:
+                self.after_cancel(self._configure_after_id)
+            except Exception:
+                pass
+            self._configure_after_id = None
+        self._pyramid.clear()
+        super().destroy()

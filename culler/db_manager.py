@@ -6,6 +6,38 @@ from typing import Dict, Any, Optional, Tuple, List
 from culler.paths import DB_PATH, resolve_workspace_path, get_dataset_dir_for_workspace
 
 
+def _parse_box(value):
+    """Decode a stored box column into a 4-tuple of floats, or None."""
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, (list, tuple)) and len(parsed) == 4:
+            return (float(parsed[0]), float(parsed[1]), float(parsed[2]), float(parsed[3]))
+    except Exception:
+        return None
+    return None
+
+
+def _record_from_row(row) -> Dict[str, Any]:
+    """Shared row -> record mapping, so both query paths produce the same shape."""
+    keys = set(row.keys())
+    return {
+        "filename": row["filename"],
+        "flag": row["flag"],
+        "rating": row["rating"],
+        "sharpness": row["sharpness"],
+        "tags": row["tags"] if "tags" in keys else "",
+        "detection_box": _parse_box(row["detection_box"]) if "detection_box" in keys else None,
+        "eye_box": _parse_box(row["eye_box"]) if "eye_box" in keys else None,
+    }
+
+
+#: SQLite caps the number of bound parameters per statement (999 on older builds), so a
+#: folder must not be sent as one long ``IN`` list.
+_MAX_SQL_VARIABLES = 500
+
+
 class DatabaseManager:
     """
     SQLite Database Manager for persisting application settings,
@@ -344,35 +376,63 @@ class DatabaseManager:
             rows = conn.execute("SELECT * FROM image_records WHERE file_path LIKE ?", (clean_dir + "%",)).fetchall()
             records = {}
             for r in rows:
-                norm_key = str(Path(r["file_path"]).resolve())
-                box_val = None
-                if "detection_box" in r.keys() and r["detection_box"]:
-                    try:
-                        parsed = json.loads(r["detection_box"])
-                        if isinstance(parsed, (list, tuple)) and len(parsed) == 4:
-                            box_val = (float(parsed[0]), float(parsed[1]), float(parsed[2]), float(parsed[3]))
-                    except Exception:
-                        box_val = None
-
-                eye_val = None
-                if "eye_box" in r.keys() and r["eye_box"]:
-                    try:
-                        parsed_eye = json.loads(r["eye_box"])
-                        if isinstance(parsed_eye, (list, tuple)) and len(parsed_eye) == 4:
-                            eye_val = (float(parsed_eye[0]), float(parsed_eye[1]), float(parsed_eye[2]), float(parsed_eye[3]))
-                    except Exception:
-                        eye_val = None
-
-                records[norm_key] = {
-                    "filename": r["filename"],
-                    "flag": r["flag"],
-                    "rating": r["rating"],
-                    "sharpness": r["sharpness"],
-                    "tags": r["tags"] if "tags" in r.keys() else "",
-                    "detection_box": box_val,
-                    "eye_box": eye_val,
-                }
+                records[str(Path(r["file_path"]).resolve())] = _record_from_row(r)
             return records
+
+    def get_records_for_paths(self, file_paths: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Fetch records for specific files only.
+
+        A differential refresh rebuilds a handful of rows and needs the saved state for
+        exactly those; ``get_all_records_for_dir`` would read and parse every row of the
+        folder on every refresh.
+        """
+        if not file_paths:
+            return {}
+        wanted = set()
+        for fp in file_paths:
+            try:
+                wanted.add(str(Path(fp).resolve()))
+            except (OSError, ValueError):
+                wanted.add(str(fp))
+        if not wanted:
+            return {}
+
+        records: Dict[str, Dict[str, Any]] = {}
+        keys = list(wanted)
+        with self._get_connection() as conn:
+            for start in range(0, len(keys), _MAX_SQL_VARIABLES):
+                chunk = keys[start:start + _MAX_SQL_VARIABLES]
+                rows = conn.execute(
+                    "SELECT * FROM image_records WHERE file_path IN (%s)" % ",".join("?" * len(chunk)),
+                    chunk,
+                ).fetchall()
+                for r in rows:
+                    records[str(Path(r["file_path"]).resolve())] = _record_from_row(r)
+        return records
+
+    def delete_image_records(self, file_paths: List[str]) -> int:
+        """Delete the records of specific files. Returns rows removed."""
+        if not file_paths:
+            return 0
+        keys = []
+        for fp in file_paths:
+            try:
+                keys.append(str(Path(fp).resolve()))
+            except (OSError, ValueError):
+                keys.append(str(fp))
+        if not keys:
+            return 0
+        removed = 0
+        with self._get_connection() as conn:
+            for start in range(0, len(keys), _MAX_SQL_VARIABLES):
+                chunk = keys[start:start + _MAX_SQL_VARIABLES]
+                cursor = conn.execute(
+                    "DELETE FROM image_records WHERE file_path IN (%s)" % ",".join("?" * len(chunk)),
+                    chunk,
+                )
+                removed += max(0, cursor.rowcount)
+            conn.commit()
+        return removed
 
     def cleanup_folder_metadata(self, folder_path: str) -> int:
         """

@@ -50,7 +50,7 @@ class TestImageLoader(unittest.TestCase):
         test_path = Path("D:/Photos/TEST_CACHE.JPG")
         dummy_img = Image.new("RGB", (400, 400), color="blue")
 
-        self.loader._store_thumb((str(test_path), 0.10, "camera"), dummy_img)
+        self.loader._store_thumb(self.loader.tier_key(test_path, 0.10, "camera"), dummy_img)
 
         cached = self.loader.get_cached_thumbnail(test_path)
         self.assertIsNotNone(cached)
@@ -61,7 +61,7 @@ class TestImageLoader(unittest.TestCase):
         Verify callers cannot mutate the cached canonical through the returned image.
         """
         test_path = Path("D:/Photos/TEST_COPY.JPG")
-        self.loader._store_thumb((str(test_path), 0.10, "camera"), Image.new("RGB", (400, 400), "blue"))
+        self.loader._store_thumb(self.loader.tier_key(test_path, 0.10, "camera"), Image.new("RGB", (400, 400), "blue"))
 
         first = self.loader.get_cached_thumbnail(test_path)
         first.paste((255, 0, 0), (0, 0, 10, 10))
@@ -75,14 +75,14 @@ class TestImageLoader(unittest.TestCase):
         default variant (regression: the old path-only index returned it).
         """
         test_path = Path("D:/Photos/TEST_VARIANT.JPG")
-        self.loader._store_thumb((str(test_path), 0.25, "camera"), Image.new("RGB", (400, 400), "red"))
+        self.loader._store_thumb(self.loader.tier_key(test_path, 0.25, "camera"), Image.new("RGB", (400, 400), "red"))
 
         self.assertIsNone(
             self.loader.get_cached_thumbnail(test_path),
             "0.25/camera is not a navigation variant",
         )
 
-        self.loader._store_thumb((str(test_path), 0.10, "camera"), Image.new("RGB", (400, 400), "red"))
+        self.loader._store_thumb(self.loader.tier_key(test_path, 0.10, "camera"), Image.new("RGB", (400, 400), "red"))
         self.assertIsNotNone(self.loader.get_cached_thumbnail(test_path))
 
     def test_thumbnail_cache_uses_composite_key(self):
@@ -93,11 +93,11 @@ class TestImageLoader(unittest.TestCase):
         camera = Image.new("RGB", (400, 400), "red")
         auto = Image.new("RGB", (400, 400), "green")
 
-        self.loader._store_thumb((str(test_path), 0.10, "camera"), camera)
-        self.loader._store_thumb((str(test_path), 0.10, "auto"), auto)
+        self.loader._store_thumb(self.loader.tier_key(test_path, 0.10, "camera"), camera)
+        self.loader._store_thumb(self.loader.tier_key(test_path, 0.10, "auto"), auto)
 
         self.assertEqual(len(self.loader._thumb_cache), 2)
-        self.assertIs(self.loader._thumb_cache[(str(test_path), 0.10, "auto")], auto)
+        self.assertIs(self.loader._thumb_cache[self.loader.tier_key(test_path, 0.10, "auto")], auto)
 
     def test_full_image_ram_caching(self):
         """
@@ -106,8 +106,8 @@ class TestImageLoader(unittest.TestCase):
         test_path = Path("D:/Photos/TEST_FULL.JPG")
         dummy_img = Image.new("RGB", (1920, 1080), color="green")
 
-        cache_key = (str(test_path), 0.25, "camera")
-        self.loader._full_cache[cache_key] = dummy_img
+        cache_key = self.loader.tier_key(test_path, 0.25, "camera")
+        self.loader._store_full(cache_key, dummy_img)
 
         cached = self.loader.get_cached_full_image(test_path, raw_scale=0.25, white_balance="camera")
         self.assertIsNotNone(cached)
@@ -120,8 +120,8 @@ class TestImageLoader(unittest.TestCase):
         test_path = Path("D:/Photos/TEST.JPG")
         dummy_img = Image.new("RGB", (50, 50))
 
-        self.loader._store_thumb((str(test_path), 0.10, "camera"), dummy_img)
-        self.loader._full_cache[(str(test_path), 0.25, "camera")] = dummy_img
+        self.loader._store_thumb(self.loader.tier_key(test_path, 0.10, "camera"), dummy_img)
+        self.loader._store_full(self.loader.tier_key(test_path, 0.25, "camera"), dummy_img)
 
         self.loader.clear_cache()
 
@@ -156,7 +156,7 @@ class TestImageLoader(unittest.TestCase):
         test_path = Path("D:/Photos/TEST_DOWNSCALE.JPG")
         dummy_img = Image.new("RGB", (400, 400), color="green")
 
-        self.loader._store_thumb((str(test_path), 0.10, "camera"), dummy_img)
+        self.loader._store_thumb(self.loader.tier_key(test_path, 0.10, "camera"), dummy_img)
 
         thumb = self.loader.get_thumbnail(test_path, max_size=(80, 80), raw_scale=0.10, white_balance="camera")
         self.assertIsNotNone(thumb)
@@ -168,12 +168,12 @@ class TestImageLoader(unittest.TestCase):
         """
         cap = self.loader.MAX_THUMB_CACHE
         for i in range(cap + 5):
-            self.loader._store_thumb((f"D:/Photos/EVICT_{i:04d}.JPG", 0.10, "camera"),
+            self.loader._store_thumb(self.loader.tier_key(f"D:/Photos/EVICT_{i:04d}.JPG", 0.10, "camera"),
                                     Image.new("RGB", (80, 80)))
 
         self.assertEqual(len(self.loader._thumb_cache), cap)
-        self.assertNotIn(("D:/Photos/EVICT_0000.JPG", 0.10, "camera"), self.loader._thumb_cache)
-        self.assertIn(("D:/Photos/EVICT_%04d.JPG" % (cap + 4), 0.10, "camera"), self.loader._thumb_cache)
+        self.assertNotIn(self.loader.tier_key("D:/Photos/EVICT_0000.JPG", 0.10, "camera"), self.loader._thumb_cache)
+        self.assertIn(self.loader.tier_key("D:/Photos/EVICT_%04d.JPG" % (cap + 4), 0.10, "camera"), self.loader._thumb_cache)
 
 
 class TestImageLoaderThumbnailMemoryBound(unittest.TestCase):

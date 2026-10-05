@@ -1,4 +1,4 @@
-from typing import Callable, Optional, List
+from typing import Callable, Optional, List, Dict
 import tkinter as tk
 import customtkinter as ctk
 
@@ -9,6 +9,8 @@ ABOUT_ICON = "\u24d8"  # circled small i
 
 ADD_TAB_ICON = "+"
 
+CLOSE_ALL_ICON = "\u2715\u2715"  # ✕✕
+
 
 class TabBar(ctk.CTkFrame):
     def __init__(
@@ -18,6 +20,7 @@ class TabBar(ctk.CTkFrame):
         on_tab_closed: Callable[[int], None] = None,
         on_tab_reordered: Callable[[int, int], None] = None,
         on_new_tab: Callable[[], None] = None,
+        on_close_all: Callable[[], None] = None,
         on_about: Callable[[], None] = None,
         **kwargs
     ):
@@ -28,6 +31,7 @@ class TabBar(ctk.CTkFrame):
         self.on_tab_closed = on_tab_closed
         self.on_tab_reordered = on_tab_reordered
         self.on_new_tab = on_new_tab
+        self.on_close_all = on_close_all
         self.on_about = on_about
 
         self._tab_buttons: List[ctk.CTkButton] = []
@@ -36,11 +40,18 @@ class TabBar(ctk.CTkFrame):
         self._active_index: int = 0
         self._tab_count: int = 0
 
+        # Widgets a tab owns, flattened once at creation. Hit-testing used to walk
+        # winfo_children() per mouse-motion event, which is a Tk round trip per child per
+        # pixel of movement and is a large part of why dragging felt like it glitched.
+        self._widget_index: Dict[int, int] = {}
+        self._tab_widgets: List[List[int]] = []
+
         self._drag_source_idx: Optional[int] = None
         self._drag_over_idx: Optional[int] = None
         self._drag_start_x: int = 0
         self._drag_start_y: int = 0
         self._did_drag: bool = False
+        self._drag_hit_after_id: Optional[str] = None
 
         self._scroll_frame = ctk.CTkFrame(self, fg_color="transparent")
         self._scroll_frame.pack(side="left", fill="both", expand=True)
@@ -65,6 +76,20 @@ class TabBar(ctk.CTkFrame):
         self._btn_about.pack(side="right", padx=(2, 6), pady=3)
         ToolTip(self._btn_about, "About")
 
+        self._btn_close_all = ctk.CTkButton(
+            self,
+            text=CLOSE_ALL_ICON,
+            width=30,
+            height=30,
+            fg_color="#2b2b2b",
+            hover_color="#3a3a3a",
+            font=ctk.CTkFont(size=10),
+            command=self._handle_close_all
+        )
+        self._btn_close_all.pack(side="right", padx=2, pady=3)
+        ToolTip(self._btn_close_all, "Close all tabs and release their memory")
+        self._btn_close_all.pack_forget()
+
         # Lives inside the scrolling strip so it always sits right after the last tab.
         self._btn_add = ctk.CTkButton(
             self._inner_frame,
@@ -82,6 +107,37 @@ class TabBar(ctk.CTkFrame):
     def _on_canvas_configure(self, event):
         self._canvas.itemconfig(self._canvas_window, width=event.width)
 
+    def _register_widgets(self, index: int, btn: ctk.CTkButton, close_btn: ctk.CTkButton) -> None:
+        """Cache every widget id a tab owns, so hit-testing is a dict lookup."""
+        owned = [btn, close_btn]
+        for widget in (btn, close_btn):
+            owned.extend(widget.winfo_children())
+            for child in widget.winfo_children():
+                owned.extend(child.winfo_children())
+        while len(self._tab_widgets) <= index:
+            self._tab_widgets.append([])
+        self._tab_widgets[index] = [id(w) for w in owned]
+        for w in owned:
+            self._widget_index[id(w)] = index
+
+    def _rebuild_widget_index(self) -> None:
+        """Re-derive the id -> index map after the button lists have been reordered."""
+        self._widget_index.clear()
+        self._tab_widgets = []
+        for index, (btn, close_btn) in enumerate(zip(self._tab_buttons, self._close_buttons)):
+            self._register_widgets(index, btn, close_btn)
+
+    def _append_tab_widgets(self, btn: ctk.CTkButton, close_btn: ctk.CTkButton) -> None:
+        """Insert a new tab just before the '+' button.
+
+        Adding a tab used to re-pack every existing tab button, which is O(n) per add
+        and O(n²) over a session's worth of tabs, with a visible jump each time.
+        """
+        btn.pack(side="left", padx=(2, 0), pady=3, before=self._btn_add)
+        close_btn.pack(side="left", padx=(0, 4), pady=3, before=self._btn_add)
+        self._update_scroll_region()
+        self._sync_close_all_visibility()
+
     def _relayout(self):
         """Re-pack the strip so tab buttons keep their order and '+' stays last."""
         for btn in self._tab_buttons:
@@ -96,6 +152,14 @@ class TabBar(ctk.CTkFrame):
 
         self._btn_add.pack(side="left", padx=(6, 2), pady=3)
         self._update_scroll_region()
+        self._sync_close_all_visibility()
+
+    def _sync_close_all_visibility(self) -> None:
+        """The Close All button has nothing to act on with no tabs open."""
+        if self._tab_count > 0:
+            self._btn_close_all.pack(side="right", padx=2, pady=3)
+        else:
+            self._btn_close_all.pack_forget()
 
     def add_tab(self, label: str) -> int:
         idx = self._tab_count
@@ -112,7 +176,6 @@ class TabBar(ctk.CTkFrame):
             text_color="#cccccc" if idx != self._active_index else "#ffffff",
             font=ctk.CTkFont(size=11),
         )
-        btn.pack(side="left", padx=(2, 0), pady=3)
 
         btn.bind("<ButtonPress-1>", self._on_drag_start)
         btn.bind("<B1-Motion>", self._on_drag_motion)
@@ -134,7 +197,8 @@ class TabBar(ctk.CTkFrame):
 
         self._tab_buttons.append(btn)
         self._close_buttons.append(close_btn)
-        self._relayout()
+        self._register_widgets(idx, btn, close_btn)
+        self._append_tab_widgets(btn, close_btn)
         return idx
 
     def remove_tab(self, index: int):
@@ -146,7 +210,9 @@ class TabBar(ctk.CTkFrame):
         close_btn = self._close_buttons.pop(index)
         close_btn.destroy()
         self._tab_labels.pop(index)
+        self._tab_widgets.pop(index)
         self._tab_count -= 1
+        self._rebuild_widget_index()
 
         if self._tab_count == 0:
             self._active_index = 0
@@ -165,6 +231,26 @@ class TabBar(ctk.CTkFrame):
                 text_color="#cccccc" if i != self._active_index else "#ffffff"
             )
 
+        self._relayout()
+
+    def remove_all_tabs(self):
+        """Drop every tab button in one pass.
+
+        Calling ``remove_tab`` n times destroyed and re-packed the strip n times.
+        """
+        for btn in self._tab_buttons:
+            btn.destroy()
+        for close_btn in self._close_buttons:
+            close_btn.destroy()
+        self._tab_buttons = []
+        self._close_buttons = []
+        self._tab_labels = []
+        self._tab_widgets = []
+        self._widget_index = {}
+        self._tab_count = 0
+        self._active_index = 0
+        self._drag_source_idx = None
+        self._drag_over_idx = None
         self._relayout()
 
     def set_active(self, index: int):
@@ -211,6 +297,8 @@ class TabBar(ctk.CTkFrame):
         elif from_idx > to_idx and old_active >= to_idx and old_active < from_idx:
             self._active_index += 1
 
+        self._rebuild_widget_index()
+
         for b in self._tab_buttons:
             b.pack_forget()
         for cb in self._close_buttons:
@@ -239,13 +327,32 @@ class TabBar(ctk.CTkFrame):
             self._canvas.config(scrollregion=bbox)
 
     def _get_index_for_widget(self, widget) -> int:
-        for idx, btn in enumerate(self._tab_buttons):
-            if btn == widget or any(child == widget for child in btn.winfo_children()):
-                return idx
-        for idx, cb in enumerate(self._close_buttons):
-            if cb == widget or any(child == widget for child in cb.winfo_children()):
-                return idx
-        return -1
+        """Which tab a widget belongs to, via the id map built when the tab was created."""
+        if widget is None:
+            return -1
+        idx = self._widget_index.get(id(widget))
+        if idx is None:
+            # Tk can hand back an internal window (e.g. a scrollbar) we never cached.
+            try:
+                parent = widget.nametowidget(widget.winfo_parent())
+            except Exception:
+                return -1
+            if parent is widget:
+                return -1
+            return self._get_index_for_widget(parent)
+        return idx if 0 <= idx < self._tab_count else -1
+
+    def _tab_index_at_pointer(self, x_root: int, y_root: int) -> int:
+        """Tab under the pointer, including its close button.
+
+        Hit-testing used to start from ``event.widget`` - the widget the event was bound
+        to, which is unrelated to where the cursor actually is - so the drop target
+        drifted while dragging.
+        """
+        widget = self.winfo_containing(x_root, y_root)
+        if widget is None:
+            return -1
+        return self._get_index_for_widget(widget)
 
     def _handle_close_btn_click(self, close_btn: ctk.CTkButton):
         if close_btn in self._close_buttons:
@@ -260,6 +367,10 @@ class TabBar(ctk.CTkFrame):
     def _handle_close(self, index: int):
         if self.on_tab_closed and 0 <= index < self._tab_count:
             self.on_tab_closed(index)
+
+    def _handle_close_all(self):
+        if self.on_close_all and self._tab_count > 0:
+            self.on_close_all()
 
     def _handle_new_tab(self):
         if self.on_new_tab:
@@ -286,15 +397,27 @@ class TabBar(ctk.CTkFrame):
         dy = event.y_root - self._drag_start_y
         if abs(dx) > 4 or abs(dy) > 4:
             self._did_drag = True
-        widget_under = event.widget.winfo_containing(event.x_root, event.y_root)
-        if widget_under is None:
+        # Coalesce to one hit-test per frame: a drag emits a motion event per pixel, and
+        # each one used to walk every tab button's widget tree.
+        if self._drag_hit_after_id is not None:
             return
-        for i, btn in enumerate(self._tab_buttons):
-            if btn == widget_under or any(child == widget_under for child in btn.winfo_children()):
-                self._drag_over_idx = i
-                return
+        self._drag_hit_after_id = self.after_idle(self._resolve_drag_target, event.x_root, event.y_root)
+
+    def _resolve_drag_target(self, x_root: int, y_root: int) -> None:
+        self._drag_hit_after_id = None
+        if self._drag_source_idx is None:
+            return
+        idx = self._tab_index_at_pointer(x_root, y_root)
+        if idx >= 0:
+            self._drag_over_idx = idx
 
     def _on_drag_release(self, event):
+        if self._drag_hit_after_id is not None:
+            try:
+                self.after_cancel(self._drag_hit_after_id)
+            except Exception:
+                pass
+            self._drag_hit_after_id = None
         if self._did_drag and self._drag_source_idx is not None and self._drag_over_idx is not None:
             if self._drag_source_idx != self._drag_over_idx and self.on_tab_reordered:
                 self.on_tab_reordered(self._drag_source_idx, self._drag_over_idx)

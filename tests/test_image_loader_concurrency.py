@@ -33,7 +33,7 @@ class TestFullCacheByteBudget(unittest.TestCase):
 
         # 1200x800 RGB ~= 2.74 MB each, so only one fits in a 4 MB budget.
         for i in range(6):
-            self.loader._store_full((f"D:/Photos/BIG_{i}.JPG", 0.25, "camera"),
+            self.loader._store_full(self.loader.tier_key(f"D:/Photos/BIG_{i}.JPG", 0.25, "camera"),
                                     Image.new("RGB", (1200, 800)))
 
         stats = self.loader.cache_stats()
@@ -45,23 +45,23 @@ class TestFullCacheByteBudget(unittest.TestCase):
         self.loader.MAX_FULL_CACHE_BYTES = 4 * 1024 * 1024
         self.loader.MAX_FULL_CACHE = 1000
         for i in range(4):
-            self.loader._store_full((f"D:/Photos/KEEP_{i}.JPG", 0.25, "camera"),
+            self.loader._store_full(self.loader.tier_key(f"D:/Photos/KEEP_{i}.JPG", 0.25, "camera"),
                                     Image.new("RGB", (1200, 800)))
 
-        self.assertIn(("D:/Photos/KEEP_3.JPG", 0.25, "camera"), self.loader._full_cache)
-        self.assertNotIn(("D:/Photos/KEEP_0.JPG", 0.25, "camera"), self.loader._full_cache)
+        self.assertIn(self.loader.tier_key("D:/Photos/KEEP_3.JPG", 0.25, "camera"), self.loader._full_cache)
+        self.assertNotIn(self.loader.tier_key("D:/Photos/KEEP_0.JPG", 0.25, "camera"), self.loader._full_cache)
 
     def test_item_cap_still_applies_for_small_images(self):
         self.loader.MAX_FULL_CACHE_BYTES = 512 * 1024 * 1024
         self.loader.MAX_FULL_CACHE = 3
         for i in range(6):
-            self.loader._store_full((f"D:/Photos/SMALL_{i}.JPG", 0.25, "camera"),
+            self.loader._store_full(self.loader.tier_key(f"D:/Photos/SMALL_{i}.JPG", 0.25, "camera"),
                                     Image.new("RGB", (16, 16)))
 
         self.assertEqual(len(self.loader._full_cache), 3)
 
     def test_cache_stats_reports_budget(self):
-        self.loader._store_full(("D:/Photos/S.JPG", 0.25, "camera"), Image.new("RGB", (10, 10)))
+        self.loader._store_full(self.loader.tier_key("D:/Photos/S.JPG", 0.25, "camera"), Image.new("RGB", (10, 10)))
         stats = self.loader.cache_stats()
         for key in ("thumb_items", "thumb_bytes", "full_items", "full_bytes", "full_budget_bytes"):
             self.assertIn(key, stats)
@@ -86,10 +86,10 @@ class TestSingleFlight(unittest.TestCase):
         calls = []
         original_decode = ImageLoader._decode_and_store_full
 
-        def slow_decode(self_, file_path_str, cache_key, raw_scale, white_balance):
+        def slow_decode(self_, file_path_str, cache_key, raw_scale, white_balance, content=None):
             calls.append(cache_key)
             time.sleep(0.25)
-            return original_decode(self_, file_path_str, cache_key, raw_scale, white_balance)
+            return original_decode(self_, file_path_str, cache_key, raw_scale, white_balance, content)
 
         ImageLoader._decode_and_store_full = slow_decode
         try:
@@ -119,9 +119,9 @@ class TestSingleFlight(unittest.TestCase):
     def test_waiter_gets_cached_result_not_none(self):
         original_decode = ImageLoader._decode_and_store_full
 
-        def slow_decode(self_, file_path_str, cache_key, raw_scale, white_balance):
+        def slow_decode(self_, file_path_str, cache_key, raw_scale, white_balance, content=None):
             time.sleep(0.2)
-            return original_decode(self_, file_path_str, cache_key, raw_scale, white_balance)
+            return original_decode(self_, file_path_str, cache_key, raw_scale, white_balance, content)
 
         ImageLoader._decode_and_store_full = slow_decode
         try:

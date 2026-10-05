@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -162,6 +163,78 @@ class TestDatabaseManager(unittest.TestCase):
 
         records = self.db.get_all_records_for_dir(str(dir_path))
         self.assertEqual(len(records), 0)
+
+
+class TestTargetedRecordQueries(unittest.TestCase):
+    """A differential refresh queries specific files, and a folder can exceed SQLite's
+    bound-parameter limit, so the query has to be chunked."""
+
+    def setUp(self):
+        self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix=".db")
+        os.close(self.temp_db_fd)
+        self.db = DatabaseManager(db_path=self.temp_db_path)
+        self.dir_path = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        try:
+            self.db.close()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(self.temp_db_path):
+                os.remove(self.temp_db_path)
+        except Exception:
+            pass
+        shutil.rmtree(self.dir_path, ignore_errors=True)
+
+    def test_get_records_for_paths_returns_only_what_was_asked_for(self):
+        a = str(self.dir_path / "A.ARW")
+        b = str(self.dir_path / "B.ARW")
+        self.db.save_image_record(file_path=a, filename="A.ARW", flag="PICK", rating=4)
+        self.db.save_image_record(file_path=b, filename="B.ARW", flag="REJECT", rating=1)
+
+        records = self.db.get_records_for_paths([a])
+
+        self.assertEqual(list(records), [a])
+        self.assertEqual(records[a]["flag"], "PICK")
+        self.assertEqual(records[a]["rating"], 4)
+
+    def test_get_records_for_paths_handles_an_empty_list(self):
+        self.assertEqual(self.db.get_records_for_paths([]), {})
+
+    def test_get_records_for_paths_chunks_past_the_parameter_limit(self):
+        from culler.db_manager import _MAX_SQL_VARIABLES
+
+        total = _MAX_SQL_VARIABLES + 37
+        paths = [str(self.dir_path / f"IMG{i:05d}.ARW") for i in range(total)]
+        self.db.save_image_records([
+            {"file_path": p, "filename": Path(p).name, "flag": "PICK", "rating": 3}
+            for p in paths
+        ])
+
+        records = self.db.get_records_for_paths(paths)
+
+        self.assertEqual(len(records), total,
+                         "a folder larger than one statement's parameter limit must still resolve")
+        self.assertEqual(records[paths[-1]]["rating"], 3)
+
+    def test_delete_image_records_chunks_past_the_parameter_limit(self):
+        from culler.db_manager import _MAX_SQL_VARIABLES
+
+        total = _MAX_SQL_VARIABLES + 11
+        paths = [str(self.dir_path / f"DEL{i:05d}.ARW") for i in range(total)]
+        self.db.save_image_records([
+            {"file_path": p, "filename": Path(p).name, "flag": "PICK", "rating": 1}
+            for p in paths
+        ])
+
+        removed = self.db.delete_image_records(paths)
+
+        self.assertEqual(removed, total)
+        self.assertEqual(self.db.get_records_for_paths(paths), {})
+
+    def test_delete_image_records_handles_an_empty_list(self):
+        self.assertEqual(self.db.delete_image_records([]), 0)
 
 
 if __name__ == "__main__":

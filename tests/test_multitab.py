@@ -113,6 +113,7 @@ class TestImageCullerAppTabLogic(unittest.TestCase):
         app._persist_tabs_state = lambda: ImageCullerApp._persist_tabs_state(app)
         app._restore_tabs_state = lambda: ImageCullerApp._restore_tabs_state(app)
         app._apply_tab_state = lambda tab: ImageCullerApp._apply_tab_state(app, tab)
+        app._release_tab_resources = lambda tab: ImageCullerApp._release_tab_resources(app, tab)
         app._load_tab_directory = MagicMock()
         return app
 
@@ -190,17 +191,112 @@ class TestImageCullerAppTabLogic(unittest.TestCase):
         self.assertEqual(app.active_tab_index, 0)
         app._apply_tab_state.assert_called_once_with(app.tabs[0])
 
-    def test_close_tab_when_only_one_does_nothing(self):
+    def test_close_tab_when_only_one_closes_it_and_resets_the_workspace(self):
+        """
+        Regression: with a single tab open, closing it silently did nothing.
+
+        There was an early return for ``len(self.tabs) <= 1``, so the last tab could
+        never be closed and its memory could never be released.
+        """
         from gui import ImageCullerApp
 
         app = self._make_app()
+        app._sync_loading_progress = MagicMock()
+        app._update_status = MagicMock()
         ImageCullerApp._add_tab(app, "D:/Photos/A")
+        session = app.tabs[0]["session"]
+        session.release = MagicMock(wraps=session.release)
 
         app.tab_bar.reset_mock()
+        app._persist_tabs_state = MagicMock()
+
         ImageCullerApp._close_tab(app, 0)
 
-        self.assertEqual(len(app.tabs), 1)
-        app.tab_bar.remove_tab.assert_not_called()
+        self.assertEqual(app.tabs, [], "the last tab must be closable")
+        app.tab_bar.remove_tab.assert_called_once_with(0)
+        self.assertEqual(app.active_tab_index, 0)
+        session.release.assert_called_once()
+        app.thumb_list.forget_paths.assert_called_once()
+        app._persist_tabs_state.assert_called_once()
+
+    def test_closing_a_tab_releases_its_cached_images(self):
+        from gui import ImageCullerApp
+        from pathlib import Path as _Path
+
+        app = self._make_app()
+        app._sync_loading_progress = MagicMock()
+        app._update_status = MagicMock()
+        ImageCullerApp._add_tab(app, "D:/Photos/A")
+        ImageCullerApp._add_tab(app, "D:/Photos/B")
+
+        session = app.tabs[0]["session"]
+        session.release = MagicMock(wraps=session.release)
+        item = _Path("D:/Photos/A/IMG_1.ARW")
+        session.items = [MagicMock(stacked_paths=[item], path=item)]
+
+        app.tab_bar.reset_mock()
+        app._persist_tabs_state = MagicMock()
+        ImageCullerApp._close_tab(app, 0)
+
+        released = app.image_loader.invalidate_paths.call_args[0][0]
+        self.assertIn(item, released, "the closed tab's decoded pixels must be evicted")
+        session.release.assert_called_once()
+        self.assertEqual(session.items, [], "the closed tab must not hold its items")
+
+    def test_close_all_tabs_releases_everything(self):
+        from gui import ImageCullerApp
+        from pathlib import Path as _Path
+
+        app = self._make_app()
+        app._show_no_tabs_state = MagicMock()
+        app._update_status = MagicMock()
+        ImageCullerApp._add_tab(app, "D:/Photos/A")
+        ImageCullerApp._add_tab(app, "D:/Photos/B")
+        ImageCullerApp._add_tab(app, "D:/Photos/C")
+
+        sessions = [t["session"] for t in app.tabs]
+        for session, directory in zip(sessions, ["D:/Photos/A", "D:/Photos/B", "D:/Photos/C"]):
+            session.release = MagicMock(wraps=session.release)
+            # Give each tab a directory so the watcher unwatch path is exercised.
+            session.directory = _Path(directory).resolve()
+        app.tab_bar.reset_mock()
+        app._persist_tabs_state = MagicMock()
+
+        ImageCullerApp._close_all_tabs(app)
+
+        self.assertEqual(app.tabs, [])
+        self.assertEqual(app.active_tab_index, 0)
+        app.tab_bar.remove_all_tabs.assert_called_once()
+        for session in sessions:
+            session.release.assert_called_once()
+        self.assertEqual(app.image_loader.invalidate_paths.call_count, 3)
+        self.assertEqual(app.folder_watcher.unwatch.call_count, 3)
+
+    def test_close_all_tabs_with_none_open_is_a_noop(self):
+        from gui import ImageCullerApp
+
+        app = self._make_app()
+        app._show_no_tabs_state = MagicMock()
+        app._update_status = MagicMock()
+
+        ImageCullerApp._close_all_tabs(app)
+
+        app.tab_bar.remove_all_tabs.assert_not_called()
+        app._update_status.assert_not_called()
+
+    def test_scan_callbacks_ignore_a_released_tab(self):
+        """A tab closed mid-scan must not be painted into after it is gone."""
+        from gui import ImageCullerApp
+
+        app = self._make_app()
+        app._update_tab_loading_indicator = MagicMock()
+        tab = {"_released": True, "session": MagicMock(), "is_loaded": True, "loading": False}
+
+        ImageCullerApp._on_tab_scan_complete(app, tab)
+        ImageCullerApp._on_tab_scan_error(app, tab, RuntimeError("boom"))
+        ImageCullerApp._preload_placeholder_items(app, tab, "camera")
+
+        app._update_tab_loading_indicator.assert_not_called()
 
     def test_switch_tab_saves_and_applies_state(self):
         from gui import ImageCullerApp
@@ -627,8 +723,10 @@ class TestFolderChangeReload(unittest.TestCase):
         change = self.change_cls(directory=self.directory, removed=("A.JPG", "B.JPG"))
         app._on_folder_changed(tab, change)
 
-        app._load_directory.assert_called_once_with(str(self.directory))
-        app._load_tab_directory.assert_not_called()
+        # The tab's own loader, not _load_directory: a watcher reload must keep the
+        # tab's filters and selection, and the session's manifest makes it differential.
+        app._load_tab_directory.assert_called_once_with(tab, show_progress=True)
+        app._load_directory.assert_not_called()
         app._update_status.assert_called_once()
         self.assertIn("-2 removed", app._update_status.call_args[0][0])
 
@@ -766,7 +864,12 @@ class TestTabBarDynamicIndex(unittest.TestCase):
         bar._tab_count = 3
         bar._active_index = 0
         bar._btn_add = MagicMock()
+        bar._btn_close_all = MagicMock()
         bar._update_scroll_region = MagicMock()
+        bar._widget_index = {}
+        bar._tab_widgets = []
+        for i in range(3):
+            bar._register_widgets(i, bar._tab_buttons[i], bar._close_buttons[i])
 
         btn0, btn1, btn2 = bar._close_buttons[0], bar._close_buttons[1], bar._close_buttons[2]
 
@@ -795,7 +898,12 @@ class TestTabBarDynamicIndex(unittest.TestCase):
         bar._tab_count = 3
         bar._active_index = 0
         bar._btn_add = MagicMock()
+        bar._btn_close_all = MagicMock()
         bar._update_scroll_region = MagicMock()
+        bar._widget_index = {}
+        bar._tab_widgets = []
+        for i, (b, cb) in enumerate(zip(bar._tab_buttons, bar._close_buttons)):
+            bar._register_widgets(i, b, cb)
 
         bar.reorder(0, 2)  # Move A to position 2: [B, C, A]
         self.assertEqual(bar._get_index_for_widget(btnA), 2)

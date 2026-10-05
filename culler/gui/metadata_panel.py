@@ -1,14 +1,36 @@
 from pathlib import Path
-from typing import List, Optional, Callable
+from typing import Callable, Dict, List, Optional
 import customtkinter as ctk
 from ..culler_engine import ImageItem, FlagState
+from ..logger import log_error
 from .tooltip import ToolTip
+
+
+#: Stable identifiers for the panel's sections, in their default order. The order the
+#: user drags them into is persisted against these keys, not against widget instances.
+BAG_KEYS = ("action", "reset", "move", "tags", "rating", "meta")
+
+BAG_SETTINGS_KEY = "meta_panel_bag_order"
+
+#: The panel is the right-hand sidebar. Its bags live in one scrollable column so a short
+#: window scrolls instead of overlapping them, and the width the tag buttons are laid out
+#: from is derived from this rather than hard-coded.
+PANEL_WIDTH = 290
+PANEL_PADDING = 10
+TAG_GRID_PAD = 2
+#: Inner width available to a bag: the panel, less its own padding on both sides.
+TAG_ROW_WIDTH = PANEL_WIDTH - PANEL_PADDING * 4
 
 
 class MetadataPanel(ctk.CTkFrame):
     """
     Right sidebar containing Pick/Reject action buttons, Move Picked / Move Rejected actions with custom output folders,
     Unflag All, Tagging controls (Blur, Duplicate, Dark, Over-exposed, Custom), star rating controls, and EXIF card.
+
+    The bags keep the arrangement they have always had. The only structural change is
+    that they live in one scrollable column: packed straight into a fixed-height panel
+    they overflowed, and Tk placed the remainder on top of each other. Each bag's title
+    doubles as a drag handle, so the order is the user's to choose and is persisted.
     """
 
     def __init__(
@@ -29,9 +51,11 @@ class MetadataPanel(ctk.CTkFrame):
         on_config_output_folders: Optional[Callable[[], None]] = None,
         initial_picked_folder: str = "_SELECTED",
         initial_rejected_folder: str = "_REJECTED",
+        bag_order: Optional[List[str]] = None,
+        on_bag_order_changed: Optional[Callable[[List[str]], None]] = None,
         **kwargs
     ):
-        super().__init__(master, width=290, corner_radius=5, **kwargs)
+        super().__init__(master, width=PANEL_WIDTH, corner_radius=5, **kwargs)
         self.pack_propagate(False)
 
         self.on_set_flag = on_set_flag
@@ -47,24 +71,154 @@ class MetadataPanel(ctk.CTkFrame):
         self.on_move_picked = on_move_picked
         self.on_move_rejected = on_move_rejected
         self.on_config_output_folders = on_config_output_folders
+        self.on_bag_order_changed = on_bag_order_changed
 
         self.picked_folder = initial_picked_folder
         self.rejected_folder = initial_rejected_folder
 
         self.current_item: Optional[ImageItem] = None
         self._tag_buttons: dict = {}
+        self._bags: Dict[str, ctk.CTkFrame] = {}
+        self._bag_titles: Dict[str, ctk.CTkLabel] = {}
+        self._bag_pack: Dict[str, dict] = {}
+        self._bag_title_colors: Dict[str, str] = {}
+        self._bag_order: List[str] = self._sanitize_order(bag_order)
+        self._drag_key: Optional[str] = None
+        self._drag_target: Optional[str] = None
 
         self._build_widgets()
+        self._apply_bag_order()
+
+    def _sanitize_order(self, order: Optional[List[str]]) -> List[str]:
+        """A persisted order, filtered to known keys and completed with any new ones.
+
+        A bag added in a later version must still appear, and a key that no longer
+        exists must not leave a hole in the layout.
+        """
+        if not order:
+            return list(BAG_KEYS)
+        seen = [k for k in order if k in BAG_KEYS]
+        for key in BAG_KEYS:
+            if key not in seen:
+                seen.append(key)
+        return seen
+
+    def _register_bag(self, key: str, frame: ctk.CTkFrame, title: ctk.CTkLabel,
+                      pack_options: dict) -> None:
+        """Remember a bag so it can be reordered, and make its title a drag handle.
+
+        The title doubles as the handle rather than adding a separate grip widget, so
+        the bags look exactly as they did before.
+        """
+        self._bags[key] = frame
+        self._bag_titles[key] = title
+        self._bag_pack[key] = pack_options
+        # CustomTkinter has no "unset" for text_color, so the original is kept and
+        # restored rather than cleared.
+        self._bag_title_colors[key] = title.cget("text_color")
+        title.configure(cursor="hand2")
+        ToolTip(title, "Drag to reorder this section")
+        title.bind("<ButtonPress-1>", self._on_bag_drag_start)
+        title.bind("<B1-Motion>", self._on_bag_drag_motion)
+        title.bind("<ButtonRelease-1>", self._on_bag_drag_end)
+
+    # ------------------------------------------------------------- reordering
+
+    def bag_order(self) -> List[str]:
+        """The current section order, for persisting."""
+        return list(self._bag_order)
+
+    def set_bag_order(self, order: List[str]) -> None:
+        self._bag_order = self._sanitize_order(order)
+        self._apply_bag_order()
+
+    def _apply_bag_order(self) -> None:
+        """Repack the bags in the current order, with one consistent set of options."""
+        for frame in self._bags.values():
+            frame.pack_forget()
+        for key in self._bag_order:
+            frame = self._bags.get(key)
+            if frame is not None:
+                frame.pack(**self._bag_pack[key])
+
+    def _on_bag_drag_start(self, event) -> None:
+        key = self._bag_key_of(event.widget)
+        if key is None:
+            return
+        self._drag_key = key
+        self._drag_target = key
+        self._bag_titles[key].configure(text_color="#3a86ff")
+
+    def _on_bag_drag_motion(self, event) -> None:
+        if self._drag_key is None:
+            return
+        target = self._bag_at_y(event.y_root)
+        if target is None or target == self._drag_target:
+            return
+        self._drag_target = target
+        order = list(self._bag_order)
+        order.remove(self._drag_key)
+        order.insert(order.index(target), self._drag_key)
+        if order != self._bag_order:
+            self._bag_order = order
+            self._apply_bag_order()
+
+    def _on_bag_drag_end(self, event) -> None:
+        if self._drag_key is None:
+            return
+        self._bag_titles[self._drag_key].configure(
+            text_color=self._bag_title_colors.get(self._drag_key, "#ffffff"))
+        self._drag_key = None
+        self._drag_target = None
+        if self.on_bag_order_changed:
+            try:
+                self.on_bag_order_changed(self.bag_order())
+            except Exception:
+                log_error("Failed to persist the metadata panel section order", exc_info=True)
+
+    def _bag_key_of(self, widget) -> Optional[str]:
+        for key, title in self._bag_titles.items():
+            if title is widget:
+                return key
+        return None
+
+    def _bag_at_y(self, y_root: int) -> Optional[str]:
+        """The bag whose vertical centre is nearest ``y_root``.
+
+        Using the centre line keeps the result stable no matter how tall a bag's
+        contents happen to be, which is what makes the drop position predictable.
+        """
+        best = None
+        best_delta = None
+        for key in self._bag_order:
+            frame = self._bags.get(key)
+            if frame is None:
+                continue
+            try:
+                top = frame.winfo_rooty()
+                height = max(1, frame.winfo_height())
+            except Exception:
+                continue
+            delta = abs((top + height / 2.0) - y_root)
+            if best_delta is None or delta < best_delta:
+                best, best_delta = key, delta
+        return best
 
     def _build_widgets(self):
+        # One scrollable column for the bags. Packed straight into a fixed-height panel
+        # they overflowed, and Tk placed whatever did not fit on top of the rest.
+        self._bags_area = ctk.CTkScrollableFrame(self, label_text="")
+        self._bags_area.pack(side="top", fill="both", expand=True)
+
         # Action Buttons Box
-        self.action_box = ctk.CTkFrame(self, fg_color="transparent")
-        self.action_box.pack(side="top", fill="x", padx=10, pady=6)
+        self.action_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
 
         self.lbl_action = ctk.CTkLabel(
             self.action_box, text="CULLING ACTIONS", font=ctk.CTkFont(size=12, weight="bold")
         )
         self.lbl_action.pack(anchor="w", pady=(0, 4))
+        self._register_bag("action", self.action_box, self.lbl_action,
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 6})
 
         self.btn_pick = ctk.CTkButton(
             self.action_box,
@@ -99,13 +253,14 @@ class MetadataPanel(ctk.CTkFrame):
         ToolTip(self.btn_unflag, "Shortcut: U (Unflag active photo)")
 
         # Clear / Reset Metadata Row (Flags, Tags, Ratings, All side by side)
-        self.reset_box = ctk.CTkFrame(self, fg_color="transparent")
-        self.reset_box.pack(side="top", fill="x", padx=10, pady=4)
+        self.reset_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
 
         self.lbl_reset = ctk.CTkLabel(
             self.reset_box, text="CLEAR METADATA", font=ctk.CTkFont(size=11, weight="bold")
         )
         self.lbl_reset.pack(anchor="w", pady=(0, 3))
+        self._register_bag("reset", self.reset_box, self.lbl_reset,
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 4})
 
         self.reset_btn_row = ctk.CTkFrame(self.reset_box, fg_color="transparent")
         self.reset_btn_row.pack(fill="x")
@@ -167,13 +322,14 @@ class MetadataPanel(ctk.CTkFrame):
             ToolTip(self.btn_clear_all, "Clear Flags, Tags, AND Ratings across all photos")
 
         # Move & Export Operations Box
-        self.move_box = ctk.CTkFrame(self, fg_color="transparent")
-        self.move_box.pack(side="top", fill="x", padx=10, pady=4)
+        self.move_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
 
         self.lbl_move = ctk.CTkLabel(
             self.move_box, text="MOVE & EXPORT", font=ctk.CTkFont(size=12, weight="bold")
         )
         self.lbl_move.pack(anchor="w", pady=(0, 4))
+        self._register_bag("move", self.move_box, self.lbl_move,
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 4})
 
         p_name = Path(self.picked_folder).name or self.picked_folder
         r_name = Path(self.rejected_folder).name or self.rejected_folder
@@ -267,13 +423,14 @@ class MetadataPanel(ctk.CTkFrame):
             ToolTip(self.btn_convert_jpg, "Convert selected photo(s) to JPG (Shortcut: Ctrl+S)")
 
         # Tags Box (Blur, Duplicate, Dark, Over-exposed + Custom from Settings)
-        self.tags_box = ctk.CTkFrame(self, fg_color="transparent")
-        self.tags_box.pack(side="top", fill="x", padx=10, pady=4)
+        self.tags_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
 
         self.lbl_tags = ctk.CTkLabel(
             self.tags_box, text="IMAGE TAGS", font=ctk.CTkFont(size=12, weight="bold")
         )
         self.lbl_tags.pack(anchor="w", pady=(0, 4))
+        self._register_bag("tags", self.tags_box, self.lbl_tags,
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 4})
 
         self._tags_container = ctk.CTkFrame(self.tags_box, fg_color="transparent")
         self._tags_container.pack(fill="x")
@@ -281,13 +438,14 @@ class MetadataPanel(ctk.CTkFrame):
         self._build_tag_buttons([])
 
         # Rating Stars Box
-        self.rating_box = ctk.CTkFrame(self, fg_color="transparent")
-        self.rating_box.pack(side="top", fill="x", padx=10, pady=4)
+        self.rating_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
 
         self.lbl_stars = ctk.CTkLabel(
             self.rating_box, text="STAR RATING", font=ctk.CTkFont(size=12, weight="bold")
         )
         self.lbl_stars.pack(anchor="w", pady=(0, 4))
+        self._register_bag("rating", self.rating_box, self.lbl_stars,
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 4})
 
         self.star_btn_frame = ctk.CTkFrame(self.rating_box, fg_color="transparent")
         self.star_btn_frame.pack(fill="x")
@@ -308,13 +466,14 @@ class MetadataPanel(ctk.CTkFrame):
             self.star_buttons.append(btn)
 
         # Metadata Card Box
-        self.meta_card = ctk.CTkFrame(self, corner_radius=6, fg_color="#242424")
-        self.meta_card.pack(side="top", fill="both", expand=True, padx=10, pady=6)
+        self.meta_card = ctk.CTkFrame(self._bags_area, corner_radius=6, fg_color="#242424")
 
         self.lbl_meta_title = ctk.CTkLabel(
             self.meta_card, text="EXIF METADATA", font=ctk.CTkFont(size=12, weight="bold")
         )
         self.lbl_meta_title.pack(anchor="w", padx=10, pady=(6, 2))
+        self._register_bag("meta", self.meta_card, self.lbl_meta_title,
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 6})
 
         self.lbl_meta_details = ctk.CTkLabel(
             self.meta_card,
@@ -395,6 +554,11 @@ class MetadataPanel(ctk.CTkFrame):
 
         all_tags = ["Blur", "Duplicate", "Dark", "Over-exposed"] + list(custom_tags)
 
+        # Two per row, each sized from the panel width. The old fixed 125 px buttons
+        # needed ~258 px of inner width, which is wider than the panel, so the tags bag
+        # grew past its neighbours and the bags below it overlapped them.
+        button_width = max(90, (TAG_ROW_WIDTH - TAG_GRID_PAD * 6) // 2)
+
         # Layout in rows of 2
         row_frame = None
         for idx, tag in enumerate(all_tags):
@@ -404,14 +568,14 @@ class MetadataPanel(ctk.CTkFrame):
             btn = ctk.CTkButton(
                 row_frame,
                 text=f"🏷️ {tag}",
-                width=125,
+                width=button_width,
                 height=26,
                 fg_color="#3a3a3a",
                 hover_color="#555555",
                 font=ctk.CTkFont(size=10, weight="bold"),
                 command=lambda t=tag: self._toggle_tag(t)
             )
-            btn.pack(side="left", padx=2, pady=1)
+            btn.pack(side="left", padx=TAG_GRID_PAD, pady=1, fill="x", expand=True)
             self._tag_buttons[tag] = btn
 
         # Re-highlight if there's a current item
