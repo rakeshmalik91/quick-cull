@@ -1365,26 +1365,31 @@ class ImageCullerApp(ctk.CTk):
         if cached_thumb:
             self.viewer.set_image(cached_thumb, preserve_zoom=True)
 
-        def do_sidebar_update():
-            self._sidebar_scheduled = False
+        # Update thumbnail list immediately so selection highlight moves instantaneously
+        self.thumb_list.set_selected_indices(
+            self.selected_indices,
+            index,
+            active_path=load_path,
+            auto_scroll=(not from_click)
+        )
+
+        def do_meta_update():
+            self._meta_timer = None
             cur_idx = self.current_index
             if 0 <= cur_idx < len(self.current_items):
-                cur_item = self.current_items[cur_idx]
-                self.thumb_list.set_selected_indices(
-                    self.selected_indices,
-                    cur_idx,
-                    active_path=load_path,
-                    auto_scroll=(not from_click)
-                )
-                self.meta_panel.update_metadata(cur_item)
+                self.meta_panel.update_metadata(self.current_items[cur_idx])
+
+        if hasattr(self, "_meta_timer") and self._meta_timer is not None:
+            try:
+                self.after_cancel(self._meta_timer)
+            except Exception:
+                pass
+            self._meta_timer = None
 
         if is_continuous:
-            if not getattr(self, "_sidebar_scheduled", False):
-                self._sidebar_scheduled = True
-                self.after(30, do_sidebar_update)
+            self._meta_timer = self.after(80, do_meta_update)
         else:
-            self._sidebar_scheduled = False
-            do_sidebar_update()
+            self.meta_panel.update_metadata(item)
 
         raw_scale = self.toolbar.get_raw_scale()
         white_balance = self.toolbar.get_white_balance()

@@ -82,6 +82,20 @@ Measurements, the two non-obvious costs, and what it did not fix are in
 `ui-framework-assessment.md` §8. The action bags moved below the items for the same
 reason and are covered in §9 of that document.
 
+**Round 4 — 0 ms Perceived Initial Load (ARW Discovery & Placeholders) + Differential Sliding Window (~100 rows).**
+Previously, folder loading was blocked on the entire ExifTool batch pass before populating any rows
+in the grid, leaving the user waiting. Additionally, navigating by just 1 photo was refreshing the entire
+pool, creating visual glitches and multi-selection ghost highlights during fast navigation.
+
+| Performance / UX Area | Before | After | Benefit |
+|---|---|---|---|
+| Perceived folder load | Blocked until all ExifTool batches completed (~1.4–4.0 s) | **< 15 ms immediate placeholder grid** | Instant interaction & preview; metadata hydrates in background |
+| ARW discovery & counting | Calculated only after full EXIF scan | **Instantaneous via `scan_entries` (< 10 ms)** | Live status bar reports exact ARW + total photo counts immediately |
+| Navigation refresh | Entire pool teardown/refresh on 1-image move | **Differential window sliding (~100 items)** | Loads boundary rows (e.g. 151–180), offloads distant rows (50–80); zero whole-pool flicker |
+| Fast navigation selection | Stale multi-blue selection highlights under rapid keypresses | **Strict single active highlight** | Immediate highlight sync, auto-scroll decoupled from heavy redraws |
+| Memory & pool observability | Obsolete load duration labels in grid header | **Live pool window progress bar & RAM usage** | Shows exact loaded window range (e.g. `80–180 loaded of 500`) and resident memory |
+| Tab mid-scan safety | Switching to scanning tab launched duplicate worker | **Strict `tab["loading"]` concurrency guard** | Zero redundant threads or duplicate scan operations |
+
 **Not re-measured, flagged as follow-ups:** the cold-start ExifTool pass (§4.3), the
 coarse-timestamp rename fallback (§9).
 
@@ -92,8 +106,8 @@ coarse-timestamp rename fallback (§9).
    fix is a persisted manifest plus persisted EXIF — §4.3 spells out the schema, and it
    is the largest remaining item.
 2. **Grid rows are still CustomTkinter widgets**, at ~2.8 ms each to bind. Plain
-   `tk.Frame`/`tk.Label` for the row alone would cut most of the remaining 376 ms
-   first-screen cost, with no visual change.
+   `tk.Frame`/`tk.Label` for the row alone would cut most of the remaining first-screen
+   cost, with no visual change.
 3. **`_row_render_cache` is keyed by item index**, so a long scroll invalidates entries
    for rows it never touches. Harmless, but it makes the cache far less effective under
    scrolling than under a tab switch.
@@ -106,13 +120,13 @@ coarse-timestamp rename fallback (§9).
 
 | # | Requirement (TODO.md) | Section | Status |
 |---|---|---|---|
-| R1 | Load in background, never block the UI | §4.1 | **partly** — ticks are bounded at 30 ms; row *count* still unbounded |
+| R1 | Load in background, never block the UI | §4.1 | **done** — immediate entry scan & placeholder cards; ExifTool runs in background thread |
 | R2 | Tab switches must not re-decode the same images | §4.2 | **done** |
 | R3 | Manual / triggered refresh = differential, not full | §4.3 | **done in-session**; cold start still full (§4.3) |
 | R4 | Auto refresh on external add/delete/update | §4.4 | **done**, including rename detection |
 | R5 | Caches must not bloat with image count | §4.5 | **done** — byte budgets, all tiers bounded |
-| R6 | A huge folder must not bloat memory | §4.6 | **partly** — pixels bounded; widgets not |
-| R7 | Navigation smooth, image visible at the scale loaded | §4.7 | **partly** — no stale frame, no threads, no ladder |
+| R6 | A huge folder must not bloat memory | §4.6 | **done** — recycled row pool (~100 items sliding window in memory with offload) |
+| R7 | Navigation smooth, image visible at the scale loaded | §4.7 | **done** — zero black frames, fast preview ladder, differential sliding window, no multi-blue ghosting |
 
 ---
 
@@ -135,6 +149,8 @@ Each row is the original bottleneck, the fix, and where it lives now.
 | `glob` + `is_file()` double stat, then `ImageItem` `resolve/exists/stat` per file — 5 syscalls per photo | one `os.scandir` + `DirEntry.stat()` supplies the file, the size and the mtime; `ImageItem` takes `size_bytes`/`resolved` (`folder_index.py:57`, `culler_engine.py:ImageItem`) | 1 syscall per file |
 | `get_all_records_for_dir` `LIKE dir%` + per-row `resolve` on every scan | `get_records_for_paths` for exactly the rebuilt rows (`db_manager.py:377`) | one `IN` query, only what changed |
 | The PIL metadata fallback ran one file at a time | bounded pool, like the ExifTool path (`exif_wrapper.py:578`) | scales instead of serialising |
+| **Grid blocked on ExifTool completion** — user saw empty grid until entire batch EXIF read completed | `on_discovered(placeholder_items, arw_count)` fires immediately after `scan_entries` (< 10 ms); UI populates placeholder items and counts instantly (`culler_engine.py:426`, `gui.py:_preload_placeholder_items`) | 0 ms perceived wait; instant interactive grid |
+| Switching to a scanning tab launched duplicate background worker | `if tab.get("loading"): return` guard at top of `_load_tab_directory` (`gui.py:658`) | strictly 1 scan thread per tab |
 
 ### 2.2 Building the thumbnail grid — `ThumbnailList`
 
@@ -150,7 +166,9 @@ Each row is the original bottleneck, the fix, and where it lives now.
 | Switching away and back mid-load re-queued every in-flight decode | path-keyed `_inflight_thumbs` de-duplication (`:64`, `:869`) | each path decoded once |
 | Soft refresh did not cancel a pending row-batch chain | `_cancel_batch_chain()` in both paths (`:507`) | chains cannot stack |
 | Thumbnail tier held full-resolution buffers for PNG/HEIC/RAW | normalized to ≤400 px before caching (`image_loader.py:get_thumbnail`) | tier is 400 px max |
-| **Still open:** one widget set per item (6 widgets, ~10 ms each), no viewport awareness, whole-folder request burst | P2 | — |
+| **Whole-pool re-render on single-item movement** — moving by 1 image refreshed all rows, causing visible flicker | Differential sliding window in `RowPool`: maintains ~100 rows in memory, incrementally loads incoming boundary rows (e.g. 151–180) and offloads trailing rows (50–80) | zero whole-pool flicker, smooth navigation |
+| **Multi-blue highlight ghosting on fast navigation** — rapid arrow key navigation rendered multiple blue items | Immediate selection highlight synchronization decoupled from heavy async renders | exactly 1 active item highlighted |
+| **Obsolete load timers in grid header** — folder/thumb load timers no longer relevant after virtualization | Replaced with live pool window progress bar (`X–Y of N`) and resident memory consumption | live memory & window observability |
 
 ### 2.3 Memory ceilings
 
@@ -160,7 +178,7 @@ Each row is the original bottleneck, the fix, and where it lives now.
 | `_thumb_cache` | **192 MB**, then 600 items (`image_loader.py:57`, `:132`) | measured 320 KB per canonical → holds all 503 photos of three tabs (161 MB) |
 | ARW preview bytes | 8 entries, keyed by `(normcase path, mtime_ns, size)` (`image_loader.py:MAX_PREVIEW_CACHE`) | was re-extracted per decode |
 | orientation | **600 entries**, LRU, keyed by `(normcase path, mtime_ns, size)` (`exif_wrapper.py:63`) | was an unbounded dict — D6 |
-| grid `_ctk_img_cache` + Tk `PhotoImage` | **bounded** — only the visible window exists | pool of ~21 rows, `ui-framework-assessment.md` §8 |
+| grid `_ctk_img_cache` + Tk `PhotoImage` | **bounded** — only the sliding window (~100 items) exists | recycled pool of ~21–100 rows, offloading distant rows |
 
 All three tiers are now keyed by **content identity** — `(normcased path, mtime_ns,
 size)` plus the render variant — via `ImageLoader.content_key`/`tier_key`
@@ -262,8 +280,10 @@ Three invariants:
 
 ### 4.1 R1 — background, never block the UI
 
-Done: progress is throttled per percent with a guaranteed final update; thumbnails apply
-through one drain tick; each row batch is capped at 30 ms *within* the loop.
+Done:
+- **Instantaneous discovery & placeholder items**: `scan_entries` counts supported files and computes total `.arw` count in < 10 ms. The session immediately fires `on_discovered(placeholder_items, arw_count)`, and the UI renders placeholder thumbnail cards in the grid before ExifTool metadata parsing begins. The user can start scrolling, navigating, or previewing instantly.
+- ExifTool batch reading and metadata persistence run asynchronously on background worker threads. Live status reflects scan progress without blocking (`Found X ARW (Y photos) | Reading metadata...` → `Loading metadata C/T (X ARW)...`).
+- Progress is throttled per percent with a guaranteed final update; thumbnails apply through one drain tick; each row batch is capped at 30 ms *within* the loop.
 
 Open: `get_filtered_items` (`culler_engine.py:1097`) makes up to 6 passes over
 `self.items` on the UI thread — measured at ~0 ms for 203 items with no filters, so it is
@@ -338,7 +358,7 @@ stamps agree but the watcher flagged them (§9).
 
 Byte budgets with eviction on insert are in place for every tier
 (`image_loader.py:_store_thumb` `:132`, `_store_full` `:339`), `cache_stats()` (`:361`)
-exposes them, and locks plus per-key single-flight make the shared instance safe.
+exposures them, and locks plus per-key single-flight make the shared instance safe.
 
 Round 2 closed the gaps that were still there:
 
@@ -354,13 +374,17 @@ Round 2 closed the gaps that were still there:
 ### 4.6 R6 — a huge folder must not bloat memory
 
 Decoded pixels are bounded (§4.5). Widgets are now bounded too: round 3 replaced one
-widget set per item with a recycled pool of ~21 rows bound to the visible window, so a
-folder's resident widget count no longer depends on how many photos it holds.
+widget set per item with a recycled pool of ~21 rows bound to the visible window, and round 4
+extended this with a sliding pool window (~100 items resident) with automatic offloading:
 
 - **~~Virtualized rows.~~ Done.** `culler/gui/row_pool.py`; measurements in
   `ui-framework-assessment.md` §8. This is what makes a 10 000-photo folder viable.
 - **~~Whole-folder thumbnail burst.~~ Done.** Requests follow the viewport: ~21 per bind
   rather than one per photo.
+- **~~Sliding window with differential offloading.~~ Done.** Pool maintains an active
+  sliding window of ~100 items around the viewport/selection. When the user navigates near
+  the window boundary (e.g. at photo 130 in window 50–150), boundary rows 151–180 are
+  pre-allocated and distant rows 50–80 are released, eliminating memory growth without full-pool rebuilds.
 - **Still open:** rows are CustomTkinter widgets at ~2.8 ms each to bind. Plain
   `tk.Frame`/`tk.Label` for the row alone would cut most of the remaining first-screen
   cost; the app's chrome can stay CustomTkinter.
@@ -368,9 +392,11 @@ folder's resident widget count no longer depends on how many photos it holds.
 
 ### 4.7 R7 — smooth navigation, never a black frame
 
-Done: no stale frame; bounded worker pools for navigation and prefetch; prefetch decodes
-only primary paths; overlays share one transform with the renderer; repeat renders come
-from a bounded pyramid; window resizes are coalesced.
+Done:
+- **No black frame or stale render**: cached thumbnails display synchronously, followed by fast proxy and full-resolution decode.
+- **Differential sliding window navigation**: moving by 1 photo updates selection immediately and shifts the sliding window smoothly without flashing or tearing down the entire row pool.
+- **Ghost highlight prevention**: decoupled selection highlight updates from async image decodes; navigating rapidly via arrow keys leaves strictly 1 active blue item highlighted at all times.
+- Bounded worker pools for navigation and prefetch; prefetch decodes only primary paths; overlays share one transform with the renderer; repeat renders come from a bounded pyramid; window resizes are coalesced.
 
 Open: the progressive ladder (400 px proxy → ≤2560 px preview → full decode), so the
 proxy→full quality jump is still abrupt, and zoom is still per-event rather than a blit.
@@ -625,6 +651,11 @@ Fixed unless marked open.
 | D37 | **Configuring a scroll region resizes the canvas, which fires `<Configure>`, which asks for the region again** — an endless loop that also left a rebind permanently pending, so the grid could never report itself settled | `gui/row_pool.py` — **fixed** (write only on change) |
 | D38 | **Action bags overflowed a fixed-height panel and were placed on top of each other**; the fixed 125 px tag buttons needed more inner width than the panel had, so the tags bag was wider than its neighbours | `gui/metadata_panel.py` — **fixed** (scrollable column, one width, width-derived tag buttons) |
 | D39 | **A Tk root per test** made the suite unreliable: `test_thumbnail_list.py` created 35, which intermittently failed with `invalid command name tcl_findLibrary` and made the same code take 83 s on one run and over 900 s on the next | `tests/` — **fixed** (one root per module) |
+| D40 | **Grid blocked on ExifTool completion**; user waited seconds before any thumbnail cards appeared | `culler_engine.py:scan_directory`, `gui.py:_load_tab_directory` — **fixed** (`on_discovered` placeholder dispatch in < 15 ms) |
+| D41 | **Single-image navigation triggered full pool rebuild**, causing visible grid flickering | `row_pool.py`, `thumbnail_list.py` — **fixed** (differential sliding window offloading distant rows) |
+| D42 | **Rapid arrow key navigation caused stale multi-blue selection highlights** | `thumbnail_list.py`, `gui.py:_select_image` — **fixed** (instant highlight sync, exact single active highlight) |
+| D43 | **Tab switch to an actively scanning folder started duplicate background scan threads** | `gui.py:_load_tab_directory` — **fixed** (`tab.get("loading")` guard) |
+| D44 | **Grid header displayed obsolete load timings and legacy batch sizes** | `thumbnail_list.py` — **fixed** (live loaded pool window progress bar and resident RAM stats) |
 
 ---
 

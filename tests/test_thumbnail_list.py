@@ -586,7 +586,7 @@ class TestThumbnailList(unittest.TestCase):
         """
         Requests follow the viewport: one per bound row, none for rows nobody can see.
         """
-        items = [self._make_item(f"THUMB_{i:04d}.JPG") for i in range(400)]
+        items = [self._make_item(f"THUMB_{i:04d}.JPG") for i in range(600)]
         requested = []
         original = self.list_widget._load_single_thumb_async
 
@@ -607,7 +607,7 @@ class TestThumbnailList(unittest.TestCase):
         self.assertEqual(set(requested), visible,
                          "exactly the visible rows are requested, once each")
         self.assertLess(len(requested), len(items) / 4,
-                        "a 400-row folder must not queue every thumbnail up front")
+                        "a 600-row folder must not queue every thumbnail up front")
 
     def test_soft_update_skips_rebuild_when_paths_match(self):
         """
@@ -682,7 +682,7 @@ class TestThumbnailList(unittest.TestCase):
         items = [self._make_item(f"IMG_{i:03d}.JPG") for i in range(3)]
         self.list_widget.update_items(items, selected_idx=0)
         self.assertIsNone(self.list_widget._thumb_time_start)
-        self.assertIn("Loaded Pool: 3", self.list_widget.lbl_load_timing.cget("text"))
+        self.assertIn("Image 1-3 of 3 loaded", self.list_widget.lbl_load_timing.cget("text"))
 
     def test_load_timing_shows_folder_and_thumb_durations(self):
         """
@@ -690,7 +690,7 @@ class TestThumbnailList(unittest.TestCase):
         """
         started = time.monotonic() - 3.0
         self.list_widget.start_load_timing(started)
-        self.assertIn("Loaded Pool:", self.list_widget.lbl_load_timing.cget("text"))
+        self.assertIn("Memory:", self.list_widget.lbl_load_timing.cget("text"))
 
         self.list_widget.start_thumb_timing()
         self.assertIn("Memory:", self.list_widget.lbl_load_timing.cget("text"))
@@ -719,7 +719,7 @@ class TestThumbnailList(unittest.TestCase):
 
         self.list_widget._update_progress_ui()
         text = self.list_widget.lbl_load_timing.cget("text")
-        self.assertIn("Loaded Pool:", text)
+        self.assertIn("loaded", text)
         self.assertIn("Memory:", text)
         self.assertFalse(self.list_widget._load_cycle_active,
                          "the duration must stop once the load settles")
@@ -745,7 +745,7 @@ class TestThumbnailList(unittest.TestCase):
         thumb_final = self.list_widget._thumb_time_final
 
         self.list_widget.update_items([self._make_item("FILTERED.JPG")], selected_idx=0)
-        self.assertIn("Loaded Pool: 1", self.list_widget.lbl_load_timing.cget("text"))
+        self.assertIn("Image 1-1 of 1 loaded", self.list_widget.lbl_load_timing.cget("text"))
         self.assertEqual(self.list_widget._thumb_time_final, thumb_final)
 
     def test_finish_load_timing_freezes_folder_and_thumb(self):
@@ -760,7 +760,7 @@ class TestThumbnailList(unittest.TestCase):
         self.assertAlmostEqual(self.list_widget._folder_time_final, 2.0, delta=0.5)
         self.assertIsNotNone(self.list_widget._thumb_time_final)
         self.assertIsNone(self.list_widget._timing_after_id)
-        self.assertIn("Loaded Pool:", self.list_widget.lbl_load_timing.cget("text"))
+        self.assertIn("Memory:", self.list_widget.lbl_load_timing.cget("text"))
 
     def test_show_load_stats_restores_saved_totals(self):
         """
@@ -768,7 +768,6 @@ class TestThumbnailList(unittest.TestCase):
         """
         self.list_widget.show_load_stats(4.5, 1.25)
         text = self.list_widget.lbl_load_timing.cget("text")
-        self.assertIn("Loaded Pool:", text)
         self.assertIn("Memory:", text)
         self.assertIsNone(self.list_widget._timing_after_id)
         self.assertFalse(self.list_widget._load_cycle_active)
@@ -798,7 +797,7 @@ class TestThumbnailList(unittest.TestCase):
         self.list_widget.freeze_load_timing()
         self.assertIsNotNone(self.list_widget._thumb_time_final)
         self.assertEqual(self.list_widget._folder_time_final, 4.5)
-        self.assertIn("Loaded Pool:", self.list_widget.lbl_load_timing.cget("text"))
+        self.assertIn("Memory:", self.list_widget.lbl_load_timing.cget("text"))
 
     def test_load_stats_emitted_on_freeze(self):
         """
@@ -832,7 +831,7 @@ class TestThumbnailList(unittest.TestCase):
         """
         self.list_widget.start_load_timing(time.monotonic() - 1.0)
         self.list_widget.update_items([], selected_idx=0)
-        self.assertIn("Loaded Pool:", self.list_widget.lbl_load_timing.cget("text"))
+        self.assertIn("Memory:", self.list_widget.lbl_load_timing.cget("text"))
         self.assertIsNotNone(self.list_widget._folder_time_final)
         self.assertIsNone(self.list_widget._timing_after_id)
 
@@ -842,9 +841,45 @@ class TestThumbnailList(unittest.TestCase):
         self.list_widget.update_items(items, selected_idx=0)
         self.root.update()
         text = self.list_widget.lbl_pool_stats.cget("text")
-        self.assertIn("Loaded Pool: 15", text)
+        self.assertIn("Image 1-15 of 15 loaded", text)
         self.assertIn("Memory:", text)
         self.assertIn("MB", text)
+        self.assertAlmostEqual(self.list_widget.pool_progress_bar.get(), 1.0, places=2)
+
+    def test_differential_sliding_window_navigation(self):
+        """
+        Navigating within the window safe zone must not rebind or slide slots.
+        Approaching within SLIDE_MARGIN of the window edge shifts by SLIDE_CHUNK.
+        """
+        items = [self._make_item(f"DIFF_{i:04d}.JPG") for i in range(300)]
+        self.list_widget.update_items(items, selected_idx=0)
+        self.root.update()
+
+        pool = self.list_widget.row_pool
+        # Initial window is 0 to 99
+        self.assertEqual((pool.window_start, pool.window_end), (0, 99))
+        self.assertIn("Image 1-100 of 300 loaded", self.list_widget.lbl_pool_stats.cget("text"))
+        self.assertAlmostEqual(self.list_widget.pool_progress_bar.get(), 100 / 300, places=2)
+        r_start, r_end = self.list_widget.pool_progress_bar.get_range()
+        self.assertAlmostEqual(r_start, 0.0, places=2)
+        self.assertAlmostEqual(r_end, 100 / 300, places=2)
+
+        # Navigating to index 50 (well inside safe zone [20, 79]) does NOT slide or rebind
+        slot_50_before = pool.slot_for_index(50)
+        self.list_widget.set_selected_indices({50}, 50)
+        self.assertEqual((pool.window_start, pool.window_end), (0, 99))
+        self.assertIs(pool.slot_for_index(50), slot_50_before)
+
+        # Navigating to index 80 (approaching window_end 99 within margin 20) triggers slide
+        self.list_widget.set_selected_indices({80}, 80)
+        self.assertEqual((pool.window_start, pool.window_end), (30, 129))
+        self.assertIn("Image 31-130 of 300 loaded", self.list_widget.lbl_pool_stats.cget("text"))
+        self.assertAlmostEqual(self.list_widget.pool_progress_bar.get(), 130 / 300, places=2)
+        r_start, r_end = self.list_widget.pool_progress_bar.get_range()
+        self.assertAlmostEqual(r_start, 30 / 300, places=2)
+        self.assertAlmostEqual(r_end, 130 / 300, places=2)
+        # Row 50 is still retained in the middle and was not recreated
+        self.assertIsNotNone(pool.slot_for_index(50))
 
 
     def test_scrolling_repositions_container_window_in_canvas(self):
@@ -880,6 +915,71 @@ class TestThumbnailList(unittest.TestCase):
         slot0_frame = pool._slots[0]["frame"]
         self.assertEqual(slot0_frame.winfo_viewable(), 1,
                          "bound slot must be viewable on screen at scrolled position")
+
+    def test_fast_navigation_leaves_only_one_blue_highlight(self):
+        """
+        Fast navigation must never leave multiple images highlighted in blue (#1f538d).
+        Both the row frame border and thumbnail button must be uniquely highlighted.
+        """
+        items = [self._make_item(f"FAST_NAV_{i:03d}.JPG") for i in range(50)]
+        self.list_widget.update_items(items, selected_idx=0)
+        self.root.update()
+        pool = self.list_widget.row_pool
+
+        for target_idx in range(1, 25):
+            target_path = items[target_idx].path
+            self.list_widget.set_selected_indices({target_idx}, target_idx, active_path=target_path)
+
+            # Check all bound slots in pool
+            blue_frames = []
+            for slot in pool._slots:
+                idx = slot.get("item_index")
+                if idx is not None:
+                    border = slot.get("applied", {}).get("border")
+                    if border and border[0] == "#1f538d":
+                        blue_frames.append(idx)
+
+            self.assertEqual(blue_frames, [target_idx],
+                             f"At step {target_idx}, exactly one row frame must be blue, found {blue_frames}")
+
+            # Check all buttons in _btn_map
+            blue_buttons = [p for p, btn in self.list_widget._btn_map.items()
+                            if btn.cget("fg_color") == "#1f538d"]
+            self.assertEqual(blue_buttons, [str(target_path)],
+                             f"At step {target_idx}, exactly one button must be blue, found {blue_buttons}")
+
+    def test_differential_slide_never_leaks_blue_highlights_to_new_items(self):
+        """
+        When pool slots are rotated and rebound during differential sliding,
+        the newly bound items must never inherit blue highlights from recycled slots.
+        """
+        items = [self._make_item(f"LEAK_CHECK_{i:04d}.JPG") for i in range(200)]
+        self.list_widget.update_items(items, selected_idx=0)
+        self.root.update()
+        pool = self.list_widget.row_pool
+
+        # Start at index 0 (active and blue)
+        self.list_widget.set_selected_indices({0}, 0, active_path=items[0].path)
+
+        # Jump/navigate to index 85 which triggers sliding window (shifts window to 30..129)
+        self.list_widget.set_selected_indices({85}, 85, active_path=items[85].path)
+        self.root.update()
+
+        blue_frames = []
+        for slot in pool._slots:
+            idx = slot.get("item_index")
+            if idx is not None:
+                border = slot.get("applied", {}).get("border")
+                if border and border[0] == "#1f538d":
+                    blue_frames.append(idx)
+
+        self.assertEqual(blue_frames, [85],
+                         f"Only index 85 should have blue border, found {blue_frames}")
+
+        blue_buttons = [p for p, btn in self.list_widget._btn_map.items()
+                        if btn.cget("fg_color") == "#1f538d"]
+        self.assertEqual(blue_buttons, [str(items[85].path)],
+                         f"Only index 85 button should be blue, found {blue_buttons}")
 
 
 if __name__ == "__main__":

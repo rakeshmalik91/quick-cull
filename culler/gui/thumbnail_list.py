@@ -1,4 +1,5 @@
 import os
+import tkinter as tk
 import threading
 import time
 from collections import deque
@@ -37,6 +38,93 @@ def get_consumed_memory_mb(image_loader: Optional[ImageLoader] = None) -> float:
         except Exception:
             pass
     return 0.0
+
+
+class PoolRangeBar(tk.Canvas):
+    """Horizontal range bar indicating the loaded window [start, end] out of total items."""
+
+    @classmethod
+    def _find_bg_color(cls, widget):
+        curr = widget
+        while curr is not None:
+            if hasattr(curr, "_fg_color") and curr._fg_color not in ("transparent", None):
+                color = curr._apply_appearance_mode(curr._fg_color)
+                if color and color != "transparent":
+                    return color
+            curr = getattr(curr, "master", None)
+        return "#242424"
+
+    def __init__(self, master, height: int = 6, bg: str = "#343638", fill_color: str = "#1f538d", **kwargs):
+        bg_color = self._find_bg_color(master)
+        super().__init__(
+            master,
+            height=height,
+            bg=bg_color,
+            highlightthickness=0,
+            bd=0,
+            **kwargs
+        )
+        self._bar_height = height
+        self._track_color = bg
+        self._fill_color = fill_color
+        self._start_frac = 0.0
+        self._end_frac = 0.0
+        self.bind("<Configure>", self._on_resize)
+
+    def _on_resize(self, event):
+        self._redraw()
+
+    def set(self, *args):
+        """Set position: set(end_frac) or set(start_frac, end_frac)."""
+        if len(args) == 1:
+            self._start_frac = 0.0
+            self._end_frac = max(0.0, min(1.0, float(args[0])))
+        elif len(args) >= 2:
+            self._start_frac = max(0.0, min(1.0, float(args[0])))
+            self._end_frac = max(0.0, min(1.0, float(args[1])))
+            if self._end_frac < self._start_frac:
+                self._end_frac = self._start_frac
+        self._redraw()
+
+    def get(self) -> float:
+        """Return end fraction for compatibility with progress bar checks."""
+        return self._end_frac
+
+    def get_range(self) -> Tuple[float, float]:
+        """Return (start_fraction, end_fraction)."""
+        return (self._start_frac, self._end_frac)
+
+    def _redraw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self._bar_height
+        if w <= 1:
+            return
+
+        # Draw track (background trough)
+        self._draw_pill(0, 0, w, h, self._track_color)
+
+        # Draw filled range if any
+        if self._end_frac > self._start_frac:
+            x0 = int(round(self._start_frac * w))
+            x1 = int(round(self._end_frac * w))
+            if x1 - x0 < h:
+                x1 = min(w, x0 + h)
+            self._draw_pill(x0, 0, x1, h, self._fill_color)
+
+    def _draw_pill(self, x0: int, y0: int, x1: int, y1: int, color: str):
+        w = x1 - x0
+        h = y1 - y0
+        if w <= 0 or h <= 0:
+            return
+        r = h // 2
+        if w < 2 * r:
+            self.create_oval(x0, y0, x1, y1, fill=color, outline="", width=0)
+        else:
+            self.create_oval(x0, y0, x0 + 2 * r, y0 + 2 * r, fill=color, outline="", width=0)
+            self.create_oval(x1 - 2 * r, y0, x1, y0 + 2 * r, fill=color, outline="", width=0)
+            self.create_rectangle(x0 + r, y0, x1 - r, y1, fill=color, outline="", width=0)
+
 
 
 class ThumbnailList(ctk.CTkFrame):
@@ -185,9 +273,18 @@ class ThumbnailList(ctk.CTkFrame):
         # an "N / M" counter under it, which reported how many *visible* rows had been
         # decoded - a batch count that said nothing useful once the grid was virtualised,
         # and one that flickered on every scroll.
-        self.progress_frame = ctk.CTkFrame(self, fg_color="transparent", height=18)
+        self.progress_frame = ctk.CTkFrame(self, fg_color="transparent", height=28)
         self.progress_frame.pack(side="bottom", fill="x", padx=4, pady=(0, 2))
         self.progress_frame.pack_propagate(False)
+
+        self.pool_progress_bar = PoolRangeBar(
+            self.progress_frame,
+            height=6,
+            bg="#343638",
+            fill_color="#1f538d",
+        )
+        self.pool_progress_bar.pack(side="top", fill="x", padx=2, pady=(2, 2))
+        self.pool_progress_bar.set(0.0, 0.0)
 
         self.lbl_pool_stats = ctk.CTkLabel(
             self.progress_frame,
@@ -326,14 +423,37 @@ class ThumbnailList(ctk.CTkFrame):
         return self.row_pool.items if hasattr(self, "row_pool") else []
 
     def _update_pool_stats(self):
-        """Update footer label with loaded pool size and consumed memory."""
+        """Update footer label and progress bar with loaded window and consumed memory."""
         items = self.items
         if not items and self._folder_time_final is None and self._folder_time_start is None:
             self.lbl_pool_stats.configure(text="")
+            if hasattr(self, "pool_progress_bar"):
+                self.pool_progress_bar.set(0.0)
             return
+        total = len(items)
         loaded = self.row_pool.loaded_pool_size if hasattr(self, "row_pool") else 0
+        w_start = self.row_pool.window_start if hasattr(self, "row_pool") else 0
+        w_end = self.row_pool.window_end if hasattr(self, "row_pool") else -1
         mem_mb = get_consumed_memory_mb(self.image_loader)
-        text = f"Loaded Pool: {loaded}   |   Memory: {int(round(mem_mb))} MB"
+        mem_str = f"{int(round(mem_mb))} MB"
+
+        if total > 0 and loaded > 0 and w_end >= w_start:
+            display_start = w_start + 1
+            display_end = min(total, w_end + 1)
+            text = f"Image {display_start}-{display_end} of {total} loaded   |   Memory: {mem_str}"
+            start_frac = max(0.0, min(1.0, w_start / total))
+            end_frac = max(0.0, min(1.0, display_end / total))
+            if hasattr(self, "pool_progress_bar"):
+                self.pool_progress_bar.set(start_frac, end_frac)
+        elif total > 0:
+            text = f"0 of {total} loaded   |   Memory: {mem_str}"
+            if hasattr(self, "pool_progress_bar"):
+                self.pool_progress_bar.set(0.0, 0.0)
+        else:
+            text = f"0 of 0 loaded   |   Memory: {mem_str}"
+            if hasattr(self, "pool_progress_bar"):
+                self.pool_progress_bar.set(0.0, 0.0)
+
         self.lbl_pool_stats.configure(text=text)
 
     def _update_load_timing(self):
@@ -426,8 +546,14 @@ class ThumbnailList(ctk.CTkFrame):
         prev_act = getattr(self, "_prev_active_idx", -1)
         prev_path = getattr(self, "_prev_active_path_str", None)
 
+        self._current_selected_indices = set(selected_indices)
+        self._current_active_idx = active_idx
+        self._current_active_path_str = active_path_str
+
         # Compute exact set of row indices that changed state
-        changed_indices = (selected_indices ^ prev_sel) | {active_idx, prev_act}
+        changed_indices = (selected_indices ^ prev_sel) | {active_idx}
+        if prev_act != -1:
+            changed_indices.add(prev_act)
 
         # Bring the active row into view *before* styling, so its slot exists.
         if auto_scroll and total_items > 1:
@@ -436,39 +562,42 @@ class ThumbnailList(ctk.CTkFrame):
 
         for idx in changed_indices:
             slot = self.row_pool.slot_for_index(idx)
-            if slot is None:
-                continue
-            frame = slot["frame"]
-            is_active = (idx == active_idx)
-            is_selected = (idx in selected_indices)
+            if slot is not None:
+                self.row_pool._style_slot(slot, idx)
 
-            if is_active:
-                frame.configure(border_color="#1f538d", border_width=2)
-            elif is_selected:
-                frame.configure(border_color="#ffb703", border_width=2)
+        # Ensure previously active slot loses active border if it wasn't caught in changed_indices
+        curr_active_slot = self.row_pool.slot_for_index(active_idx)
+        prev_active_slot = getattr(self, "_active_slot_ref", None)
+        if prev_active_slot and prev_active_slot is not curr_active_slot:
+            old_item = prev_active_slot.get("item_index")
+            if old_item is not None:
+                self.row_pool._style_slot(prev_active_slot, old_item)
             else:
-                frame.configure(border_color="#3a3a3a", border_width=1)
-
-            if idx in self._checkbox_map:
-                chk = self._checkbox_map[idx]
-                if is_selected:
-                    chk.select()
-                else:
-                    chk.deselect()
-            elif "checkbox" in slot:
-                if is_selected:
-                    slot["checkbox"].select()
-                else:
-                    slot["checkbox"].deselect()
+                prev_active_slot["frame"].configure(border_color="#3a3a3a", border_width=1)
+                prev_active_slot["applied"]["border"] = ("#3a3a3a", 1)
+        self._active_slot_ref = curr_active_slot
 
         self.row_pool.set_selected_index(active_idx)
 
-        # Update button highlights only if active sub-path changed
-        if active_path_str != prev_path:
-            if prev_path and prev_path in self._btn_map:
+        # Ensure only the current active button is highlighted in blue
+        curr_btn = self._btn_map.get(active_path_str) if active_path_str else None
+        prev_btn = getattr(self, "_active_btn_ref", None)
+        if prev_btn and prev_btn is not curr_btn:
+            try:
+                prev_btn.configure(fg_color="transparent")
+            except Exception:
+                pass
+            self._active_btn_ref = None
+
+        if prev_path and prev_path in self._btn_map and prev_path != active_path_str:
+            try:
                 self._btn_map[prev_path].configure(fg_color="transparent")
-            if active_path_str and active_path_str in self._btn_map:
-                self._btn_map[active_path_str].configure(fg_color="#1f538d")
+            except Exception:
+                pass
+
+        if curr_btn is not None:
+            curr_btn.configure(fg_color="#1f538d")
+            self._active_btn_ref = curr_btn
 
         self._prev_selected_indices = set(selected_indices)
         self._prev_active_idx = active_idx

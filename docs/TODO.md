@@ -18,7 +18,7 @@ Make corrections optionally, if required.
     - navigating between images should be smooth and fast, regardless of image is fully/partially loaded. during navigation the image should be visible on screen at scale it has been loaded at that point of time, not with black screen
     - consider using multithreading and gpu for faster operations
     - consider using exiftool batch processing if available
-      (see docs/load-performance-v1.md)
+      (see docs/analysis/load-performance-v1.md)
 - [x] mark keeper tag as "Duplicate" too by default, not "Keeper", make stars configurable for keeper too
 - [x] remove the custom tag button on right panel, in settings create a new tab to manage tags
 - [x] for duplicate add feature for keeper selection methods. 

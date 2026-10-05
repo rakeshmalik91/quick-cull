@@ -41,9 +41,11 @@ ROW_OVERSCAN = 45
 POOL_TARGET_ROWS = 100
 POOL_MIN_ROWS = 10
 
-#: Rows rebound per UI tick *while scrolling*. Each rebind is ~9 ms of widget work for
-#: a plain row and more for a stacked one, so a jump to a far position is spread over
-#: ticks instead of blocking.
+#: Differential sliding window settings:
+SLIDE_CHUNK = 30
+SLIDE_MARGIN = 20
+
+#: Rows rebound per UI tick *while scrolling*.
 REBIND_ROWS_PER_TICK = 10
 
 #: Rows bound synchronously when a new item set arrives.
@@ -92,6 +94,8 @@ class RowPool:
         self._first_visible = 0
         self._last_visible = -1
         self._selected_idx = 0
+        self._window_start: int = 0
+        self._window_end: int = -1
 
         self._rebind_after_id: Optional[str] = None
         self._scroll_after_id: Optional[str] = None
@@ -112,10 +116,15 @@ class RowPool:
             total += row_height_for(item) + ROW_PADDING
             offsets.append(total)
         self._offsets = offsets
+        self._window_start = 0
+        self._window_end = -1
 
     def clear_items(self) -> None:
         self.items = []
         self._offsets = [0]
+        self._window_start = 0
+        self._window_end = -1
+        self._release_all_slots()
         self._update_window_position(0)
 
     def __len__(self) -> int:
@@ -142,15 +151,14 @@ class RowPool:
         return self._offsets[index]
 
     def visible_indices(self) -> range:
-        if self._first_visible > self._last_visible:
+        if self._window_end < self._window_start:
             return range(0, 0)
-        return range(self._first_visible, self._last_visible + 1)
+        return range(self._window_start, self._window_end + 1)
 
     def visible_item_indices(self) -> List[int]:
-        if not self.items or self._first_visible > self._last_visible:
+        if not self.items or self._window_end < self._window_start:
             return []
-        last = min(self._last_visible, len(self.items) - 1)
-        return list(range(self._first_visible, last + 1))
+        return list(range(self._window_start, self._window_end + 1))
 
     def slot_for_index(self, index: int) -> Optional[Dict]:
         """The slot showing ``index``, in O(1).
@@ -245,66 +253,78 @@ class RowPool:
         self.owner._arm_thumb_drain()
 
     def _needs_rebind(self, offset: int) -> bool:
-        """True when the visible row range no longer matches what is bound."""
-        if not self.items:
-            return False
-        bound = [i for i in self._slot_items if i is not None]
-        if not bound:
+        """True when the visible row range approaches or exceeds the loaded window boundary."""
+        if not self.items or self._window_end < self._window_start:
             return True
         viewport = self._viewport_height()
         view_top = self.index_at_offset(offset)
         view_bottom = self.index_at_offset(offset + max(0, viewport))
 
-        if view_top <= bound[0] and bound[0] > 0:
+        if view_bottom >= self._window_end - SLIDE_MARGIN and self._window_end < len(self.items) - 1:
             return True
-        if view_bottom >= bound[-1] and bound[-1] < len(self.items) - 1:
+        if view_top <= self._window_start + SLIDE_MARGIN and self._window_start > 0:
             return True
-        if view_top < bound[0] or view_bottom > bound[-1]:
+        if view_top < self._window_start or view_bottom > self._window_end:
             return True
         return False
 
     def scroll_to_index(self, index: int, align: str = "nearest") -> None:
-        """Bring ``index`` into view. ``align`` is nearest, center or top."""
+        """Bring ``index`` into view."""
         if not self.items:
             return
         index = max(0, min(index, len(self.items) - 1))
+        self.set_selected_index(index)
+
         canvas = self._canvas()
-        if canvas is None:
-            return
-        viewport = self._viewport_height()
-        height = row_height_for(self.items[index]) + ROW_PADDING
-        top = self.offset_of(index)
-
-        if align == "top":
-            target = top
-        elif align == "center":
-            target = top - max(0, (viewport - height) // 2)
-        else:
+        if canvas is not None:
+            viewport = self._viewport_height()
+            height = row_height_for(self.items[index]) + ROW_PADDING
+            top = self.offset_of(index)
             current = self._scroll_offset()
-            if top < current:
-                target = top
-            elif top + height > current + viewport:
-                target = top - viewport + height
-            else:
-                return
 
-        max_top = max(0, self.total_content_height - viewport)
-        fraction = (max(0, min(target, max_top)) / self.total_content_height) if self.total_content_height else 0.0
-        try:
-            canvas.yview_moveto(fraction)
-        except Exception:
-            return
-        # Remember where we just asked to be, rather than flushing Tk to read it back.
-        self._forced_offset = self._clamp_offset(target)
-        self._last_scroll_offset = -1
-        self.request_sync(reason="scroll_to")
+            if align == "top":
+                target = top
+            elif align == "center":
+                target = top - max(0, (viewport - height) // 2)
+            else:
+                if top < current:
+                    target = top
+                elif top + height > current + viewport:
+                    target = top - viewport + height
+                else:
+                    target = current
+
+            if target != current:
+                max_top = max(0, self.total_content_height - viewport)
+                fraction = (max(0, min(target, max_top)) / self.total_content_height) if self.total_content_height else 0.0
+                try:
+                    canvas.yview_moveto(fraction)
+                except Exception:
+                    pass
+                self._forced_offset = self._clamp_offset(target)
+                self._last_scroll_offset = -1
+                self.request_sync(reason="scroll_to_index")
+            elif self._needs_rebind(current):
+                self.request_sync(reason="scroll_to_index")
+        else:
+            self.request_sync(reason="scroll_to_index")
 
     # ------------------------------------------------------------------ syncing
 
     @property
+    def window_start(self) -> int:
+        return self._window_start
+
+    @property
+    def window_end(self) -> int:
+        return self._window_end
+
+    @property
     def loaded_pool_size(self) -> int:
         """Number of slots in the pool that are currently bound to an item."""
-        return sum(1 for it in self._slot_items if it is not None)
+        if not self.items or self._window_end < self._window_start:
+            return 0
+        return self._window_end - self._window_start + 1
 
     @property
     def pool_size(self) -> int:
@@ -321,113 +341,178 @@ class RowPool:
         if self._rebind_after_id is None:
             self._rebind_after_id = self.owner.after(1, self.sync)
 
-    def sync(self, budget: int = REBIND_ROWS_PER_TICK) -> None:
-        """Reconcile the pool with the current scroll position."""
+    def sync(self, budget: int = INITIAL_BIND_ROWS, focus_idx: Optional[int] = None) -> None:
+        """Reconcile the pool with the current scroll position using differential sliding."""
         self._rebind_after_id = None
         if not self.items:
             self._release_all_slots()
+            self._window_start = 0
+            self._window_end = -1
             self._update_spacer()
+            self._update_window_position(0)
+            if hasattr(self.owner, "_update_pool_stats"):
+                self.owner._update_pool_stats()
             return
 
-        offset = self._scroll_offset()
-        first = max(0, self.index_at_offset(offset) - ROW_OVERSCAN)
+        if focus_idx is not None:
+            v_top = focus_idx
+            v_bottom = focus_idx
+        else:
+            offset = self._scroll_offset()
+            v_top = self.index_at_offset(offset)
+            v_bottom = self.index_at_offset(offset + max(0, self._viewport_height()))
 
-        viewport = self._viewport_height()
-        # Walk forward until the viewport plus overscan is covered (~100 rows total).
-        covered = offset
-        overscan_ahead = ROW_OVERSCAN * 2 if first == 0 else ROW_OVERSCAN
-        limit = offset + max(viewport, 0) + ROW_STRIDE * overscan_ahead
-        last = first
-        idx = first
-        while idx < len(self.items):
-            last = idx
-            covered += row_height_for(self.items[idx]) + ROW_PADDING
-            idx += 1
-            if covered >= limit:
-                break
-        last = min(last, len(self.items) - 1)
+        total = len(self.items)
+        if total <= POOL_TARGET_ROWS:
+            target_start = 0
+            target_end = total - 1
+            if self._window_start == 0 and self._window_end == total - 1:
+                if all(i < len(self._slot_items) and self._slot_items[i] == i for i in range(total)):
+                    self._first_visible = v_top
+                    self._last_visible = v_bottom
+                    self.start_scroll_polling()
+                    return
+        else:
+            incomplete_window = False
+            if self._window_end >= self._window_start:
+                for i, expected in enumerate(range(self._window_start, self._window_end + 1)):
+                    if i >= len(self._slot_items) or self._slot_items[i] != expected:
+                        incomplete_window = True
+                        break
 
-        # Near the end of the list there is nothing left to walk forward into, so the
-        # forward pass alone leaves the window short of POOL_TARGET_ROWS. Extend backwards
-        # until it is covered, or the top of the list is reached.
-        covered = sum(row_height_for(self.items[i]) + ROW_PADDING
-                      for i in range(first, last + 1))
-        target_span = ROW_STRIDE * min(POOL_TARGET_ROWS, len(self.items))
-        while covered < target_span and first > 0:
-            first -= 1
-            covered += row_height_for(self.items[first]) + ROW_PADDING
+            if incomplete_window:
+                target_start = self._window_start
+                target_end = self._window_end
+            elif self._window_end < self._window_start:
+                target_start = max(0, min(v_top, total - POOL_TARGET_ROWS))
+                target_end = target_start + POOL_TARGET_ROWS - 1
+            else:
+                cur_start = self._window_start
+                cur_end = self._window_end
+                if v_bottom >= cur_end - SLIDE_MARGIN and cur_end < total - 1:
+                    if v_bottom > cur_end:
+                        target_start = max(0, min(v_top - 10, total - POOL_TARGET_ROWS))
+                        target_end = target_start + POOL_TARGET_ROWS - 1
+                    else:
+                        shift = min(SLIDE_CHUNK, total - 1 - cur_end)
+                        target_start = cur_start + shift
+                        target_end = cur_end + shift
+                elif v_top <= cur_start + SLIDE_MARGIN and cur_start > 0:
+                    if v_top < cur_start:
+                        target_start = max(0, min(v_top - 10, total - POOL_TARGET_ROWS))
+                        target_end = target_start + POOL_TARGET_ROWS - 1
+                    else:
+                        shift = min(SLIDE_CHUNK, cur_start)
+                        target_start = cur_start - shift
+                        target_end = cur_end - shift
+                else:
+                    self._first_visible = v_top
+                    self._last_visible = v_bottom
+                    self.start_scroll_polling()
+                    return
 
-        self._first_visible = first
-        self._last_visible = last
+        self._first_visible = v_top
+        self._last_visible = v_bottom
 
-        size = self.desired_pool_size()
-        self._ensure_pool_size(max(size, (last - first) + 1))
+        target_count = target_end - target_start + 1
+        self._ensure_pool_size(target_count)
 
-        target = list(range(first, last + 1))
-        self._reconcile(target, budget)
+        if self._window_end >= self._window_start:
+            cur_start = self._window_start
+            cur_end = self._window_end
+            overlap_start = max(cur_start, target_start)
+            overlap_end = min(cur_end, target_end)
 
+            if overlap_start <= overlap_end:
+                if target_start > cur_start:
+                    k = target_start - cur_start
+                    for slot in self._slots[:k]:
+                        old_idx = slot.get("item_index")
+                        if old_idx is not None:
+                            self._unregister_from_owner_maps(old_idx, slot)
+                            self._slot_by_item.pop(old_idx, None)
+                        slot["frame"].pack_forget()
+                        slot["frame"].pack(side="top", fill="x", padx=1, pady=2)
+
+                    self._slots = self._slots[k:] + self._slots[:k]
+                    self._slot_items = self._slot_items[k:] + [None] * k
+                    self._slot_by_item = {s["item_index"]: i for i, s in enumerate(self._slots) if s.get("item_index") is not None}
+
+                    new_items = list(range(cur_end + 1, target_end + 1))
+                    bound_slots = []
+                    for slot_idx, item_idx in zip(range(len(self._slots) - k, len(self._slots)), new_items):
+                        self._bind_slot(slot_idx, item_idx)
+                        bound_slots.append(slot_idx)
+
+                    self._window_start = target_start
+                    self._window_end = target_end
+                    self._update_window_position(self.offset_of(target_start))
+                    self._update_spacer()
+                    self.start_scroll_polling()
+                    self.owner.on_rows_bound(self, bound_slots)
+                    if hasattr(self.owner, "_update_pool_stats"):
+                        self.owner._update_pool_stats()
+                    return
+
+                elif target_start < cur_start:
+                    k = cur_start - target_start
+                    first_frame = self._slots[0]["frame"]
+                    for slot in reversed(self._slots[-k:]):
+                        old_idx = slot.get("item_index")
+                        if old_idx is not None:
+                            self._unregister_from_owner_maps(old_idx, slot)
+                            self._slot_by_item.pop(old_idx, None)
+                        slot["frame"].pack_forget()
+                        slot["frame"].pack(side="top", fill="x", padx=1, pady=2, before=first_frame)
+                        first_frame = slot["frame"]
+
+                    self._slots = self._slots[-k:] + self._slots[:-k]
+                    self._slot_items = [None] * k + self._slot_items[:-k]
+                    self._slot_by_item = {s["item_index"]: i for i, s in enumerate(self._slots) if s.get("item_index") is not None}
+
+                    new_items = list(range(target_start, cur_start))
+                    bound_slots = []
+                    for slot_idx, item_idx in enumerate(new_items):
+                        self._bind_slot(slot_idx, item_idx)
+                        bound_slots.append(slot_idx)
+
+                    self._window_start = target_start
+                    self._window_end = target_end
+                    self._update_window_position(self.offset_of(target_start))
+                    self._update_spacer()
+                    self.start_scroll_polling()
+                    self.owner.on_rows_bound(self, bound_slots)
+                    if hasattr(self.owner, "_update_pool_stats"):
+                        self.owner._update_pool_stats()
+                    return
+
+        # Initial bind or non-overlapping jump
+        bound_slots = []
+        for i, item_idx in enumerate(range(target_start, target_end + 1)):
+            if self._slot_items[i] != item_idx:
+                if len(bound_slots) >= budget:
+                    if self._rebind_after_id is None:
+                        self._rebind_after_id = self.owner.after(1, self.sync)
+                    break
+                old_idx = self._slot_items[i]
+                if old_idx is not None:
+                    self._unregister_from_owner_maps(old_idx, self._slots[i])
+                self._bind_slot(i, item_idx)
+                bound_slots.append(i)
+
+        for i in range(target_count, len(self._slots)):
+            if self._slot_items[i] is not None:
+                self._release_slot(i)
+
+        self._window_start = target_start
+        self._window_end = target_end
+        self._update_window_position(self.offset_of(target_start))
         self._update_spacer()
-        first_bound = self._slot_items[0] if self._slot_items and self._slot_items[0] is not None else first
-        self._update_window_position(self.offset_of(first_bound))
         self.start_scroll_polling()
+        if bound_slots:
+            self.owner.on_rows_bound(self, bound_slots)
         if hasattr(self.owner, "_update_pool_stats"):
             self.owner._update_pool_stats()
-
-    def _reconcile(self, target: List[int], budget: int = REBIND_ROWS_PER_TICK) -> None:
-        """Bind the fewest slots that cover ``target``, in index order.
-
-        Slots are packed in order, so slot *k* always renders ``target[k]``: a scroll of
-        one row rebinds one slot, and a jump rebinds only what the per-tick budget
-        allows, resuming on the next tick. That budget is what keeps the longest UI
-        tick bounded - binding a whole screenful in one go would be ~200 ms, which is
-        the stall the old per-item build was measured at.
-        """
-        self._ensure_pool_size(len(target))
-
-        pending = [k for k in range(len(target)) if self._slot_items[k] != target[k]]
-        if not pending:
-            # Already correct. Re-styling every slot here made the scroll poll pay a
-            # full-screen restyle on every frame; selection is applied by
-            # set_selected_index and by _bind_slot, so there is nothing to redo.
-            return
-
-        deferred = False
-        bound: List[int] = []
-        for slot_index in pending:
-            current = self._slot_items[slot_index]
-            if current is None:
-                if budget > 0:
-                    self._bind_slot(slot_index, target[slot_index])
-                    budget -= 1
-                    bound.append(slot_index)
-                else:
-                    deferred = True
-                continue
-
-            if budget > 0:
-                # Rebind in place. The body is reused whenever the row shape matches, so
-                # a scroll rebinds by re-configuring widgets rather than destroying and
-                # recreating them - which was the expensive half of a jump.
-                self._rebind_slot(slot_index, target[slot_index])
-                budget -= 1
-                bound.append(slot_index)
-            else:
-                self._release_slot(slot_index)
-                deferred = True
-
-        # Slots past the end of the window release whatever they held.
-        for slot_index in range(len(target), len(self._slot_items)):
-            if self._slot_items[slot_index] is not None:
-                self._release_slot(slot_index)
-
-        if deferred:
-            # after_idle, not after(1): a rebind tick takes longer than 1 ms, so a 1 ms
-            # timer is already expired when it is armed and Tk runs the whole chain
-            # without ever returning to the loop - which is exactly the freeze the
-            # recycled pool exists to remove. Idle callbacks run after the pending
-            # events, so the loop really does get a turn between ticks.
-            self._rebind_after_id = self.owner.after_idle(self.sync)
-        self.owner.on_rows_bound(self, bound)
 
     def _rebind_slot(self, slot_index: int, item_index: int) -> None:
         """Point an already-occupied slot at a different item, keeping its widgets."""
@@ -626,6 +711,15 @@ class RowPool:
             button = slot["body"][0]
             button.configure(command=lambda i=item_index: self._on_slot_clicked(i))
 
+        is_active_path = (path_str == getattr(owner, "_current_active_path_str", None))
+        expected_fg = "#1f538d" if is_active_path else "transparent"
+        if slot["applied"].get("btn_fg") != expected_fg:
+            try:
+                button.configure(fg_color=expected_fg)
+                slot["applied"]["btn_fg"] = expected_fg
+            except Exception:
+                pass
+
         image = owner._ctk_img_cache.get(path_str, owner.placeholder_image(80))
         if slot["applied"].get("image") is not image:
             button.configure(image=image)
@@ -669,13 +763,15 @@ class RowPool:
         if jpg_n:
             parts.append(f"{jpg_n} JPG")
         comp = ", ".join(parts) if parts else f"{len(item.stacked_paths)} files"
-        stars = "â˜…" * item.rating if item.rating > 0 else ""
+        stars = "★" * item.rating if item.rating > 0 else ""
         label.configure(text=f"{base_stem.upper()} [Stacked: {comp}] {stars}")
 
         paths = []
         for sub_p in item.stacked_paths:
             path_str = str(sub_p)
             paths.append(path_str)
+            is_active_sub = (path_str == getattr(owner, "_current_active_path_str", None))
+            sub_fg = "#1f538d" if is_active_sub else "transparent"
             button = ctk.CTkButton(
                 strip,
                 text=sub_p.name,
@@ -684,7 +780,7 @@ class RowPool:
                 font=owner.row_font(bold=True),
                 width=95,
                 height=95,
-                fg_color="transparent",
+                fg_color=sub_fg,
                 hover_color="#333333",
                 command=lambda i=item_index, p=sub_p: self._on_slot_clicked(i, p)
             )
@@ -705,10 +801,11 @@ class RowPool:
         """Selection border, checkbox and flag colour for a bound row."""
         owner = self.owner
         item = self.items[item_index]
-        is_selected = (item_index == self._selected_idx)
+        is_active = (item_index == getattr(owner, "_current_active_idx", self._selected_idx))
+        is_selected = (item_index in getattr(owner, "_current_selected_indices", {self._selected_idx}))
         applied = slot["applied"]
 
-        border = ("#1f538d", 2) if is_selected else ("#3a3a3a", 1)
+        border = ("#1f538d", 2) if is_active else (("#ffb703", 2) if is_selected else ("#3a3a3a", 1))
         if applied.get("border") != border:
             slot["frame"].configure(border_color=border[0], border_width=border[1])
             applied["border"] = border
