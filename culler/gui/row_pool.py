@@ -53,11 +53,13 @@ INITIAL_BIND_ROWS = 100
 
 #: How often the canvas is polled for a scroll. Cheap (one Tk call), and it
 #: catches the scrollbar drag as well as the wheel.
-SCROLL_POLL_MS = 60
+SCROLL_POLL_MS = 20
 
 
 def row_height_for(item) -> int:
-    """Height of the row that renders ``item``: stacked pairs are twice as tall."""
+    """Height of the row that renders ``item``: stacked pairs are twice as tall, placeholders are default."""
+    if getattr(item, "is_placeholder", False):
+        return ROW_HEIGHT
     if getattr(item, "is_stacked", False) and len(item.stacked_paths) >= 2:
         return STACKED_ROW_HEIGHT
     return ROW_HEIGHT
@@ -77,7 +79,9 @@ class RowPool:
 
         #: Row widgets live in their own frame so the scrollable frame keeps a constant
         #: child count and Tk's layout stays O(pool) instead of O(items).
-        self.pool_frame = ctk.CTkFrame(container, fg_color="transparent")
+        #: Must be opaque matching container to prevent un-erased bitblt ghosting during fast scrolling.
+        fg_col = container.cget("fg_color") if hasattr(container, "cget") else ("#ebebeb", "#242424")
+        self.pool_frame = ctk.CTkFrame(container, fg_color=fg_col, corner_radius=0)
         self.pool_frame.pack(side="top", fill="x")
         self.spacer: Optional[ctk.CTkFrame] = None
 
@@ -105,6 +109,125 @@ class RowPool:
         self._last_viewport: Tuple[int, int] = (0, 0)
         self._pool_dirty = True
         self.rebind_count = 0
+        self._hook_scrollbar()
+
+    def _hook_scrollbar(self) -> None:
+        """Wrap the scrollbar command so scroll jumps and drags rebind immediately."""
+        scrollbar = getattr(self.container, "_scrollbar", None)
+        if scrollbar is None or getattr(scrollbar, "_row_pool_hooked", False):
+            return
+        orig_cmd = scrollbar.cget("command")
+
+        def _on_scroll(*args):
+            if orig_cmd:
+                try:
+                    orig_cmd(*args)
+                except Exception:
+                    pass
+            self._on_scrollbar_movement()
+
+        try:
+            scrollbar.configure(command=_on_scroll)
+            scrollbar._row_pool_hooked = True
+        except Exception:
+            pass
+
+        canvas = getattr(scrollbar, "_canvas", None)
+        if canvas is not None and not getattr(scrollbar, "_row_pool_release_hooked", False):
+            try:
+                canvas.bind(
+                    "<ButtonRelease-1>",
+                    lambda e: self._on_scrollbar_release(),
+                    add="+",
+                )
+                self.owner.bind(
+                    "<ButtonRelease-1>",
+                    lambda e: self._on_scrollbar_release(),
+                    add="+",
+                )
+                scrollbar._row_pool_release_hooked = True
+            except Exception:
+                pass
+
+        p_canvas = self._canvas()
+        if p_canvas is not None and not getattr(p_canvas, "_row_pool_wheel_hooked", False):
+            try:
+                p_canvas.bind(
+                    "<MouseWheel>",
+                    lambda e: self.owner.after_idle(self._on_scrollbar_movement),
+                    add="+",
+                )
+                p_canvas._row_pool_wheel_hooked = True
+            except Exception:
+                pass
+
+        if not getattr(self.container, "_row_pool_wheel_hooked", False):
+            try:
+                self.container.bind(
+                    "<MouseWheel>",
+                    lambda e: self.owner.after_idle(self._on_scrollbar_movement),
+                    add="+",
+                )
+                self.container._row_pool_wheel_hooked = True
+            except Exception:
+                pass
+
+    def _on_scrollbar_movement(self) -> None:
+        """Called immediately whenever the scrollbar is clicked or dragged."""
+        self._release_forced_offset()
+        if not self.items:
+            return
+        offset = self._scroll_offset()
+        total = len(self.items)
+
+        if self._needs_rebind(offset):
+            v_top = self.index_at_offset(offset)
+            v_bottom = self.index_at_offset(offset + max(0, self._viewport_height()))
+            v_top = max(0, min(v_top, total - 1))
+            v_bottom = max(0, min(v_bottom, total - 1))
+
+            if total <= POOL_TARGET_ROWS:
+                target_start = 0
+                target_end = total - 1
+            else:
+                target_start = max(0, min(v_top - 40, total - POOL_TARGET_ROWS))
+                target_end = target_start + POOL_TARGET_ROWS - 1
+
+            target_count = target_end - target_start + 1
+            self._ensure_pool_size(target_count)
+            self._update_window_position(self.offset_of(target_start))
+            self._update_spacer()
+
+            self._first_visible = v_top
+            self._last_visible = v_bottom
+
+            # Coalesce continuous drag motion non-blockingly so rapid drag events
+            # never freeze the UI with redundant synchronous full-pool rebinds.
+            self.request_sync(reason="scroll")
+            if hasattr(self.owner, "_schedule_thumb_submit"):
+                self.owner._schedule_thumb_submit(immediate=False)
+        elif offset != self._last_scroll_offset:
+            self._last_scroll_offset = offset
+            self.owner._arm_thumb_drain()
+
+    def _on_scrollbar_release(self) -> None:
+        """Called when the user finishes dragging or clicking the scrollbar."""
+        self._release_forced_offset()
+        offset = self._scroll_offset()
+        # Always sync on release: canvas may still be animating, so the window
+        # might not match the actual scroll position even if _needs_rebind is False.
+        self.sync()
+        if offset != self._last_scroll_offset:
+            self._last_scroll_offset = offset
+            self.owner._arm_thumb_drain()
+        if hasattr(self.owner, "_schedule_thumb_submit"):
+            self.owner._schedule_thumb_submit(immediate=True)
+        # Force immediate thumbnail load for the newly visible viewport rows
+        if hasattr(self.owner, "_submit_thumbs_for_viewport"):
+            self.owner._submit_thumbs_for_viewport()
+        # Rebuild _btn_map for visible slots to fix stale entries after rebinds
+        if hasattr(self.owner, "_rebuild_btn_map_for_visible"):
+            self.owner._rebuild_btn_map_for_visible()
 
     # ------------------------------------------------------------------ items
 
@@ -118,6 +241,7 @@ class RowPool:
         self._offsets = offsets
         self._window_start = 0
         self._window_end = -1
+        self._hook_scrollbar()
 
     def clear_items(self) -> None:
         self.items = []
@@ -159,6 +283,17 @@ class RowPool:
         if not self.items or self._window_end < self._window_start:
             return []
         return list(range(self._window_start, self._window_end + 1))
+
+    def viewport_item_indices(self) -> List[int]:
+        """Indices of items actually visible within the canvas viewport."""
+        if not self.items:
+            return []
+        offset = self._scroll_offset()
+        v_top = self.index_at_offset(offset)
+        v_bottom = self.index_at_offset(offset + max(0, self._viewport_height()))
+        v_top = max(0, min(v_top, len(self.items) - 1))
+        v_bottom = max(0, min(v_bottom, len(self.items) - 1))
+        return list(range(v_top, v_bottom + 1))
 
     def slot_for_index(self, index: int) -> Optional[Dict]:
         """The slot showing ``index``, in O(1).
@@ -236,13 +371,15 @@ class RowPool:
 
     def _poll_scroll(self) -> None:
         self._scroll_after_id = None
+        had_forced_offset = self._forced_offset is not None
         self._release_forced_offset()
         offset = self._scroll_offset()
+        # If we just released a forced offset (canvas settled after scrollbar drag),
+        # the actual position may differ from what we thought. Force an immediate
+        # thumbnail submit for the new position.
+        forced_released = had_forced_offset and self._forced_offset is None
         if offset != self._last_scroll_offset:
             self._last_scroll_offset = offset
-            # Rebind when the *window* has to move, not when a pixel changed. Syncing on
-            # every pixel meant a smooth scroll drove a full rebind at the poll rate -
-            # dozens of full-screen rebinds per gesture, which is the freeze.
             if self._needs_rebind(offset):
                 self.request_sync(reason="scroll")
         if self.items:
@@ -251,6 +388,8 @@ class RowPool:
         # UI thread every frame regardless of what the user is doing, so it is where a
         # waiting thumbnail result gets picked up.
         self.owner._arm_thumb_drain()
+        if forced_released and hasattr(self.owner, "_schedule_thumb_submit"):
+            self.owner._schedule_thumb_submit(immediate=True)
 
     def _needs_rebind(self, offset: int) -> bool:
         """True when the visible row range approaches or exceeds the loaded window boundary."""
@@ -259,6 +398,10 @@ class RowPool:
         viewport = self._viewport_height()
         view_top = self.index_at_offset(offset)
         view_bottom = self.index_at_offset(offset + max(0, viewport))
+
+        for idx in range(view_top, min(view_bottom + 1, len(self.items))):
+            if idx not in self._slot_by_item:
+                return True
 
         if view_bottom >= self._window_end - SLIDE_MARGIN and self._window_end < len(self.items) - 1:
             return True
@@ -373,43 +516,35 @@ class RowPool:
                     self.start_scroll_polling()
                     return
         else:
-            incomplete_window = False
-            if self._window_end >= self._window_start:
-                for i, expected in enumerate(range(self._window_start, self._window_end + 1)):
-                    if i >= len(self._slot_items) or self._slot_items[i] != expected:
-                        incomplete_window = True
+            # Check if current window already covers the viewport with comfortable margin
+            MARGIN = 20
+            if (self._window_end >= self._window_start and
+                v_top >= self._window_start + MARGIN and
+                v_bottom <= self._window_end - MARGIN):
+                all_bound = True
+                for idx in range(v_top, min(v_bottom + 1, total)):
+                    if idx not in self._slot_by_item:
+                        all_bound = False
                         break
-
-            if incomplete_window:
-                target_start = self._window_start
-                target_end = self._window_end
-            elif self._window_end < self._window_start:
-                target_start = max(0, min(v_top, total - POOL_TARGET_ROWS))
-                target_end = target_start + POOL_TARGET_ROWS - 1
-            else:
-                cur_start = self._window_start
-                cur_end = self._window_end
-                if v_bottom >= cur_end - SLIDE_MARGIN and cur_end < total - 1:
-                    if v_bottom > cur_end:
-                        target_start = max(0, min(v_top - 10, total - POOL_TARGET_ROWS))
-                        target_end = target_start + POOL_TARGET_ROWS - 1
-                    else:
-                        shift = min(SLIDE_CHUNK, total - 1 - cur_end)
-                        target_start = cur_start + shift
-                        target_end = cur_end + shift
-                elif v_top <= cur_start + SLIDE_MARGIN and cur_start > 0:
-                    if v_top < cur_start:
-                        target_start = max(0, min(v_top - 10, total - POOL_TARGET_ROWS))
-                        target_end = target_start + POOL_TARGET_ROWS - 1
-                    else:
-                        shift = min(SLIDE_CHUNK, cur_start)
-                        target_start = cur_start - shift
-                        target_end = cur_end - shift
-                else:
+                if all_bound:
                     self._first_visible = v_top
                     self._last_visible = v_bottom
                     self.start_scroll_polling()
                     return
+
+            # Viewport jumped or approached margin: calculate sliding window target
+            if v_top > self._window_end or v_bottom < self._window_start:
+                # Viewport jumped completely outside resident window; center on viewport
+                target_start = max(0, min(v_top - 40, total - POOL_TARGET_ROWS))
+            elif v_bottom >= self._window_end - SLIDE_MARGIN and self._window_end < total - 1:
+                # Approaching bottom boundary; slide down by SLIDE_CHUNK
+                target_start = min(total - POOL_TARGET_ROWS, self._window_start + SLIDE_CHUNK)
+            elif v_top <= self._window_start + SLIDE_MARGIN and self._window_start > 0:
+                # Approaching top boundary; slide up by SLIDE_CHUNK
+                target_start = max(0, self._window_start - SLIDE_CHUNK)
+            else:
+                target_start = max(0, min(v_top - 40, total - POOL_TARGET_ROWS))
+            target_end = target_start + POOL_TARGET_ROWS - 1
 
         self._first_visible = v_top
         self._last_visible = v_bottom
@@ -417,88 +552,23 @@ class RowPool:
         target_count = target_end - target_start + 1
         self._ensure_pool_size(target_count)
 
-        if self._window_end >= self._window_start:
-            cur_start = self._window_start
-            cur_end = self._window_end
-            overlap_start = max(cur_start, target_start)
-            overlap_end = min(cur_end, target_end)
+        self._update_window_position(self.offset_of(target_start))
+        self._update_spacer()
 
-            if overlap_start <= overlap_end:
-                if target_start > cur_start:
-                    k = target_start - cur_start
-                    for slot in self._slots[:k]:
-                        old_idx = slot.get("item_index")
-                        if old_idx is not None:
-                            self._unregister_from_owner_maps(old_idx, slot)
-                            self._slot_by_item.pop(old_idx, None)
-                        slot["frame"].pack_forget()
-                        slot["frame"].pack(side="top", fill="x", padx=1, pady=2)
+        visible_indices = [idx for idx in range(v_top, min(v_bottom + 1, total)) if target_start <= idx <= target_end]
+        overscan_indices = [idx for idx in range(target_start, target_end + 1) if idx < v_top or idx > v_bottom]
+        ordered_indices = visible_indices + overscan_indices
 
-                    self._slots = self._slots[k:] + self._slots[:k]
-                    self._slot_items = self._slot_items[k:] + [None] * k
-                    self._slot_by_item = {s["item_index"]: i for i, s in enumerate(self._slots) if s.get("item_index") is not None}
-
-                    new_items = list(range(cur_end + 1, target_end + 1))
-                    bound_slots = []
-                    for slot_idx, item_idx in zip(range(len(self._slots) - k, len(self._slots)), new_items):
-                        self._bind_slot(slot_idx, item_idx)
-                        bound_slots.append(slot_idx)
-
-                    self._window_start = target_start
-                    self._window_end = target_end
-                    self._update_window_position(self.offset_of(target_start))
-                    self._update_spacer()
-                    self.start_scroll_polling()
-                    self.owner.on_rows_bound(self, bound_slots)
-                    if hasattr(self.owner, "_update_pool_stats"):
-                        self.owner._update_pool_stats()
-                    return
-
-                elif target_start < cur_start:
-                    k = cur_start - target_start
-                    first_frame = self._slots[0]["frame"]
-                    for slot in reversed(self._slots[-k:]):
-                        old_idx = slot.get("item_index")
-                        if old_idx is not None:
-                            self._unregister_from_owner_maps(old_idx, slot)
-                            self._slot_by_item.pop(old_idx, None)
-                        slot["frame"].pack_forget()
-                        slot["frame"].pack(side="top", fill="x", padx=1, pady=2, before=first_frame)
-                        first_frame = slot["frame"]
-
-                    self._slots = self._slots[-k:] + self._slots[:-k]
-                    self._slot_items = [None] * k + self._slot_items[:-k]
-                    self._slot_by_item = {s["item_index"]: i for i, s in enumerate(self._slots) if s.get("item_index") is not None}
-
-                    new_items = list(range(target_start, cur_start))
-                    bound_slots = []
-                    for slot_idx, item_idx in enumerate(new_items):
-                        self._bind_slot(slot_idx, item_idx)
-                        bound_slots.append(slot_idx)
-
-                    self._window_start = target_start
-                    self._window_end = target_end
-                    self._update_window_position(self.offset_of(target_start))
-                    self._update_spacer()
-                    self.start_scroll_polling()
-                    self.owner.on_rows_bound(self, bound_slots)
-                    if hasattr(self.owner, "_update_pool_stats"):
-                        self.owner._update_pool_stats()
-                    return
-
-        # Initial bind or non-overlapping jump
         bound_slots = []
-        for i, item_idx in enumerate(range(target_start, target_end + 1)):
-            if self._slot_items[i] != item_idx:
-                if len(bound_slots) >= budget:
-                    if self._rebind_after_id is None:
-                        self._rebind_after_id = self.owner.after(1, self.sync)
+        rebound_this_tick = 0
+        for item_idx in ordered_indices:
+            i = item_idx - target_start
+            if i >= len(self._slot_items) or self._slot_items[i] != item_idx:
+                if rebound_this_tick >= budget:
                     break
-                old_idx = self._slot_items[i]
-                if old_idx is not None:
-                    self._unregister_from_owner_maps(old_idx, self._slots[i])
-                self._bind_slot(i, item_idx)
+                self._rebind_slot(i, item_idx)
                 bound_slots.append(i)
+                rebound_this_tick += 1
 
         for i in range(target_count, len(self._slots)):
             if self._slot_items[i] is not None:
@@ -506,13 +576,27 @@ class RowPool:
 
         self._window_start = target_start
         self._window_end = target_end
-        self._update_window_position(self.offset_of(target_start))
-        self._update_spacer()
         self.start_scroll_polling()
+
+        # Re-sync _slot_by_item and owner maps for all currently bound slots to guarantee consistency
+        self._slot_by_item = {item_idx: i for i, item_idx in enumerate(self._slot_items) if item_idx is not None}
+        for i, item_idx in enumerate(self._slot_items):
+            if item_idx is not None and item_idx < len(self.items):
+                slot = self._slots[i]
+                self._register_in_owner_maps(i, slot, item_idx)
+                body = slot.get("body")
+                if body and len(body) == 1:
+                    it = self.items[item_idx]
+                    self.owner._btn_map[str(it.path)] = body[0]
+                    self.owner._label_map[item_idx] = body[0]
+
         if bound_slots:
             self.owner.on_rows_bound(self, bound_slots)
         if hasattr(self.owner, "_update_pool_stats"):
             self.owner._update_pool_stats()
+
+        if rebound_this_tick >= budget:
+            self._rebind_after_id = self.owner.after(1, lambda: self.sync(budget=budget, focus_idx=focus_idx))
 
     def _rebind_slot(self, slot_index: int, item_index: int) -> None:
         """Point an already-occupied slot at a different item, keeping its widgets."""
@@ -520,6 +604,8 @@ class RowPool:
         previous = self._slot_items[slot_index]
         if previous is not None:
             self._unregister_from_owner_maps(previous, slot)
+            if self._slot_by_item.get(previous) == slot_index:
+                self._slot_by_item.pop(previous, None)
         self._bind_slot(slot_index, item_index)
 
     def _apply_selection(self) -> None:
@@ -578,7 +664,11 @@ class RowPool:
             # Last value applied to each widget. Every CTk configure() redraws a canvas,
             # so a rebind that skips unchanged values costs a fraction of one that does
             # not - and a scroll rebinds a whole screenful at a time.
-            "applied": {},
+            "applied": {
+                "height": ROW_HEIGHT,
+                "border_color": "#3a3a3a",
+                "border_width": 1,
+            },
         }
 
     def _on_slot_checkbox(self, slot_index: int) -> None:
@@ -596,31 +686,67 @@ class RowPool:
     def _release_slot(self, slot_index: int) -> None:
         slot = self._slots[slot_index]
         item_index = self._slot_items[slot_index]
+        if item_index is None and slot["body"] is None:
+            # Slot is already clean/unbound; only ensure height if it was changed
+            if slot["applied"].get("height") != ROW_HEIGHT:
+                try:
+                    slot["frame"].configure(height=ROW_HEIGHT)
+                    slot["frame"].pack_propagate(False)
+                    slot["applied"]["height"] = ROW_HEIGHT
+                except Exception:
+                    pass
+            return
+
         if item_index is not None:
             self._unregister_from_owner_maps(item_index, slot)
+            self._slot_by_item.pop(item_index, None)
         self._destroy_body(slot)
         self._slot_items[slot_index] = None
-        if item_index is not None:
-            self._slot_by_item.pop(item_index, None)
         slot["item_index"] = None
-        slot["applied"] = {}
-        # A released row must not paint a stale selection.
-        slot["frame"].configure(border_color="#3a3a3a", border_width=1)
+
+        applied = slot["applied"]
+        cfg = {}
+        if applied.get("border_color") != "#3a3a3a":
+            cfg["border_color"] = "#3a3a3a"
+        if applied.get("border_width") != 1:
+            cfg["border_width"] = 1
+        if applied.get("height") != ROW_HEIGHT:
+            cfg["height"] = ROW_HEIGHT
+        if cfg:
+            try:
+                slot["frame"].configure(**cfg)
+                if "height" in cfg:
+                    slot["frame"].pack_propagate(False)
+            except Exception:
+                pass
+            applied.update(cfg)
         slot["checkbox"].deselect()
 
     def _unregister_from_owner_maps(self, item_index: int, slot: Dict) -> None:
         owner = self.owner
-        owner._row_frame_map.pop(item_index, None)
-        owner._indicator_map.pop(item_index, None)
-        owner._checkbox_map.pop(item_index, None)
-        owner._label_map.pop(item_index, None)
+        if owner._row_frame_map.get(item_index) is slot.get("frame"):
+            owner._row_frame_map.pop(item_index, None)
+        if owner._indicator_map.get(item_index) is slot.get("indicator"):
+            owner._indicator_map.pop(item_index, None)
+        if owner._checkbox_map.get(item_index) is slot.get("checkbox"):
+            owner._checkbox_map.pop(item_index, None)
+        if owner._label_map.get(item_index) is not None:
+            body = slot.get("body")
+            if body and owner._label_map.get(item_index) in body:
+                owner._label_map.pop(item_index, None)
+            elif owner._label_map.get(item_index) is slot.get("label"):
+                owner._label_map.pop(item_index, None)
         owner._row_render_cache.pop(item_index, None)
 
     def _destroy_body(self, slot: Dict) -> None:
         """Tear down a row's content and unregister it from the owner's maps."""
         owner = self.owner
+        body = slot.get("body")
         for path_str in slot["paths"]:
-            owner._btn_map.pop(path_str, None)
+            if body and owner._btn_map.get(path_str) in body:
+                owner._btn_map.pop(path_str, None)
+            elif not body:
+                owner._btn_map.pop(path_str, None)
         slot["paths"] = []
         if slot["body"] is not None:
             for widget in slot["body"]:
@@ -630,23 +756,40 @@ class RowPool:
                     pass
             slot["body"] = None
         slot["shape"] = None
-        for key in ("image", "border", "checked", "flag", "text"):
-            slot["applied"].pop(key, None)
+        slot["applied"].pop("text", None)
+        slot["applied"].pop("image", None)
+        slot["applied"].pop("btn_fg", None)
+        slot["applied"].pop("btn_hover", None)
+        if slot["applied"].get("height") != ROW_HEIGHT:
+            try:
+                slot["frame"].configure(height=ROW_HEIGHT)
+                slot["frame"].pack_propagate(False)
+                slot["applied"]["height"] = ROW_HEIGHT
+            except Exception:
+                pass
 
     def _bind_slot(self, slot_index: int, item_index: int) -> None:
         slot = self._slots[slot_index]
         owner = self.owner
         item = self.items[item_index]
 
-        stacked = bool(getattr(item, "is_stacked", False)) and len(item.stacked_paths) >= 2
+        stacked = (
+            not bool(getattr(item, "is_placeholder", False))
+            and bool(getattr(item, "is_stacked", False))
+            and len(item.stacked_paths) >= 2
+        )
         shape = ("stacked", len(item.stacked_paths)) if stacked else ("plain", 1)
 
         # Unregister the paths this slot used to show *before* rebinding. When the shape
         # is unchanged the body is reused rather than destroyed, so nothing else clears
         # these: every rebind leaked a path -> button entry, and a stale entry let a
         # decoded thumbnail be painted onto a button showing a different photo.
+        body = slot.get("body")
         for path_str in slot["paths"]:
-            self.owner._btn_map.pop(path_str, None)
+            if body and self.owner._btn_map.get(path_str) in body:
+                self.owner._btn_map.pop(path_str, None)
+            elif not body:
+                self.owner._btn_map.pop(path_str, None)
         slot["paths"] = []
 
         if slot["shape"] != shape:
@@ -657,6 +800,7 @@ class RowPool:
         if slot["applied"].get("height") != height:
             try:
                 slot["frame"].configure(height=height)
+                slot["frame"].pack_propagate(False)
                 slot["applied"]["height"] = height
             except Exception:
                 pass
@@ -691,42 +835,68 @@ class RowPool:
     def _bind_plain_body(self, slot: Dict, item_index: int, item) -> None:
         owner = self.owner
         path_str = str(item.path)
+        stars = "★" * item.rating if item.rating > 0 else ""
+        expected_text = f"{item.filename}\n{stars}" if stars else item.filename
+
+        is_active_path = (path_str == getattr(owner, "_current_active_path_str", None))
+        expected_fg = "#1f538d" if is_active_path else "transparent"
+        expected_hover = "#2b6cb0" if is_active_path else "#4a4a4a"
 
         if slot["body"] is None:
             button = ctk.CTkButton(
                 slot["frame"],
-                text="",
+                text=expected_text,
                 image=owner.placeholder_image(80),
                 compound="left",
                 anchor="w",
                 font=owner.row_font(),
                 height=88,
-                fg_color="transparent",
-                hover_color="#333333",
+                fg_color=expected_fg,
+                hover_color=expected_hover,
                 command=lambda i=item_index: self._on_slot_clicked(i)
             )
             button.pack(side="left", fill="both", expand=True, padx=2, pady=1)
             slot["body"] = [button]
+            slot["applied"]["text"] = expected_text
+            slot["applied"]["btn_fg"] = expected_fg
+            slot["applied"]["btn_hover"] = expected_hover
         else:
             button = slot["body"][0]
-            button.configure(command=lambda i=item_index: self._on_slot_clicked(i))
-
-        is_active_path = (path_str == getattr(owner, "_current_active_path_str", None))
-        expected_fg = "#1f538d" if is_active_path else "transparent"
-        if slot["applied"].get("btn_fg") != expected_fg:
             try:
-                button.configure(fg_color=expected_fg)
-                slot["applied"]["btn_fg"] = expected_fg
+                button.configure(command=lambda i=item_index: self._on_slot_clicked(i))
             except Exception:
                 pass
+            if slot["applied"].get("text") != expected_text:
+                try:
+                    button.configure(text=expected_text)
+                    slot["applied"]["text"] = expected_text
+                except Exception:
+                    pass
+
+            cfg = {}
+            if slot["applied"].get("btn_fg") != expected_fg:
+                cfg["fg_color"] = expected_fg
+                slot["applied"]["btn_fg"] = expected_fg
+            if slot["applied"].get("btn_hover") != expected_hover:
+                cfg["hover_color"] = expected_hover
+                slot["applied"]["btn_hover"] = expected_hover
+            if cfg:
+                try:
+                    button.configure(**cfg)
+                except Exception:
+                    pass
 
         image = owner._ctk_img_cache.get(path_str, owner.placeholder_image(80))
         if slot["applied"].get("image") is not image:
-            button.configure(image=image)
+            try:
+                button.configure(image=image)
+            except Exception:
+                pass
             slot["applied"]["image"] = image
         slot["paths"] = [path_str]
         owner._btn_map[path_str] = button
         owner._label_map[item_index] = button
+        owner._row_render_cache[item_index] = (owner.flag_color(item), expected_text)
 
     def _bind_stacked_body(self, slot: Dict, item_index: int, item) -> None:
         owner = self.owner
@@ -751,8 +921,19 @@ class RowPool:
             slot["strip"] = strip
         else:
             strip = slot["strip"]
-            for widget in strip.winfo_children():
-                widget.destroy()
+            inner = getattr(strip, "_scrollable_frame", None) or getattr(strip, "_frame", None)
+            if inner is not None:
+                for widget in inner.winfo_children():
+                    try:
+                        widget.destroy()
+                    except Exception:
+                        pass
+            else:
+                for widget in strip.winfo_children():
+                    try:
+                        widget.destroy()
+                    except Exception:
+                        pass
 
         label = slot["label"]
         raw_n = sum(1 for p in item.stacked_paths if p.suffix.lower() == ".arw")
@@ -772,6 +953,7 @@ class RowPool:
             paths.append(path_str)
             is_active_sub = (path_str == getattr(owner, "_current_active_path_str", None))
             sub_fg = "#1f538d" if is_active_sub else "transparent"
+            sub_hover = "#2b6cb0" if is_active_sub else "#4a4a4a"
             button = ctk.CTkButton(
                 strip,
                 text=sub_p.name,
@@ -781,7 +963,7 @@ class RowPool:
                 width=95,
                 height=95,
                 fg_color=sub_fg,
-                hover_color="#333333",
+                hover_color=sub_hover,
                 command=lambda i=item_index, p=sub_p: self._on_slot_clicked(i, p)
             )
             button.pack(side="left", padx=3)

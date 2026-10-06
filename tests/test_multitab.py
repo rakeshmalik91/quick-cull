@@ -298,6 +298,54 @@ class TestImageCullerAppTabLogic(unittest.TestCase):
 
         app._update_tab_loading_indicator.assert_not_called()
 
+    def test_preload_placeholder_items_updates_thumb_list_and_current_items(self):
+        from gui import ImageCullerApp
+        from culler.culler_engine import ImageItem
+
+        app = self._make_app()
+        app._select_image = MagicMock()
+        app._sync_loading_progress = MagicMock()
+
+        tab = ImageCullerApp._create_tab_info(app, "D:/Photos/A")
+        app.tabs.append(tab)
+        app.active_tab_index = 0
+
+        p1 = Path("D:/Photos/A/DSC001.ARW")
+        p2 = Path("D:/Photos/A/DSC002.JPG")
+        item1 = ImageItem(p1)
+        item2 = ImageItem(p2)
+
+        ImageCullerApp._preload_placeholder_items(app, tab, "camera", items=[item1, item2], arw_count=1)
+
+        self.assertEqual(tab["arw_count"], 1)
+        self.assertEqual(len(tab["current_items"]), 2)
+        self.assertEqual(len(app.current_items), 2)
+        app.thumb_list.update_items.assert_called_once()
+        app._select_image.assert_called_once_with(0, from_click=False)
+        app._sync_loading_progress.assert_called_once()
+
+    def test_sync_loading_progress_displays_arw_count(self):
+        from gui import ImageCullerApp
+
+        app = self._make_app()
+        app._update_status = MagicMock()
+
+        tab = ImageCullerApp._create_tab_info(app, "D:/Photos/A")
+        app.tabs.append(tab)
+        app.active_tab_index = 0
+
+        tab["loading"] = True
+        tab["load_total"] = 100
+        tab["load_current"] = 0
+        tab["arw_count"] = 80
+
+        ImageCullerApp._sync_loading_progress(app)
+        app._update_status.assert_called_with("Found 80 ARW (100 photos) | Reading metadata...")
+
+        tab["load_current"] = 25
+        ImageCullerApp._sync_loading_progress(app)
+        app._update_status.assert_called_with("Loading metadata 25/100 (80 ARW)...")
+
     def test_switch_tab_saves_and_applies_state(self):
         from gui import ImageCullerApp
 

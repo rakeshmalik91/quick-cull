@@ -289,6 +289,8 @@ class CullingSession:
         self.db = db_manager or DatabaseManager()
         self.image_loader = image_loader or ImageLoader(exif_wrapper=self.exif_wrapper)
         self.items: List[ImageItem] = []
+        self.placeholder_items: List[ImageItem] = []
+        self.arw_count: int = 0
         self.directory: Optional[Path] = None
         # Manifest of the last scan, so a refresh of the same folder is differential.
         self._index: Optional[FolderIndex] = None
@@ -337,6 +339,8 @@ class CullingSession:
         stacked paths, so a session for a few thousand photos is not free to keep.
         """
         self.items = []
+        self.placeholder_items = []
+        self.arw_count = 0
         self._index = None
         self._indexed_dir = None
         self._scan_options = None
@@ -348,7 +352,8 @@ class CullingSession:
         directory_path: Union_Path_Str,
         recursive: bool = False,
         stack_raw_jpg: bool = True,
-        progress_callback: Optional[Callable[[int, int], None]] = None
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        on_discovered: Optional[Callable[[List[ImageItem], int], None]] = None,
     ) -> List[ImageItem]:
         """
         Scan a directory for supported image formats (ARW, JPG, PNG, HEIC).
@@ -368,6 +373,8 @@ class CullingSession:
 
         self.directory = dir_path
         entries = scan_entries(dir_path, recursive)
+        arw_count = sum(1 for e in entries.values() if e.path.suffix.lower() == ".arw")
+        self.arw_count = arw_count
 
         options = (bool(recursive), bool(stack_raw_jpg))
         can_diff = (
@@ -381,6 +388,7 @@ class CullingSession:
             if can_diff and self.items:
                 self._forget_records([p for it in self.items for p in it.stacked_paths])
             self.items = []
+            self.placeholder_items = []
             self._reset_manifest(options)
             _emit_progress(progress_callback, 0, 0)
             return self.items
@@ -400,6 +408,31 @@ class CullingSession:
 
         row_specs = self._build_row_specs(entries, stack_raw_jpg)
         self._expected_row_count = len(row_specs)
+
+        # Build placeholder items immediately from the row specs so the UI can display
+        # placeholder thumbnails and total counts before EXIF reading completes.
+        # Placeholders are kept at default size (unstacked) while loading.
+        placeholder_items: List[ImageItem] = []
+        for spec in row_specs:
+            pi = ImageItem(spec.primary, size_bytes=spec.size_bytes, resolved=True)
+            pi.filename = spec.filename
+            pi.format_name = spec.format_name
+            pi.stacked_paths = [spec.primary]
+            pi.is_stacked = False
+            pi.is_placeholder = True
+            placeholder_items.append(pi)
+
+        self.placeholder_items = placeholder_items
+        self.items = placeholder_items
+
+        if on_discovered is not None:
+            try:
+                on_discovered(placeholder_items, arw_count)
+            except Exception as e:
+                log_debug(f"on_discovered callback failed: {e}")
+
+        _emit_progress(progress_callback, 0, len(row_specs), f"Found {arw_count} ARW ({len(row_specs)} photos)")
+
         items = self._reconcile_items(row_specs, previous_items, diff, progress_callback)
 
         # Only files whose bytes changed lose their decoded pixels; everything else stays
@@ -1552,9 +1585,11 @@ class CullingSession:
 
         total_bytes = sum(i.size_bytes for i in self.items)
         size_mb = round(total_bytes / (1024 * 1024), 2)
+        arw_count = getattr(self, "arw_count", sum(1 for i in self.items for p in i.stacked_paths if p.suffix.lower() == ".arw"))
 
         return {
             "total_images": total,
+            "arw_count": arw_count,
             "picked": picked,
             "rejected": rejected,
             "unflagged": unflagged,

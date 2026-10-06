@@ -378,6 +378,57 @@ class TestCullingEngine(unittest.TestCase):
         self.assertEqual(item1.flag, FlagState.UNFLAGGED)
         self.assertTrue(item1.has_tag("Blur"))
 
+    def test_scan_directory_discovers_arw_and_placeholder_items(self):
+        """
+        Verify scan_directory counts ARW files and notifies on_discovered callback with placeholder items.
+        """
+        temp_dir = tempfile.mkdtemp()
+        try:
+            # Create a mix of ARW and JPG files
+            (Path(temp_dir) / "photo1.arw").write_bytes(b"dummy arw")
+            (Path(temp_dir) / "photo2.ARW").write_bytes(b"dummy arw")
+            (Path(temp_dir) / "photo3.jpg").write_bytes(b"dummy jpg")
+
+            discovered = []
+            arw_counts = []
+
+            def on_discovered(items, arw_count):
+                discovered.append(list(items))
+                arw_counts.append(arw_count)
+
+            with patch.object(self.session, "_reconcile_items", return_value=[]):
+                self.session.scan_directory(temp_dir, on_discovered=on_discovered)
+
+            self.assertEqual(len(discovered), 1)
+            self.assertEqual(len(arw_counts), 1)
+            self.assertEqual(arw_counts[0], 2)
+            self.assertEqual(self.session.arw_count, 2)
+            self.assertEqual(len(discovered[0]), 3)
+            self.assertEqual(len(self.session.placeholder_items), 3)
+            # Verify placeholders are default unstacked size
+            self.assertTrue(all(getattr(it, "is_placeholder", False) for it in self.session.placeholder_items))
+            self.assertFalse(any(getattr(it, "is_stacked", False) for it in self.session.placeholder_items))
+            self.assertTrue(all(len(it.stacked_paths) == 1 for it in self.session.placeholder_items))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_summary_stats_includes_arw_count(self):
+        """
+        Verify get_summary_stats returns arw_count accurately.
+        """
+        item1 = ImageItem(Path("D:/Photos/DSC001.ARW"))
+        item1.stacked_paths = [Path("D:/Photos/DSC001.ARW")]
+        item2 = ImageItem(Path("D:/Photos/DSC002.JPG"))
+        item2.stacked_paths = [Path("D:/Photos/DSC002.JPG")]
+
+        self.session.items = [item1, item2]
+        self.session.arw_count = 1
+
+        stats = self.session.get_summary_stats()
+        self.assertEqual(stats["total_images"], 2)
+        self.assertEqual(stats["arw_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -655,20 +655,36 @@ class ImageCullerApp(ctk.CTk):
         directory = tab["directory"]
         if not directory or not os.path.exists(directory):
             return
+        if tab.get("loading"):
+            return
 
         self._unwatch_tab_directory(tab, directory)
 
         tab["loading"] = True
         tab["load_total"] = 0
         tab["load_current"] = 0
+        tab["arw_count"] = 0
         tab["_placeholders_loaded"] = False
         tab["_load_started_at"] = time.monotonic()
         self._update_tab_loading_indicator(tab)
 
         if tab is self._get_active_tab():
             self.thumb_list.start_load_timing(tab["_load_started_at"])
+            if not tab.get("current_items") and self.current_items:
+                self.current_items = []
+                self.thumb_list.update_items([])
 
         white_balance = self.toolbar.get_white_balance()
+
+        def on_discovered(items: List[ImageItem], arw_count: int):
+            tab["arw_count"] = arw_count
+            tab["load_total"] = len(items)
+            if not tab.get("_released"):
+                if not tab.get("_placeholders_loaded"):
+                    tab["_placeholders_loaded"] = True
+                    self.after(0, lambda: self._preload_placeholder_items(tab, white_balance, items=items, arw_count=arw_count))
+                elif tab is self._get_active_tab():
+                    self.after(0, self._sync_loading_progress)
 
         def on_progress(current: int, total: int, filename: str = ""):
             tab["load_current"] = current
@@ -685,7 +701,8 @@ class ImageCullerApp(ctk.CTk):
                 tab["session"].scan_directory(
                     directory,
                     stack_raw_jpg=True,
-                    progress_callback=on_progress
+                    progress_callback=on_progress,
+                    on_discovered=on_discovered,
                 )
                 tab["load_stats"]["folder"] = time.monotonic() - started_at
                 tab["is_loaded"] = True
@@ -698,21 +715,35 @@ class ImageCullerApp(ctk.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _preload_placeholder_items(self, tab: Dict[str, Any], white_balance: str):
+    def _preload_placeholder_items(
+        self,
+        tab: Dict[str, Any],
+        white_balance: str = "camera",
+        items: Optional[List[ImageItem]] = None,
+        arw_count: Optional[int] = None
+    ):
         if tab.get("_released") or tab not in self.tabs:
             return
-        session = tab["session"]
-        if not session or not session.items:
-            return
+        if arw_count is not None:
+            tab["arw_count"] = arw_count
+        session = tab.get("session")
+        if items is None:
+            if not session:
+                return
+            items = getattr(session, "placeholder_items", None) or getattr(session, "items", None)
+            if not items:
+                return
 
         placeholder_items = []
-        for item in session.items:
+        for item in items:
             pi = ImageItem(item.path)
             pi.filename = item.filename or item.path.name
+            pi.format_name = getattr(item, "format_name", item.path.suffix.upper().lstrip("."))
             pi.flag = item.flag
             pi.rating = item.rating
-            pi.is_stacked = item.is_stacked
-            pi.stacked_paths = list(item.stacked_paths)
+            pi.is_stacked = False
+            pi.stacked_paths = [item.path]
+            pi.is_placeholder = True
             placeholder_items.append(pi)
 
         sel_idx = 0
@@ -722,8 +753,17 @@ class ImageCullerApp(ctk.CTk):
             if f_idx >= 0:
                 sel_idx = f_idx
 
-        self.thumb_list.set_image_loader(session.image_loader)
-        self.thumb_list.update_items(placeholder_items, selected_idx=sel_idx, white_balance=white_balance)
+        tab["current_items"] = placeholder_items
+        tab["current_index"] = sel_idx
+        if tab is self._get_active_tab():
+            self.current_items = placeholder_items
+            self.current_index = sel_idx
+            if session:
+                self.thumb_list.set_image_loader(session.image_loader)
+            self.thumb_list.update_items(placeholder_items, selected_idx=sel_idx, white_balance=white_balance)
+            if placeholder_items and 0 <= sel_idx < len(placeholder_items):
+                self._select_image(sel_idx, from_click=False)
+            self._sync_loading_progress()
 
     def _on_tab_scan_complete(self, tab: Dict[str, Any]):
         # A tab closed mid-scan: the worker thread still holds a reference to its dict.
@@ -742,12 +782,14 @@ class ImageCullerApp(ctk.CTk):
         self.thumb_list.set_image_loader(session.image_loader)
         self._on_filter_changed()
         stats = tab["session"].get_summary_stats()
+        arw_count = stats.get("arw_count", tab.get("arw_count", 0))
+        arw_info = f" ({arw_count} ARW)" if arw_count > 0 else ""
         if stats['total_images'] == 0:
             folder_str = str(tab["session"].directory) if tab["session"].directory else "selected directory"
             self._update_status(f"No supported photo files found in {folder_str}.")
         else:
             self._update_status(
-                f"Loaded {stats['total_images']} photos ({stats['total_size_mb']} MB) | "
+                f"Loaded {stats['total_images']} photos{arw_info} ({stats['total_size_mb']} MB) | "
                 f"Picked: {stats['picked']}, Rejected: {stats['rejected']}, Unflagged: {stats['unflagged']}"
             )
 
@@ -759,23 +801,23 @@ class ImageCullerApp(ctk.CTk):
         self._update_status("Error loading directory.")
 
     def _sync_loading_progress(self):
-        """Reflect scan progress in the status bar.
-
-        This used to drive the grid's own progress bar and "Loading N/M" label. Both were
-        removed from the grid footer - the count was of *visible* rows decoded, so it moved
-        as you scrolled and said nothing about the folder. The scan progress is folder-wide
-        information, so it belongs on the status bar with the rest of it.
-        """
+        """Reflect scan progress in the status bar."""
         tab = self._get_active_tab()
         if not tab or not tab.get("loading"):
             return
 
         total = tab.get("load_total", 0)
         current = tab.get("load_current", 0)
+        arw_count = tab.get("arw_count", 0)
+        arw_text = f" ({arw_count} ARW)" if arw_count > 0 else ""
+
         if total > 0:
-            self._update_status(f"Loading {current}/{total}...")
+            if current == 0:
+                self._update_status(f"Found {arw_count} ARW ({total} photos) | Reading metadata..." if arw_count > 0 else f"Found {total} photos | Reading metadata...")
+            else:
+                self._update_status(f"Loading metadata {current}/{total}{arw_text}...")
         else:
-            self._update_status("Loading...")
+            self._update_status("Scanning directory...")
 
     def _update_tab_loading_indicator(self, tab: Dict[str, Any]):
         idx = self.tabs.index(tab) if tab in self.tabs else -1
@@ -1166,17 +1208,41 @@ class ImageCullerApp(ctk.CTk):
         tab["loading"] = True
         tab["load_total"] = 0
         tab["load_current"] = 0
+        tab["arw_count"] = 0
+        tab["_placeholders_loaded"] = False
         tab["pending_target_image"] = target_image
         tab["_load_started_at"] = time.monotonic()
+
+        self.current_items = []
+        self.current_index = -1
+        self.selected_indices = set()
+        self.thumb_list.update_items([])
+        self.viewer.clear()
+        self.meta_panel.clear()
 
         self.tab_bar.set_label(self.active_tab_index, tab["tab_label"] + " ⟳")
         self._update_status(f"Scanning directory: {folder_path}...")
         self.thumb_list.start_load_timing(tab["_load_started_at"])
 
+        white_balance = self.toolbar.get_white_balance()
+
+        def on_discovered(items: List[ImageItem], arw_count: int):
+            tab["arw_count"] = arw_count
+            tab["load_total"] = len(items)
+            if not tab.get("_released"):
+                if not tab.get("_placeholders_loaded"):
+                    tab["_placeholders_loaded"] = True
+                    self.after(0, lambda: self._preload_placeholder_items(tab, white_balance, items=items, arw_count=arw_count))
+                elif tab is self._get_active_tab():
+                    self.after(0, self._sync_loading_progress)
+
         def on_progress(current: int, total: int, filename: str = ""):
             tab["load_current"] = current
             tab["load_total"] = total
-            if tab is self._get_active_tab():
+            if tab is self._get_active_tab() and not tab.get("_released"):
+                if current == 0 and total > 0 and not tab.get("_placeholders_loaded"):
+                    tab["_placeholders_loaded"] = True
+                    self.after(50, lambda: self._preload_placeholder_items(tab, white_balance))
                 self.after(0, self._sync_loading_progress)
 
         def worker():
@@ -1185,7 +1251,8 @@ class ImageCullerApp(ctk.CTk):
                 tab["session"].scan_directory(
                     folder_path,
                     stack_raw_jpg=True,
-                    progress_callback=on_progress
+                    progress_callback=on_progress,
+                    on_discovered=on_discovered,
                 )
                 tab["load_stats"]["folder"] = time.monotonic() - started_at
                 tab["is_loaded"] = True
@@ -1209,6 +1276,8 @@ class ImageCullerApp(ctk.CTk):
 
         self._on_filter_changed()
         stats = tab["session"].get_summary_stats()
+        arw_count = stats.get("arw_count", tab.get("arw_count", 0))
+        arw_info = f" ({arw_count} ARW)" if arw_count > 0 else ""
         if stats['total_images'] == 0:
             folder_str = str(tab["session"].directory) if tab["session"].directory else "selected directory"
             mb.showwarning(
@@ -1218,7 +1287,7 @@ class ImageCullerApp(ctk.CTk):
             self._update_status(f"No supported photo files found in {folder_str}.")
         else:
             self._update_status(
-                f"Loaded {stats['total_images']} photos ({stats['total_size_mb']} MB) | "
+                f"Loaded {stats['total_images']} photos{arw_info} ({stats['total_size_mb']} MB) | "
                 f"Picked: {stats['picked']}, Rejected: {stats['rejected']}, Unflagged: {stats['unflagged']}"
             )
 

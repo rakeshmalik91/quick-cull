@@ -124,6 +124,20 @@ class TestThumbnailList(unittest.TestCase):
         self.assertEqual(len(self.list_widget._row_frame_map), 1)
         self.assertEqual(self.list_widget._row_frame_map[0].cget("height"), 190)
 
+    def test_placeholder_row_is_default_height_and_unstacked(self):
+        """
+        Verify placeholder rows have default height (ROW_HEIGHT) and are not resized for stacked items.
+        """
+        from culler.gui.row_pool import ROW_HEIGHT, row_height_for
+
+        item = self._make_item("ALPHA.ARW", is_stacked=True)
+        item.is_placeholder = True
+        self.assertEqual(row_height_for(item), ROW_HEIGHT)
+
+        self.list_widget.update_items([item], selected_idx=0)
+        self.list_widget.update()
+        self.assertEqual(self.list_widget._row_frame_map[0].cget("height"), ROW_HEIGHT)
+
     def test_row_signature_detects_stack_changes_only(self):
         """
         Verify the soft-refresh signature changes with stack composition, not with
@@ -980,6 +994,118 @@ class TestThumbnailList(unittest.TestCase):
                         if btn.cget("fg_color") == "#1f538d"]
         self.assertEqual(blue_buttons, [str(items[85].path)],
                          f"Only index 85 button should be blue, found {blue_buttons}")
+
+    def test_scrollbar_jump_to_middle_binds_placeholder_rows_immediately(self):
+        """
+        Clicking in the middle of the scrollbar (e.g. moveto 0.5) with 2k items must
+        immediately bind placeholder rows and position the container frame so visible
+        rows are not blank.
+        """
+        items = [self._make_item(f"MID_JUMP_{i:04d}.JPG") for i in range(2000)]
+        self.list_widget.update_items(items, selected_idx=0)
+        self.root.update()
+
+        pool = self.list_widget.row_pool
+        scrollbar = getattr(self.list_widget.scroll_frame, "_scrollbar", None)
+        self.assertIsNotNone(scrollbar, "Scrollbar must exist on scroll_frame")
+
+        # Simulate clicking the middle of the scrollbar track (moveto 0.5 -> index ~1000)
+        scrollbar._command("moveto", 0.5)
+        self.root.update()
+
+        # The pool should have synchronized to the middle
+        v_indices = pool.visible_item_indices()
+        self.assertTrue(len(v_indices) > 0, "Visible indices must not be empty")
+        self.assertTrue(any(idx >= 900 for idx in v_indices),
+                        f"Expected indices near 1000, got {v_indices[:5]}..{v_indices[-5:]}")
+
+        # Placeholder rows must be in _row_frame_map
+        for idx in v_indices:
+            self.assertIn(idx, self.list_widget._row_frame_map,
+                          f"Placeholder row {idx} must be bound in _row_frame_map")
+
+        # Container frame coords must align with canvas
+        canvas = self.list_widget.scroll_frame._parent_canvas
+        win_id = self.list_widget.scroll_frame._create_window_id
+        coords = canvas.coords(win_id)
+        expected_y = float(pool.offset_of(pool.window_start))
+        self.assertEqual(coords[1], expected_y,
+                         f"Window y-coord ({coords[1]}) must match window_start offset ({expected_y})")
+
+    def test_scrollbar_drag_cooldown_debounces_batch_loads_and_loads_final_location(self):
+        """
+        Rapid scrollbar dragging or key navigation must debounce batch thumbnail loads,
+        dropping intermediate floods while reliably loading the final resting position.
+        """
+        items = [self._make_item(f"DRAG_{i:04d}.JPG") for i in range(2000)]
+        self.list_widget.update_items(items, selected_idx=0)
+        self.root.update()
+
+        requested_batches = []
+        original_submit = self.list_widget._submit_pending_thumb_requests
+
+        def spy_submit(load_id):
+            batch = list(self.list_widget._batch_raw_requests) + list(self.list_widget._batch_other_requests)
+            requested_batches.append([b[0] for b in batch])
+            return original_submit(load_id)
+
+        self.list_widget._submit_pending_thumb_requests = spy_submit
+        scrollbar = getattr(self.list_widget.scroll_frame, "_scrollbar", None)
+
+        try:
+            # Clear initial load batch records
+            requested_batches.clear()
+
+            # Rapidly drag scrollbar through 5 intermediate positions in quick succession
+            for frac in [0.1, 0.2, 0.3, 0.4, 0.5]:
+                scrollbar._command("moveto", frac)
+                # Small update cycle (< 20ms, well below THUMB_LOAD_COOLDOWN_MS = 120ms)
+                self.root.update_idletasks()
+                time.sleep(0.01)
+
+            # Before cooldown expires: no intermediate thumbnail batch should have been submitted yet
+            self.assertEqual(len(requested_batches), 0,
+                             "Intermediate drag steps must be debounced and not submit batches immediately")
+            self.assertIsNotNone(self.list_widget._thumb_submit_after_id,
+                                 "Cooldown timer must be armed for the resting position")
+
+            # Wait for cooldown to expire (> 150ms)
+            for _ in range(20):
+                self.root.update()
+                time.sleep(0.01)
+
+            # Exactly the final resting position (frac 0.5, around index 1000) was loaded
+            self.assertGreaterEqual(len(requested_batches), 1,
+                                    "Final resting location must be submitted once cooldown expires")
+            final_batch_paths = requested_batches[-1]
+            self.assertTrue(any("DRAG_09" in str(p) or "DRAG_10" in str(p) for p in final_batch_paths),
+                            f"Final batch must contain items near index 1000, got: {final_batch_paths[:3]}")
+
+        finally:
+            self.list_widget._submit_pending_thumb_requests = original_submit
+
+    def test_scrollbar_drag_is_fast_and_non_blocking(self):
+        """
+        Dragging the scrollbar across many steps must be non-blocking and smooth (< 50ms total),
+        never executing synchronous heavy DOM rebinds on every drag motion event.
+        """
+        items = [self._make_item(f"SMOOTH_{i:04d}.JPG") for i in range(2000)]
+        self.list_widget.update_items(items, selected_idx=0)
+        self.root.update()
+
+        scrollbar = getattr(self.list_widget.scroll_frame, "_scrollbar", None)
+        self.assertIsNotNone(scrollbar)
+
+        t0 = time.perf_counter()
+        for i in range(50):
+            frac = i / 50.0
+            scrollbar._command("moveto", frac)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        self.assertLess(elapsed_ms, 50.0,
+                        f"50 scrollbar drag steps took {elapsed_ms:.1f}ms; must be non-blocking (< 50ms)")
+
+
 
 
 if __name__ == "__main__":

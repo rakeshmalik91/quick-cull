@@ -320,7 +320,7 @@ class TestThumbnailFailureDoesNotStick(unittest.TestCase):
     def _run_pending(self):
         for _ in range(300):
             self.root.update()
-            if not self.list_widget._executor._threads:
+            if not self.list_widget._inflight_thumbs and self.list_widget._thumb_submit_after_id is None:
                 break
             time.sleep(0.01)
         self.root.update()
@@ -482,6 +482,54 @@ class TestRepeatedUpdatesAlwaysBindTheVisibleWindow(unittest.TestCase):
         self.assertEqual(len(set(submitted)), len(submitted),
                          "no path may be submitted twice for the same item set")
 
+    def test_switch_from_stacked_tab_forcefully_resizes_to_default_height(self):
+        """
+        When switching from a tab with stacked items (190px) to another tab with
+        unstacked / placeholder items, all slots must be forcefully resized to
+        default ROW_HEIGHT (96px) and not retain the previous tab's 190px height.
+        """
+        from culler.gui.row_pool import ROW_HEIGHT, STACKED_ROW_HEIGHT
+        from culler.culler_engine import ImageItem
+
+        # 1. First tab: items are stacked
+        stacked_items = []
+        for i in range(5):
+            raw = Path(f"/photos/DSC_{i:04d}.ARW")
+            jpg = Path(f"/photos/DSC_{i:04d}.JPG")
+            it = ImageItem(raw)
+            it.is_stacked = True
+            it.stacked_paths = [raw, jpg]
+            stacked_items.append(it)
+
+        self.list_widget.update_items(stacked_items, selected_idx=0)
+        self._drain()
+
+        pool = self.list_widget.row_pool
+        # Verify slots were sized to STACKED_ROW_HEIGHT
+        for slot_idx in range(len(stacked_items)):
+            slot = pool._slots[slot_idx]
+            self.assertEqual(slot["frame"].cget("height"), STACKED_ROW_HEIGHT)
+
+        # 2. Switch to second tab with placeholder / unstacked items
+        placeholder_items = []
+        for i in range(5):
+            raw = Path(f"/other/IMG_{i:04d}.ARW")
+            it = ImageItem(raw)
+            it.is_stacked = False
+            it.stacked_paths = [raw]
+            it.is_placeholder = True
+            placeholder_items.append(it)
+
+        self.list_widget.update_items(placeholder_items, selected_idx=0)
+        self._drain()
+
+        # Verify all slots in the pool are forcefully resized to default ROW_HEIGHT
+        for slot in pool._slots:
+            self.assertEqual(slot["frame"].cget("height"), ROW_HEIGHT)
+            self.assertEqual(slot["applied"].get("height"), ROW_HEIGHT)
+
+
 def deque_len_zero():
     from collections import deque
     return deque()
+

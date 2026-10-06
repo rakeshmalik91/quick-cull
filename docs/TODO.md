@@ -5,7 +5,17 @@ Do not add any new details here. only use this for checking/unchecking the TODO 
 Make corrections optionally, if required.
 ---------------------
 
-- [x] virtualize the thumbnail grid rows (recycled row pool + scroll-driven rebinding). needed for folders above ~1500 photos: 2771 rows currently take ~111s to build and freeze the app. see docs/analysis/ui-framework-assessment.md
+- [ ] UI changes:
+  - [ ] add a bit of gap between "Close all Tabs" & "About" button
+  - [ ] add hide/unhide for thumbnail panel and right side tool panel
+  - [ ] make each sections of right side tool panel collapsible: "Culling Actions", "Exif Metadata"
+  - [ ] save state of the UI (panel positions, sizes, hide/unhide, panel sections collapsed/expanded, menubar state) for relaunch
+  - [ ] 
+- [ ] Add a search by filename, to jump to a file in the thumbnails list. it should suggest continuously as typed. Add it right on top of thumbnail list. Ctrl+F to focus on it.
+- [ ] Scrolling on thumbnails with large data: glitch, freeze & performance
+  - [x] some times thumbnails show blanks, and selecting a thumbnail shows the image in preview but doesnt highlight with blue in thumbnails list
+  - [ ] when scrolling fast, text from new thumbnails overlap with old ones, making it look glitchy (last try on this reduced the glitch and increased freeze. need to accept completely removed glitch/freeze)
+- [ ] virtualize the thumbnail grid rows (recycled row pool + scroll-driven rebinding). needed for folders above ~1500 photos: 2771 rows currently take ~111s to build and freeze the app. see docs/analysis/ui-framework-assessment.md
 - [x] if there is only one tab open, not able to close it. ensure closing a tab clears the memory completely. add a close all tabs button too. 
 - [x] tab button and tab close buttons are glitching all the time. thumbnail list glitching during folder/thumbnail loading. verify our ui framework is correctly being used or requires any replacement.
 - [x] create a doc for improving the folder and thumbnail load time

@@ -60,19 +60,21 @@ class AboutDialog(ctk.CTkToplevel):
         co_author_label = ctk.CTkLabel(
             self,
             text="Co authored by:",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=10),
             text_color="#888888",
+            height=16,
         )
-        co_author_label.grid(row=5, column=0, padx=28, pady=(0, 6))
+        co_author_label.grid(row=5, column=0, padx=28, pady=(0, 4))
 
         for index, name in enumerate(CO_AUTHORS):
             row = ctk.CTkLabel(
                 self,
                 text=name,
-                font=ctk.CTkFont(size=13),
-                text_color="#cccccc",
+                font=ctk.CTkFont(size=10),
+                text_color="#b8b8b8",
+                height=16,
             )
-            row.grid(row=6 + index, column=0, padx=28, pady=2)
+            row.grid(row=6 + index, column=0, padx=28, pady=1)
 
         close_button = ctk.CTkButton(
             self,
@@ -84,7 +86,7 @@ class AboutDialog(ctk.CTkToplevel):
             font=ctk.CTkFont(size=12),
             command=self._on_close,
         )
-        close_button.grid(row=6 + len(CO_AUTHORS), column=0, padx=28, pady=(20, 24))
+        close_button.grid(row=6 + len(CO_AUTHORS), column=0, padx=28, pady=(16, 20))
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Escape>", lambda _event: self._on_close())

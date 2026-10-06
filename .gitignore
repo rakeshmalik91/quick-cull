@@ -34,3 +34,7 @@ dist/
 /_temp
 /*.log
 /*.tmp
+/_tmp*
+/_temp*
+/tmp*
+/temp*

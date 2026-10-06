@@ -20,6 +20,9 @@ from .row_pool import (
     row_height_for,
 )
 
+#: Cooldown (in ms) before submitting thumbnail batch loads during rapid scrolling or key navigation.
+THUMB_LOAD_COOLDOWN_MS = 120
+
 
 def get_consumed_memory_mb(image_loader: Optional[ImageLoader] = None) -> float:
     """Return process RSS memory consumption in megabytes, with fallback."""
@@ -197,6 +200,7 @@ class ThumbnailList(ctk.CTkFrame):
         self._ctk_img_cache: Dict[str, ctk.CTkImage] = {}
 
         self._batch_after_id: Optional[str] = None
+        self._thumb_submit_after_id: Optional[str] = None
         self._current_item_signature: Optional[List] = None
         self._pending_items: List[ImageItem] = []
         self._pending_selected_idx: int = 0
@@ -529,6 +533,12 @@ class ThumbnailList(ctk.CTkFrame):
         """
         Cleanly shutdown background thread pool executor on window exit.
         """
+        if self._thumb_submit_after_id is not None:
+            try:
+                self.after_cancel(self._thumb_submit_after_id)
+            except Exception:
+                pass
+            self._thumb_submit_after_id = None
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
@@ -577,27 +587,59 @@ class ThumbnailList(ctk.CTkFrame):
                 prev_active_slot["applied"]["border"] = ("#3a3a3a", 1)
         self._active_slot_ref = curr_active_slot
 
+        # If the active slot exists but its button isn't in _btn_map (e.g., mid-scroll incremental
+        # rebind), force a pool drain so the button gets registered before we try to highlight it.
+        if curr_active_slot is not None and active_path_str:
+            if active_path_str not in self._btn_map:
+                self._drain_pool_now()
+                curr_active_slot = self.row_pool.slot_for_index(active_idx)
+
         self.row_pool.set_selected_index(active_idx)
 
         # Ensure only the current active button is highlighted in blue
         curr_btn = self._btn_map.get(active_path_str) if active_path_str else None
+        # Fallback: if button not in _btn_map but slot exists, grab it directly from the slot body
+        if curr_btn is None:
+            active_slot = curr_active_slot or self.row_pool.slot_for_index(active_idx)
+            if active_slot is not None:
+                body = active_slot.get("body")
+            if body and isinstance(body, list) and body:
+                # Plain row: body[0] is the button
+                # Stacked row: body[1] is the strip, buttons are in strip's internal frame
+                if len(body) == 1:
+                    curr_btn = body[0]
+                elif len(body) >= 2:
+                    strip = body[1]
+                    inner = getattr(strip, "_scrollable_frame", None) or getattr(strip, "_frame", None)
+                    if inner is not None:
+                        children = inner.winfo_children()
+                        if children:
+                            curr_btn = children[0]
+                    else:
+                        children = strip.winfo_children()
+                        if children:
+                            curr_btn = children[0]
+
         prev_btn = getattr(self, "_active_btn_ref", None)
         if prev_btn and prev_btn is not curr_btn:
             try:
-                prev_btn.configure(fg_color="transparent")
+                prev_btn.configure(fg_color="transparent", hover_color="#4a4a4a")
             except Exception:
                 pass
             self._active_btn_ref = None
 
         if prev_path and prev_path in self._btn_map and prev_path != active_path_str:
             try:
-                self._btn_map[prev_path].configure(fg_color="transparent")
+                self._btn_map[prev_path].configure(fg_color="transparent", hover_color="#4a4a4a")
             except Exception:
                 pass
 
         if curr_btn is not None:
-            curr_btn.configure(fg_color="#1f538d")
+            curr_btn.configure(fg_color="#1f538d", hover_color="#2b6cb0")
             self._active_btn_ref = curr_btn
+            # Also register in _btn_map if it wasn't there (fallback case)
+            if active_path_str and active_path_str not in self._btn_map:
+                self._btn_map[active_path_str] = curr_btn
 
         self._prev_selected_indices = set(selected_indices)
         self._prev_active_idx = active_idx
@@ -609,13 +651,13 @@ class ThumbnailList(ctk.CTkFrame):
         Selection has to be visible in the same event-loop turn that requested it.
         But a full rebind here made every arrow-key press re-bind all ~21 slots at
         ~5 ms each - about 100 ms per press, which is what turned navigation into a
-        freeze. One rebind tick's worth is enough: when the selection moves within the
-        visible window nothing is rebound at all.
+        freeze. With the recycled pool the max resident rows is ~100, so a full
+        window rebind is fast. Use INITIAL_BIND_ROWS so slides complete in one tick.
         """
         pool = self.row_pool
-        pool.sync(budget=REBIND_ROWS_PER_TICK)
+        pool.sync(budget=INITIAL_BIND_ROWS)
         self._arm_thumb_drain()
-        self._submit_pending_thumb_requests(getattr(self, "_current_load_id", self._load_id))
+        self._schedule_thumb_submit(immediate=False)
 
     def set_selected_index(self, selected_idx: int, active_path: Optional[Path] = None):
         self.set_selected_indices({selected_idx}, selected_idx, active_path)
@@ -651,7 +693,7 @@ class ThumbnailList(ctk.CTkFrame):
             if isinstance(widget, ctk.CTkLabel):
                 text = f"{self.base_stem_for(item).upper()} [{item.format_name}] {stars}"
             elif isinstance(widget, ctk.CTkButton):
-                text = f"{item.filename}\n{stars}"
+                text = f"{item.filename}\n{stars}" if stars else item.filename
             if text is not None and (cached is None or cached[1] != text):
                 try:
                     widget.configure(text=text)
@@ -711,28 +753,140 @@ class ThumbnailList(ctk.CTkFrame):
         self.row_pool.request_sync(reason="resize")
 
     def on_rows_bound(self, pool: "RowPool", bound_slots: List[int]) -> None:
-        """The pool rebound some rows: queue their thumbnails and refresh the status.
-
-        Called once per sync, so the thumbnail requests are limited to what the
-        viewport actually shows - the whole-folder burst is what filled the decode
-        budget with rows nobody was looking at.
-        """
+        """The pool rebound some rows: refresh their status and debounce thumbnail load."""
         for slot_index in bound_slots:
             item_index = pool._slot_items[slot_index]
             if item_index is None:
                 continue
             self.update_single_item_status(item_index, pool.items[item_index])
-            self._queue_thumbs_for_item(item_index, pool.items[item_index])
         if bound_slots:
-            self._submit_pending_thumb_requests(getattr(self, "_current_load_id", self._load_id))
+            self._schedule_thumb_submit(immediate=False)
         self._update_progress_ui()
+
+    def _schedule_thumb_submit(self, immediate: bool = False) -> None:
+        """Cooldown / debounce for thumbnail loading batches.
+
+        Avoids flooding ImageLoader with dozens of intermediate batches while
+        the user drags the scrollbar or holds the Down key, while ensuring the
+        final resting position is always loaded.
+        """
+        if not self.image_loader:
+            self._batch_raw_requests = []
+            self._batch_other_requests = []
+            return
+
+        if self._thumb_submit_after_id is not None:
+            try:
+                self.after_cancel(self._thumb_submit_after_id)
+            except Exception:
+                pass
+            self._thumb_submit_after_id = None
+
+        if immediate:
+            self._drain_debounced_thumb_requests()
+        else:
+            self._thumb_submit_after_id = self.after(
+                THUMB_LOAD_COOLDOWN_MS,
+                self._drain_debounced_thumb_requests,
+            )
+
+    def _drain_debounced_thumb_requests(self) -> None:
+        """Submit pending thumbnail requests for the visible viewport rows."""
+        self._thumb_submit_after_id = None
+        if not self.image_loader or not self.row_pool.items:
+            self._batch_raw_requests = []
+            self._batch_other_requests = []
+            return
+
+        pool = self.row_pool
+        # Prioritize rows currently on screen in the viewport first
+        vis_indices = pool.viewport_item_indices()
+        all_window = pool.visible_item_indices()
+        seen = set(vis_indices)
+        target_indices = vis_indices + [i for i in all_window if i not in seen]
+
+        self._batch_raw_requests = []
+        self._batch_other_requests = []
+        for idx in target_indices:
+            if idx < len(pool.items):
+                self._queue_thumbs_for_item(idx, pool.items[idx])
+
+        if self._batch_raw_requests or self._batch_other_requests:
+            self._submit_pending_thumb_requests(getattr(self, "_current_load_id", self._load_id))
+        self._arm_thumb_drain()
+
+    def _submit_thumbs_for_viewport(self) -> None:
+        """Force immediate thumbnail load for current viewport (bypasses debounce)."""
+        if not self.image_loader or not self.row_pool.items:
+            return
+        pool = self.row_pool
+        vis_indices = pool.viewport_item_indices()
+        all_window = pool.visible_item_indices()
+        seen = set(vis_indices)
+        target_indices = vis_indices + [i for i in all_window if i not in seen]
+
+        self._batch_raw_requests = []
+        self._batch_other_requests = []
+        for idx in target_indices:
+            if idx < len(pool.items):
+                self._queue_thumbs_for_item(idx, pool.items[idx])
+
+        if self._batch_raw_requests or self._batch_other_requests:
+            self._submit_pending_thumb_requests(getattr(self, "_current_load_id", self._load_id))
+        self._arm_thumb_drain()
+
+    def _rebuild_btn_map_for_visible(self) -> None:
+        """Rebuild _btn_map for all currently visible slots (fixes stale map after rebinds)."""
+        pool = self.row_pool
+        for idx in pool.visible_item_indices():
+            slot = pool.slot_for_index(idx)
+            if slot is None:
+                continue
+            item = pool.items[idx] if idx < len(pool.items) else None
+            if item is None:
+                continue
+            body = slot.get("body")
+            if not body or not isinstance(body, list):
+                continue
+            # Plain row
+            if len(body) == 1:
+                btn = body[0]
+                path_str = str(item.path)
+                if path_str and btn:
+                    self._btn_map[path_str] = btn
+            # Stacked row
+            elif len(body) >= 2:
+                strip = body[1]
+                inner = getattr(strip, "_scrollable_frame", None) or getattr(strip, "_frame", None)
+                if inner is not None:
+                    for widget in inner.winfo_children():
+                        if hasattr(widget, "cget"):
+                            try:
+                                text = widget.cget("text")
+                                for p in item.stacked_paths:
+                                    if p.name == text:
+                                        self._btn_map[str(p)] = widget
+                                        break
+                            except Exception:
+                                pass
+                else:
+                    for widget in strip.winfo_children():
+                        if hasattr(widget, "cget"):
+                            try:
+                                text = widget.cget("text")
+                                for p in item.stacked_paths:
+                                    if p.name == text:
+                                        self._btn_map[str(p)] = widget
+                                        break
+                            except Exception:
+                                pass
 
     def _queue_thumbs_for_item(self, item_index: int, item: ImageItem) -> None:
         if not self.image_loader:
             return
         white_balance = self._pending_white_balance
         load_id = getattr(self, "_current_load_id", self._load_id)
-        if item.is_stacked and len(item.stacked_paths) >= 2:
+        if not getattr(item, "is_placeholder", False) and item.is_stacked and len(item.stacked_paths) >= 2:
             targets = [(p, (90, 90)) for p in item.stacked_paths]
         else:
             targets = [(item.path, (80, 80))]
@@ -749,7 +903,7 @@ class ThumbnailList(ctk.CTkFrame):
     def _count_thumb_requests(self, items: List[ImageItem]) -> int:
         count = 0
         for item in items:
-            if item.is_stacked and len(item.stacked_paths) >= 2:
+            if not getattr(item, "is_placeholder", False) and item.is_stacked and len(item.stacked_paths) >= 2:
                 count += len(item.stacked_paths)
             else:
                 count += 1
@@ -758,7 +912,7 @@ class ThumbnailList(ctk.CTkFrame):
     def _count_cached_thumb_requests(self, items: List[ImageItem]) -> int:
         count = 0
         for item in items:
-            if item.is_stacked and len(item.stacked_paths) >= 2:
+            if not getattr(item, "is_placeholder", False) and item.is_stacked and len(item.stacked_paths) >= 2:
                 for sub_p in item.stacked_paths:
                     if str(sub_p) in self._ctk_img_cache:
                         count += 1
@@ -802,7 +956,12 @@ class ThumbnailList(ctk.CTkFrame):
         the existing buttons.
         """
         return [
-            (str(item.path), tuple(str(p) for p in item.stacked_paths), item.filename)
+            (
+                str(item.path),
+                tuple(str(p) for p in item.stacked_paths),
+                item.filename,
+                bool(getattr(item, "is_placeholder", False)),
+            )
             for item in items
         ]
 
@@ -848,6 +1007,7 @@ class ThumbnailList(ctk.CTkFrame):
         # the caller (a tab switch) paints the selection in the same turn.
         self.row_pool.sync(budget=INITIAL_BIND_ROWS)
         self._arm_thumb_drain()
+        self._schedule_thumb_submit(immediate=True)
 
         if soft:
             # Same rows as last time. Only the visible ones have widgets, so this is a
@@ -869,6 +1029,14 @@ class ThumbnailList(ctk.CTkFrame):
         Destroying the pool itself would be a rebuild, which is exactly the cost the
         pool exists to avoid; only the contents change between item sets.
         """
+        if self._thumb_submit_after_id is not None:
+            try:
+                self.after_cancel(self._thumb_submit_after_id)
+            except Exception:
+                pass
+            self._thumb_submit_after_id = None
+        self._batch_raw_requests = []
+        self._batch_other_requests = []
         self._cancel_row_chain()
         self.row_pool.shutdown()
         self._btn_map.clear()
@@ -886,11 +1054,11 @@ class ThumbnailList(ctk.CTkFrame):
         self._loaded_thumbs = 0
 
         pool = self.row_pool
-        for slot_index in range(len(pool._slots)):
-            pool._release_slot(slot_index)
+        pool._release_all_slots()
         pool._first_visible = 0
         pool._last_visible = -1
         pool._last_scroll_offset = -1
+        pool._forced_offset = None
         pool._update_window_position(0)
 
     def _submit_pending_thumb_requests(self, load_id: int) -> None:
@@ -949,6 +1117,7 @@ class ThumbnailList(ctk.CTkFrame):
         """
         pool = self.row_pool
         return (pool._rebind_after_id is None
+                and self._thumb_submit_after_id is None
                 and not self._inflight_thumbs
                 and not self._thumb_result_queue)
 
@@ -1040,14 +1209,11 @@ class ThumbnailList(ctk.CTkFrame):
         applied = 0
         while self._thumb_result_queue:
             path_str, pil_thumb, load_id = self._thumb_result_queue.popleft()
-            # Paint whenever a row for this path still exists: thumbnails are keyed by
-            # path, so a decode started for the previous tab is still valid here.
-            self._apply_thumb_image(path_str, pil_thumb)
             with self._inflight_lock:
                 self._inflight_thumbs.pop(path_str, None)
             if current_load_id is not None and load_id != current_load_id:
                 continue
-            # Count only the current load, so progress still reaches 100%.
+            self._apply_thumb_image(path_str, pil_thumb)
             applied += 1
 
         if applied:
@@ -1056,12 +1222,12 @@ class ThumbnailList(ctk.CTkFrame):
             self._update_pool_stats()
 
     def _apply_thumb_image(self, path_str: str, pil_thumb: Image.Image) -> bool:
-        btn = self._btn_map.get(path_str)
-        if btn is None:
-            return False
         w, h = pil_thumb.size
         ctk_img = ctk.CTkImage(light_image=pil_thumb, dark_image=pil_thumb, size=(w, h))
         self._ctk_img_cache[path_str] = ctk_img
+        btn = self._btn_map.get(path_str)
+        if btn is None:
+            return False
         btn.configure(image=ctk_img)
         return True
 
@@ -1087,6 +1253,12 @@ class ThumbnailList(ctk.CTkFrame):
             except Exception:
                 pass
             self._thumb_result_after_id = None
+        if getattr(self, "_thumb_submit_after_id", None) is not None:
+            try:
+                self.after_cancel(self._thumb_submit_after_id)
+            except Exception:
+                pass
+            self._thumb_submit_after_id = None
         if hasattr(self, "_executor"):
             self._executor.shutdown(wait=False, cancel_futures=True)
         self._reset_load_timing()
