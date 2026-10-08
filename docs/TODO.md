@@ -15,7 +15,7 @@ Make corrections optionally, if required.
   - [x] When an operation like Delete/Move etc made the thumbnail list empty, move to All filter automatically
 - [ ] UI Glitches to fix:
   - [ ] Reject some photos, Go to Rejected filter, Select all, delete all selected, come back to All filter -> all thumbnails show an yellow glitchy outline
-- [ ] Add a search by filename, to jump to a file in the thumbnails list. it should suggest continuously as typed. Add it right on top of thumbnail list. Ctrl+F to focus on it.
+- [x] Add a search by filename, to jump to a file in the thumbnails list. it should suggest continuously as typed. Add it right on top of thumbnail list. Ctrl+F to focus on it.
 - [ ] Scrolling on thumbnails with large data: glitch, freeze & performance
   - [x] some times thumbnails show blanks, and selecting a thumbnail shows the image in preview but doesnt highlight with blue in thumbnails list
   - [ ] when scrolling fast, text from new thumbnails overlap with old ones, making it look glitchy (last try on this reduced the glitch and increased freeze. need to accept completely removed glitch/freeze)

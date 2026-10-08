@@ -266,8 +266,58 @@ class ThumbnailList(ctk.CTkFrame):
         )
         self.lbl_selection_count.pack(side="right", padx=4)
 
+        # Search Panel (Top of Thumbnail List)
+        self.search_panel = ctk.CTkFrame(self, fg_color="transparent")
+        self.search_panel.pack(side="top", fill="x", padx=4, pady=(2, 2))
+
+        self.search_frame = ctk.CTkFrame(self.search_panel, fg_color="transparent")
+        self.search_frame.pack(side="top", fill="x")
+
+        self.search_var = tk.StringVar(value="")
+        self.search_entry = ctk.CTkEntry(
+            self.search_frame,
+            textvariable=self.search_var,
+            placeholder_text="🔍 Search filename... (Ctrl+F)",
+            height=28,
+            font=ctk.CTkFont(size=11),
+        )
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, 2))
+
+        self.btn_clear_search = ctk.CTkButton(
+            self.search_frame,
+            text="✕",
+            width=24,
+            height=24,
+            fg_color="transparent",
+            hover_color="#444444",
+            text_color="#999999",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self.clear_search,
+        )
+        self.btn_clear_search.pack(side="right")
+
+        # Suggestions Container (continuous suggestions as typed)
+        self.suggestion_container = ctk.CTkFrame(
+            self.search_panel,
+            fg_color="#202225",
+            border_color="#3d4043",
+            border_width=1,
+            corner_radius=4,
+        )
+        self._suggestion_items: List[Tuple[int, ImageItem]] = []
+        self._suggestion_buttons: List[ctk.CTkButton] = []
+        self._highlighted_suggestion_idx: int = -1
+
+        self.search_var.trace_add("write", self._on_search_text_changed)
+        self.search_entry.bind("<Down>", self._on_search_down)
+        self.search_entry.bind("<Up>", self._on_search_up)
+        self.search_entry.bind("<Return>", self._on_search_return)
+        self.search_entry.bind("<KP_Enter>", self._on_search_return)
+        self.search_entry.bind("<Escape>", self._on_search_escape)
+
         self.scroll_frame = ctk.CTkScrollableFrame(self, label_text="")
         self.scroll_frame.pack(side="top", fill="both", expand=True, padx=2, pady=2)
+        self.scroll_frame.bind("<Button-1>", lambda e: self._hide_suggestions(), add="+")
 
         # Recycled rows bound to the visible window, rather than one widget set per
         # photo. See culler/gui/row_pool.py for why the old layout was quadratic.
@@ -502,6 +552,187 @@ class ThumbnailList(ctk.CTkFrame):
     def _handle_select_none(self):
         if self.on_select_none:
             self.on_select_none()
+
+    # -------------------------------------------------------------------------
+    # Filename Search & Continuous Suggestions
+    # -------------------------------------------------------------------------
+
+    def _on_search_text_changed(self, *args):
+        query = self.search_var.get().strip()
+        if not query:
+            self._hide_suggestions()
+            return
+        self._update_suggestions(query)
+
+    def _update_suggestions(self, query: str):
+        q = query.lower()
+        items = self._pending_items if self._pending_items else self.row_pool.items
+        if not items:
+            self._hide_suggestions()
+            return
+
+        matches: List[Tuple[int, ImageItem]] = []
+        for idx, item in enumerate(items):
+            fn = item.filename.lower()
+            if q in fn:
+                matches.append((idx, item))
+            elif getattr(item, "is_stacked", False) and any(q in p.name.lower() for p in item.stacked_paths):
+                matches.append((idx, item))
+
+        if not matches:
+            self._render_no_matches(query)
+            return
+
+        def rank_key(pair: Tuple[int, ImageItem]):
+            idx, item = pair
+            fn = item.filename.lower()
+            stem = item.path.stem.lower()
+            if fn.startswith(q) or stem.startswith(q):
+                return (0, idx)
+            return (1, idx)
+
+        matches.sort(key=rank_key)
+        self._suggestion_items = matches[:8]
+        self._highlighted_suggestion_idx = 0
+        self._render_suggestions()
+
+    def _render_no_matches(self, query: str):
+        self._suggestion_items = []
+        self._highlighted_suggestion_idx = -1
+        for w in self.suggestion_container.winfo_children():
+            w.destroy()
+        self._suggestion_buttons.clear()
+
+        lbl = ctk.CTkLabel(
+            self.suggestion_container,
+            text=f"No matches for '{query}'",
+            font=ctk.CTkFont(size=10, slant="italic"),
+            text_color="#888888",
+            height=24,
+        )
+        lbl.pack(fill="x", padx=6, pady=3)
+
+        if not self.suggestion_container.winfo_ismapped():
+            self.suggestion_container.pack(side="top", fill="x", pady=(2, 0))
+
+    def _render_suggestions(self):
+        for w in self.suggestion_container.winfo_children():
+            w.destroy()
+        self._suggestion_buttons.clear()
+
+        for s_idx, (item_idx, item) in enumerate(self._suggestion_items):
+            flag_icon = ""
+            if item.flag == FlagState.PICK:
+                flag_icon = " ✓"
+            elif item.flag == FlagState.REJECT:
+                flag_icon = " ✗"
+            stars = f" {'★' * item.rating}" if item.rating > 0 else ""
+            label_text = f"#{item_idx + 1}  {item.filename}{flag_icon}{stars}"
+
+            btn = ctk.CTkButton(
+                self.suggestion_container,
+                text=label_text,
+                anchor="w",
+                height=24,
+                fg_color="#1f538d" if s_idx == self._highlighted_suggestion_idx else "transparent",
+                hover_color="#2b3b4c",
+                text_color="#ffffff",
+                font=ctk.CTkFont(size=11),
+                command=lambda i=item_idx: self.jump_to_index(i),
+            )
+            btn.pack(fill="x", padx=2, pady=1)
+            btn.bind("<Enter>", lambda e, s=s_idx: self._on_suggestion_hover(s))
+            self._suggestion_buttons.append(btn)
+
+        if not self.suggestion_container.winfo_ismapped():
+            self.suggestion_container.pack(side="top", fill="x", pady=(2, 0))
+
+    def _on_suggestion_hover(self, s_idx: int):
+        self._highlighted_suggestion_idx = s_idx
+        self._update_suggestion_highlight()
+
+    def _update_suggestion_highlight(self):
+        for s_idx, btn in enumerate(self._suggestion_buttons):
+            if s_idx == self._highlighted_suggestion_idx:
+                btn.configure(fg_color="#1f538d")
+            else:
+                btn.configure(fg_color="transparent")
+
+    def _on_search_down(self, event=None):
+        if not self._suggestion_items:
+            return "break"
+        self._highlighted_suggestion_idx = (self._highlighted_suggestion_idx + 1) % len(self._suggestion_items)
+        self._update_suggestion_highlight()
+        return "break"
+
+    def _on_search_up(self, event=None):
+        if not self._suggestion_items:
+            return "break"
+        self._highlighted_suggestion_idx = (self._highlighted_suggestion_idx - 1) % len(self._suggestion_items)
+        self._update_suggestion_highlight()
+        return "break"
+
+    def _on_search_return(self, event=None):
+        if self._suggestion_items:
+            target_s_idx = (
+                self._highlighted_suggestion_idx
+                if 0 <= self._highlighted_suggestion_idx < len(self._suggestion_items)
+                else 0
+            )
+            item_idx, _ = self._suggestion_items[target_s_idx]
+            self.jump_to_index(item_idx)
+        return "break"
+
+    def _on_search_escape(self, event=None):
+        self._hide_suggestions()
+        try:
+            self.scroll_frame.focus_set()
+        except Exception:
+            pass
+        return "break"
+
+    def _hide_suggestions(self):
+        self._suggestion_items = []
+        self._highlighted_suggestion_idx = -1
+        for w in self.suggestion_container.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._suggestion_buttons.clear()
+        if self.suggestion_container.winfo_ismapped():
+            self.suggestion_container.pack_forget()
+
+    def jump_to_index(self, idx: int):
+        """Select and jump to the image item at index idx."""
+        items = self._pending_items if self._pending_items else self.row_pool.items
+        if not (0 <= idx < len(items)):
+            return
+        item = items[idx]
+        self._hide_suggestions()
+        if self.on_select_image:
+            self.on_select_image(idx, item.path, is_continuous=False, is_ctrl=False, is_shift=False, from_click=False)
+        else:
+            self.set_selected_index(idx, item.path)
+
+    def focus_search(self):
+        """Focus the search input and select existing text."""
+        try:
+            self.search_entry.focus_set()
+            self.search_entry.select_range(0, "end")
+            self.search_entry.icursor("end")
+        except Exception:
+            pass
+
+    def clear_search(self, keep_focus: bool = True):
+        """Clear search query and hide suggestions."""
+        self.search_var.set("")
+        self._hide_suggestions()
+        if keep_focus:
+            try:
+                self.search_entry.focus_set()
+            except Exception:
+                pass
 
     def _handle_chk_toggled(self, idx: int):
         self._on_btn_clicked(idx, None)
@@ -987,6 +1218,7 @@ class ThumbnailList(ctk.CTkFrame):
         soft = self._current_item_signature == new_signature
 
         if not soft:
+            self.clear_search(keep_focus=False)
             self._reset_rows()
 
         self._current_item_signature = new_signature

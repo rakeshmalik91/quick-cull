@@ -1071,23 +1071,50 @@ class ImageCullerApp(ctk.CTk):
 
         self._setup_drag_drop()
 
+    def _is_entry_focused(self) -> bool:
+        """Check if focus is currently in an entry/textbox widget to prevent shortcut collisions."""
+        try:
+            w = self.focus_get()
+            if w is None:
+                return False
+            if isinstance(w, (tk.Entry, tk.Text)):
+                return True
+            if isinstance(w, (ctk.CTkEntry, ctk.CTkTextbox)):
+                return True
+            w_cls = w.winfo_class()
+            if w_cls in ("Entry", "Text", "TEntry"):
+                return True
+            if getattr(w, "_entry", None) is not None:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _on_focus_search(self):
+        """Focus the thumbnail filename search bar, unhiding the thumbnail panel if needed."""
+        if not getattr(self, "_thumbnail_panel_visible", True):
+            self.toggle_thumbnail_panel(True)
+        if hasattr(self, "thumb_list"):
+            self.thumb_list.focus_search()
+        return "break"
+
     def _bind_events(self):
         # Navigation & Multi-Selection Bindings
         # Single Step (+/- 1)
-        self.bind("<Right>", lambda e: self._navigate(1, is_shift=False))
-        self.bind("<Left>", lambda e: self._navigate(-1, is_shift=False))
-        self.bind("<Down>", lambda e: self._navigate(1, is_shift=False))
-        self.bind("<Up>", lambda e: self._navigate(-1, is_shift=False))
+        self.bind("<Right>", lambda e: None if self._is_entry_focused() else self._navigate(1, is_shift=False))
+        self.bind("<Left>", lambda e: None if self._is_entry_focused() else self._navigate(-1, is_shift=False))
+        self.bind("<Down>", lambda e: None if self._is_entry_focused() else self._navigate(1, is_shift=False))
+        self.bind("<Up>", lambda e: None if self._is_entry_focused() else self._navigate(-1, is_shift=False))
 
         # 100% Full Resolution Shortcut
-        self.bind("a", lambda e: self._on_load_100_percent())
-        self.bind("A", lambda e: self._on_load_100_percent())
+        self.bind("a", lambda e: None if self._is_entry_focused() else self._on_load_100_percent())
+        self.bind("A", lambda e: None if self._is_entry_focused() else self._on_load_100_percent())
 
         # Shift + Navigation (Multi-select range +/- 1)
-        self.bind("<Shift-Right>", lambda e: self._navigate(1, is_shift=True))
-        self.bind("<Shift-Left>", lambda e: self._navigate(-1, is_shift=True))
-        self.bind("<Shift-Down>", lambda e: self._navigate(1, is_shift=True))
-        self.bind("<Shift-Up>", lambda e: self._navigate(-1, is_shift=True))
+        self.bind("<Shift-Right>", lambda e: None if self._is_entry_focused() else self._navigate(1, is_shift=True))
+        self.bind("<Shift-Left>", lambda e: None if self._is_entry_focused() else self._navigate(-1, is_shift=True))
+        self.bind("<Shift-Down>", lambda e: None if self._is_entry_focused() else self._navigate(1, is_shift=True))
+        self.bind("<Shift-Up>", lambda e: None if self._is_entry_focused() else self._navigate(-1, is_shift=True))
 
         # Ctrl + Navigation (+/- 10 photos)
         self.bind("<Control-Right>", lambda e: self._navigate(10, is_shift=False))
@@ -1104,47 +1131,51 @@ class ImageCullerApp(ctk.CTk):
         self.bind("<Shift-Control-Up>", lambda e: self._navigate(-10, is_shift=True))
 
         # Home & End Jump
-        self.bind("<Home>", lambda e: self._navigate_first(is_shift=False))
-        self.bind("<End>", lambda e: self._navigate_last(is_shift=False))
-        self.bind("<Shift-Home>", lambda e: self._navigate_first(is_shift=True))
-        self.bind("<Shift-End>", lambda e: self._navigate_last(is_shift=True))
+        self.bind("<Home>", lambda e: None if self._is_entry_focused() else self._navigate_first(is_shift=False))
+        self.bind("<End>", lambda e: None if self._is_entry_focused() else self._navigate_last(is_shift=False))
+        self.bind("<Shift-Home>", lambda e: None if self._is_entry_focused() else self._navigate_first(is_shift=True))
+        self.bind("<Shift-End>", lambda e: None if self._is_entry_focused() else self._navigate_last(is_shift=True))
 
         # Trash / Delete Shortcuts
-        self.bind("<Delete>", lambda e: self._on_delete_selected_to_trash())
-        self.bind("d", lambda e: self._on_d_key_pressed())
-        self.bind("D", lambda e: self._on_delete_all_rejected_to_trash() if (getattr(e, "state", 0) & 0x0001) else self._on_d_key_pressed())
-        self.bind("<Shift-Key-D>", lambda e: self._on_delete_all_rejected_to_trash())
-        self.bind("<Shift-Key-d>", lambda e: self._on_delete_all_rejected_to_trash())
+        self.bind("<Delete>", lambda e: None if self._is_entry_focused() else self._on_delete_selected_to_trash())
+        self.bind("d", lambda e: None if self._is_entry_focused() else self._on_d_key_pressed())
+        self.bind("D", lambda e: None if self._is_entry_focused() else (self._on_delete_all_rejected_to_trash() if (getattr(e, "state", 0) & 0x0001) else self._on_d_key_pressed()))
+        self.bind("<Shift-Key-D>", lambda e: None if self._is_entry_focused() else self._on_delete_all_rejected_to_trash())
+        self.bind("<Shift-Key-d>", lambda e: None if self._is_entry_focused() else self._on_delete_all_rejected_to_trash())
 
         # Culling Flags & Ratings
-        self.bind("p", lambda e: self._set_current_flag(FlagState.PICK))
-        self.bind("P", lambda e: self._on_unpick_current() if (getattr(e, "state", 0) & 0x0001) else self._set_current_flag(FlagState.PICK))
-        self.bind("<Shift-Key-P>", lambda e: self._on_unpick_current())
-        self.bind("<Shift-Key-p>", lambda e: self._on_unpick_current())
+        self.bind("p", lambda e: None if self._is_entry_focused() else self._set_current_flag(FlagState.PICK))
+        self.bind("P", lambda e: None if self._is_entry_focused() else (self._on_unpick_current() if (getattr(e, "state", 0) & 0x0001) else self._set_current_flag(FlagState.PICK)))
+        self.bind("<Shift-Key-P>", lambda e: None if self._is_entry_focused() else self._on_unpick_current())
+        self.bind("<Shift-Key-p>", lambda e: None if self._is_entry_focused() else self._on_unpick_current())
 
-        self.bind("x", lambda e: self._set_current_flag(FlagState.REJECT))
-        self.bind("X", lambda e: self._on_unreject_current() if (getattr(e, "state", 0) & 0x0001) else self._set_current_flag(FlagState.REJECT))
-        self.bind("<Shift-Key-X>", lambda e: self._on_unreject_current())
-        self.bind("<Shift-Key-x>", lambda e: self._on_unreject_current())
+        self.bind("x", lambda e: None if self._is_entry_focused() else self._set_current_flag(FlagState.REJECT))
+        self.bind("X", lambda e: None if self._is_entry_focused() else (self._on_unreject_current() if (getattr(e, "state", 0) & 0x0001) else self._set_current_flag(FlagState.REJECT)))
+        self.bind("<Shift-Key-X>", lambda e: None if self._is_entry_focused() else self._on_unreject_current())
+        self.bind("<Shift-Key-x>", lambda e: None if self._is_entry_focused() else self._on_unreject_current())
 
-        self.bind("u", lambda e: self._set_current_flag(FlagState.UNFLAGGED))
-        self.bind("U", lambda e: self._set_current_flag(FlagState.UNFLAGGED))
+        self.bind("u", lambda e: None if self._is_entry_focused() else self._set_current_flag(FlagState.UNFLAGGED))
+        self.bind("U", lambda e: None if self._is_entry_focused() else self._set_current_flag(FlagState.UNFLAGGED))
 
-        self.bind("c", lambda e: self._on_trigger_crop())
-        self.bind("C", lambda e: self._on_trigger_crop())
+        self.bind("c", lambda e: None if self._is_entry_focused() else self._on_trigger_crop())
+        self.bind("C", lambda e: None if self._is_entry_focused() else self._on_trigger_crop())
         self.bind("<Control-c>", lambda e: self._on_copy_image_to_clipboard())
         self.bind("<Control-C>", lambda e: self._on_copy_image_to_clipboard())
         self.bind("<Control-s>", lambda e: self._on_save_as())
         self.bind("<Control-S>", lambda e: self._on_save_as())
-        self.bind("<Return>", lambda e: self._on_return_pressed())
-        self.bind("<KP_Enter>", lambda e: self._on_return_pressed())
-        self.bind("<Escape>", lambda e: self._on_escape_pressed())
+        self.bind("<Return>", lambda e: None if self._is_entry_focused() else self._on_return_pressed())
+        self.bind("<KP_Enter>", lambda e: None if self._is_entry_focused() else self._on_return_pressed())
+        self.bind("<Escape>", lambda e: None if self._is_entry_focused() else self._on_escape_pressed())
 
-        self.bind("b", lambda e: self._on_trigger_annotate())
-        self.bind("B", lambda e: self._on_trigger_annotate())
+        self.bind("b", lambda e: None if self._is_entry_focused() else self._on_trigger_annotate())
+        self.bind("B", lambda e: None if self._is_entry_focused() else self._on_trigger_annotate())
 
         for star in range(6):
-            self.bind(str(star), lambda e, s=star: self._set_current_rating(s))
+            self.bind(str(star), lambda e, s=star: None if self._is_entry_focused() else self._set_current_rating(s))
+
+        # Filename Search Focus (Ctrl+F)
+        self.bind("<Control-f>", lambda e: self._on_focus_search())
+        self.bind("<Control-F>", lambda e: self._on_focus_search())
 
         # Panel & Menubar Toggles & Tab Navigation
         self.bind("<F8>", lambda e: self.toggle_thumbnail_panel())
@@ -2812,6 +2843,8 @@ class ImageCullerApp(ctk.CTk):
             log_error("Failed to save UI state", exc_info=True)
 
     def _on_tab_key(self, event=None):
+        if self._is_entry_focused():
+            return None
         self.toggle_both_panels()
         return "break"
 
@@ -2836,6 +2869,8 @@ class ImageCullerApp(ctk.CTk):
 
         # Edit Menu
         edit_menu = tk.Menu(self.menubar, tearoff=0)
+        edit_menu.add_command(label="Find / Search Filename...", command=self._on_focus_search, accelerator="Ctrl+F")
+        edit_menu.add_separator()
         edit_menu.add_command(label="Select All", command=self._select_all, accelerator="Ctrl+A")
         edit_menu.add_command(label="Select None", command=self._select_none, accelerator="Ctrl+D")
         edit_menu.add_command(label="Copy Image to Clipboard", command=self._on_copy_image_to_clipboard, accelerator="Ctrl+C")
