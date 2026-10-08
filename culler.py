@@ -44,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     move_r_parser.add_argument("path", help="Path to directory or image file")
     move_r_parser.add_argument("--target", default="_REJECTED", help="Subfolder name for rejected images")
 
+    # Trash / Delete Rejected command
+    trash_r_parser = subparsers.add_parser("trash-rejected", help="Move all rejected (Flag = REJECT) images to OS Recycle Bin / Trash")
+    trash_r_parser.add_argument("path", help="Path to directory or image file")
+    trash_r_parser.add_argument("-f", "--format", default=None, help="Optional format filter (e.g. JPG, RAW)")
+
     # Auto Cull Blurry command
     auto_parser = subparsers.add_parser("auto-blur", help="Automatically flag bottom %% blurriest images as REJECT")
     auto_parser.add_argument("path", help="Path to directory or image file")
@@ -156,7 +161,7 @@ def cmd_cull(session: CullingSession, args):
 
     console.print(Panel("[bold green]Interactive Terminal Image Culler[/bold green]\n"
                         "Controls:\n"
-                        "  [bold green]p[/bold green] = Pick | [bold red]x[/bold red] = Reject | [bold grey]u[/bold grey] = Unflag\n"
+                        "  [bold green]p[/bold green] = Pick | [bold green]P[/bold green] = UnPick | [bold red]x[/bold red] = Reject | [bold red]X[/bold red] = UnReject | [bold grey]u[/bold grey] = Unflag\n"
                         "  [bold yellow]1-5[/bold yellow] = Set Stars | [bold blue]n[/bold blue] = Next | [bold blue]b[/bold blue] = Back | [bold magenta]q[/bold magenta] = Quit"))
 
     idx = start_idx
@@ -179,7 +184,7 @@ def cmd_cull(session: CullingSession, args):
 
         action = Prompt.ask(
             "Action",
-            choices=["p", "x", "u", "1", "2", "3", "4", "5", "n", "b", "q"],
+            choices=["p", "P", "x", "X", "u", "1", "2", "3", "4", "5", "n", "b", "q"],
             default="n"
         )
 
@@ -187,10 +192,22 @@ def cmd_cull(session: CullingSession, args):
             item.flag = FlagState.PICK
             console.print("[green]-> Flagged as PICK[/green]")
             idx += 1
+        elif action == "P":
+            if item.flag == FlagState.PICK:
+                item.flag = FlagState.UNFLAGGED
+                console.print("[grey]-> Unpicked (Flag reset to UNFLAGGED)[/grey]")
+            else:
+                console.print("[grey]-> Item was not PICK[/grey]")
         elif action == "x":
             item.flag = FlagState.REJECT
             console.print("[red]-> Flagged as REJECT[/red]")
             idx += 1
+        elif action == "X":
+            if item.flag == FlagState.REJECT:
+                item.flag = FlagState.UNFLAGGED
+                console.print("[grey]-> Unrejected (Flag reset to UNFLAGGED)[/grey]")
+            else:
+                console.print("[grey]-> Item was not REJECT[/grey]")
         elif action == "u":
             item.flag = FlagState.UNFLAGGED
             console.print("[grey]-> Unflagged[/grey]")
@@ -276,6 +293,13 @@ def cmd_move_rejected(session: CullingSession, args):
     console.print(f"[bold red]Moved {len(moved)} Rejected images to subfolder '{args.target}'.[/bold red]")
 
 
+def cmd_trash_rejected(session: CullingSession, args):
+    folder_path, _ = resolve_input_path(args.path)
+    session.scan_directory(folder_path)
+    moved = session.trash_rejected_items(format_filter=args.format)
+    console.print(f"[bold red]Moved {moved} Rejected file(s) to Recycle Bin / Trash.[/bold red]")
+
+
 def cmd_export(session: CullingSession, args):
     folder_path, _ = resolve_input_path(args.path)
     session.scan_directory(folder_path)
@@ -332,6 +356,8 @@ def main():
         cmd_move_picked(session, args)
     elif args.command == "move-rejected":
         cmd_move_rejected(session, args)
+    elif args.command == "trash-rejected":
+        cmd_trash_rejected(session, args)
     elif args.command == "export":
         cmd_export(session, args)
     elif args.command == "sync-exif":

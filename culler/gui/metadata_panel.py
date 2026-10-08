@@ -48,6 +48,7 @@ class MetadataPanel(ctk.CTkFrame):
         on_convert_jpg: Optional[Callable[[], None]] = None,
         on_move_picked: Optional[Callable[[], None]] = None,
         on_move_rejected: Optional[Callable[[], None]] = None,
+        on_trash_rejected: Optional[Callable[[], None]] = None,
         on_config_output_folders: Optional[Callable[[], None]] = None,
         initial_picked_folder: str = "_SELECTED",
         initial_rejected_folder: str = "_REJECTED",
@@ -70,6 +71,7 @@ class MetadataPanel(ctk.CTkFrame):
         self.on_convert_jpg = on_convert_jpg
         self.on_move_picked = on_move_picked
         self.on_move_rejected = on_move_rejected
+        self.on_trash_rejected = on_trash_rejected
         self.on_config_output_folders = on_config_output_folders
         self.on_bag_order_changed = on_bag_order_changed
 
@@ -229,7 +231,7 @@ class MetadataPanel(ctk.CTkFrame):
             command=lambda: self.on_set_flag(FlagState.PICK)
         )
         self.btn_pick.pack(fill="x", pady=2)
-        ToolTip(self.btn_pick, "Shortcut: P (Flag photo as PICK)")
+        ToolTip(self.btn_pick, "Shortcut: P (Pick) | Shift+P (UnPick)")
 
         self.btn_reject = ctk.CTkButton(
             self.action_box,
@@ -240,7 +242,7 @@ class MetadataPanel(ctk.CTkFrame):
             command=lambda: self.on_set_flag(FlagState.REJECT)
         )
         self.btn_reject.pack(fill="x", pady=2)
-        ToolTip(self.btn_reject, "Shortcut: X (Flag photo as REJECT)")
+        ToolTip(self.btn_reject, "Shortcut: X (Reject) | Shift+X (UnReject)")
 
         self.btn_unflag = ctk.CTkButton(
             self.action_box,
@@ -384,6 +386,20 @@ class MetadataPanel(ctk.CTkFrame):
         self.btn_open_rejected.pack(side="left", padx=(2, 0))
         ToolTip(self.btn_open_rejected, "Open rejected folder in file explorer")
 
+        f_trash_reject_row = ctk.CTkFrame(self.move_box, fg_color="transparent")
+        f_trash_reject_row.pack(fill="x", pady=2)
+
+        self.btn_trash_rejected = ctk.CTkButton(
+            f_trash_reject_row,
+            text="🗑️ Delete (Move to trash) All Rejected",
+            fg_color="#5c0612",
+            hover_color="#d90429",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._handle_trash_rejected
+        )
+        self.btn_trash_rejected.pack(side="left", fill="x", expand=True)
+        ToolTip(self.btn_trash_rejected, "Shortcut: Shift+D (Move all rejected photos to Recycle Bin / Trash)")
+
         if self.on_crop:
             self.btn_crop = ctk.CTkButton(
                 self.move_box,
@@ -505,6 +521,10 @@ class MetadataPanel(ctk.CTkFrame):
     def _handle_move_rejected(self):
         if self.on_move_rejected:
             self.on_move_rejected()
+
+    def _handle_trash_rejected(self):
+        if self.on_trash_rejected:
+            self.on_trash_rejected()
 
     def _handle_config_folders(self):
         if self.on_config_output_folders:

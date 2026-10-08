@@ -1527,6 +1527,13 @@ class CullingSession:
     def delete_rejected_items(self, trash_dir_name: str = "_Trash") -> List[Path]:
         return self.move_items_by_flag(FlagState.REJECT, trash_dir_name)
 
+    def trash_rejected_items(self, format_filter: Optional[str] = None) -> int:
+        """
+        Safely move all items flagged as REJECT to the OS Recycle Bin / Trash using send2trash.
+        """
+        rejected_items = [item for item in self.items if item.flag == FlagState.REJECT]
+        return self.move_items_to_trash(rejected_items, format_filter=format_filter)
+
     def sync_exif_ratings(self) -> int:
         """Write star ratings back into the files, one ExifTool call per rating value.
 

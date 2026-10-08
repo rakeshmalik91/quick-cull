@@ -1009,6 +1009,7 @@ class ImageCullerApp(ctk.CTk):
             on_convert_jpg=self._on_convert_jpg,
             on_move_picked=self._on_move_picked,
             on_move_rejected=self._on_move_rejected,
+            on_trash_rejected=self._on_delete_all_rejected_to_trash,
             on_config_output_folders=self._on_config_output_folders,
             initial_picked_folder=init_picked_folder,
             initial_rejected_folder=init_rejected_folder,
@@ -1091,13 +1092,21 @@ class ImageCullerApp(ctk.CTk):
         # Trash / Delete Shortcuts
         self.bind("<Delete>", lambda e: self._on_delete_selected_to_trash())
         self.bind("d", lambda e: self._on_d_key_pressed())
-        self.bind("D", lambda e: self._on_d_key_pressed())
+        self.bind("D", lambda e: self._on_delete_all_rejected_to_trash() if (getattr(e, "state", 0) & 0x0001) else self._on_d_key_pressed())
+        self.bind("<Shift-Key-D>", lambda e: self._on_delete_all_rejected_to_trash())
+        self.bind("<Shift-Key-d>", lambda e: self._on_delete_all_rejected_to_trash())
 
         # Culling Flags & Ratings
         self.bind("p", lambda e: self._set_current_flag(FlagState.PICK))
-        self.bind("P", lambda e: self._set_current_flag(FlagState.PICK))
+        self.bind("P", lambda e: self._on_unpick_current() if (getattr(e, "state", 0) & 0x0001) else self._set_current_flag(FlagState.PICK))
+        self.bind("<Shift-Key-P>", lambda e: self._on_unpick_current())
+        self.bind("<Shift-Key-p>", lambda e: self._on_unpick_current())
+
         self.bind("x", lambda e: self._set_current_flag(FlagState.REJECT))
-        self.bind("X", lambda e: self._set_current_flag(FlagState.REJECT))
+        self.bind("X", lambda e: self._on_unreject_current() if (getattr(e, "state", 0) & 0x0001) else self._set_current_flag(FlagState.REJECT))
+        self.bind("<Shift-Key-X>", lambda e: self._on_unreject_current())
+        self.bind("<Shift-Key-x>", lambda e: self._on_unreject_current())
+
         self.bind("u", lambda e: self._set_current_flag(FlagState.UNFLAGGED))
         self.bind("U", lambda e: self._set_current_flag(FlagState.UNFLAGGED))
 
@@ -1274,7 +1283,7 @@ class ImageCullerApp(ctk.CTk):
 
         self.thumb_list.finish_folder_timing()
 
-        self._on_filter_changed()
+        self._on_filter_changed(trigger_source="operation")
         stats = tab["session"].get_summary_stats()
         arw_count = stats.get("arw_count", tab.get("arw_count", 0))
         arw_info = f" ({arw_count} ARW)" if arw_count > 0 else ""
@@ -1338,6 +1347,44 @@ class ImageCullerApp(ctk.CTk):
             tag_filter=tag_filter
         )
         tab["current_items"] = self.current_items
+
+        # When an operation (Delete, Move, scan, reload, etc.) makes the thumbnail list empty,
+        # automatically switch to All filter so remaining photos are displayed.
+        if not self.current_items and trigger_source != "filter":
+            current_flag = self.toolbar.seg_filter.get()
+            if current_flag != "All":
+                log_info(f"Operation ({trigger_source}) made '{current_flag}' filter empty -> automatically moving to 'All' filter")
+                self.toolbar.seg_filter.set("All")
+                filter_vals["flag"] = "All"
+                tab["filter_values"]["flag"] = "All"
+                self.current_items = session.get_filtered_items(
+                    flag_filter="All",
+                    rating_filter=rating_filter_set,
+                    format_filter=fmt_val,
+                    tag_filter=tag_filter
+                )
+                tab["current_items"] = self.current_items
+
+            if not self.current_items and session.items and (rating_filter_set or fmt_val != "All" or tag_filter):
+                self.toolbar.rating_filter.reset()
+                self.toolbar.tag_filter.reset()
+                self.toolbar.opt_format.set("All Formats")
+                tab["filter_values"] = {
+                    "flag": "All",
+                    "rating": [],
+                    "format": "All Formats",
+                    "tag": []
+                }
+                rating_filter_set = None
+                fmt_val = "All"
+                tag_filter = None
+                self.current_items = session.get_filtered_items(
+                    flag_filter="All",
+                    rating_filter=None,
+                    format_filter="All",
+                    tag_filter=None
+                )
+                tab["current_items"] = self.current_items
 
         target_idx = 0
         target_sub_path = None
@@ -1630,6 +1677,52 @@ class ImageCullerApp(ctk.CTk):
         count_str = f" across {len(target_indices)} photos" if len(target_indices) > 1 else ""
         self._update_status(f"Flagged {cur_item.filename} as {flag.value}{count_str}")
 
+    def _on_unreject_current(self):
+        session = self._get_active_session()
+        if self.current_index < 0 or not self.current_items or not session:
+            return
+        target_indices = self.selected_indices if self.selected_indices else {self.current_index}
+        unrejected_count = 0
+        for idx in target_indices:
+            if 0 <= idx < len(self.current_items):
+                item = self.current_items[idx]
+                if item.flag == FlagState.REJECT:
+                    item.flag = FlagState.UNFLAGGED
+                    session.save_item_record(item)
+                    self.thumb_list.update_single_item_status(idx, item)
+                    unrejected_count += 1
+
+        cur_item = self.current_items[self.current_index]
+        self.meta_panel.update_metadata(cur_item)
+        if unrejected_count > 0:
+            count_str = f" across {unrejected_count} photos" if len(target_indices) > 1 else ""
+            self._update_status(f"Unrejected {cur_item.filename}{count_str}")
+        else:
+            self._update_status(f"Selected photo(s) are not flagged as REJECT")
+
+    def _on_unpick_current(self):
+        session = self._get_active_session()
+        if self.current_index < 0 or not self.current_items or not session:
+            return
+        target_indices = self.selected_indices if self.selected_indices else {self.current_index}
+        unpicked_count = 0
+        for idx in target_indices:
+            if 0 <= idx < len(self.current_items):
+                item = self.current_items[idx]
+                if item.flag == FlagState.PICK:
+                    item.flag = FlagState.UNFLAGGED
+                    session.save_item_record(item)
+                    self.thumb_list.update_single_item_status(idx, item)
+                    unpicked_count += 1
+
+        cur_item = self.current_items[self.current_index]
+        self.meta_panel.update_metadata(cur_item)
+        if unpicked_count > 0:
+            count_str = f" across {unpicked_count} photos" if len(target_indices) > 1 else ""
+            self._update_status(f"Unpicked {cur_item.filename}{count_str}")
+        else:
+            self._update_status(f"Selected photo(s) are not flagged as PICK")
+
     def _set_current_rating(self, rating: int):
         session = self._get_active_session()
         if self.current_index < 0 or not self.current_items or not session:
@@ -1730,11 +1823,12 @@ class ImageCullerApp(ctk.CTk):
         else:
             self._confirm_and_delete_files(target_items, [p for item in target_items for p in item.stacked_paths])
 
-    def _confirm_and_delete_files(self, items: List['ImageItem'], paths: List[Path]):
+    def _confirm_and_delete_files(self, items: List['ImageItem'], paths: List[Path], is_batch_rejected: bool = False):
         session = self._get_active_session()
         if not paths or not session:
             return
 
+        title = "Move Rejected Photos to Trash" if is_batch_rejected else "Move Files to Trash"
         if len(paths) <= 5:
             path_list = "\n".join(f"  • {p.name}" for p in paths)
             msg = f"Move {len(paths)} file(s) to Recycle Bin / Trash?\n\n{path_list}"
@@ -1742,14 +1836,59 @@ class ImageCullerApp(ctk.CTk):
             preview = "\n".join(f"  • {p.name}" for p in paths[:5])
             msg = f"Move {len(paths)} file(s) to Recycle Bin / Trash?\n\n{preview}\n  ... and {len(paths) - 5} more"
 
-        confirm = mb.askyesno(title="Move Files to Trash", message=msg, icon="warning")
+        confirm = mb.askyesno(title=title, message=msg, icon="warning")
         if not confirm:
             return
 
         moved_count = session.move_specific_files_to_trash(items, paths)
         self.folder_watcher.resync(session.directory)
+        self.selected_indices = set()
         self._update_status(f"Moved {moved_count} file(s) to Recycle Bin / Trash.")
-        self._on_filter_changed()
+        self._on_filter_changed(trigger_source="delete")
+
+    def _on_delete_all_rejected_to_trash(self):
+        tab = self._get_active_tab()
+        session = self._get_active_session()
+        if not session or not tab or not session.directory:
+            mb.showinfo("Delete Rejected Photos", "No active directory loaded.")
+            return
+
+        rejected_items = [it for it in session.items if it.flag == FlagState.REJECT]
+        if not rejected_items:
+            mb.showinfo("No Rejected Photos", "No photos are flagged as REJECT to move to Recycle Bin / Trash.")
+            return
+
+        fmt_filter = self.toolbar.get_format_filter() if hasattr(self, "toolbar") else "All"
+        stacked_count = sum(1 for it in rejected_items if it.is_stacked)
+
+        if fmt_filter and fmt_filter.upper() == "JPG":
+            paths_to_delete = []
+            for item in rejected_items:
+                for p in item.stacked_paths:
+                    if p.suffix.lower() in (".jpg", ".jpeg"):
+                        paths_to_delete.append(p)
+            if paths_to_delete:
+                self._confirm_and_delete_files(rejected_items, paths_to_delete, is_batch_rejected=True)
+            else:
+                mb.showinfo("No JPG Files", "No JPG files found in the rejected photos.")
+        elif fmt_filter and fmt_filter.upper() in ("RAW", "ARW"):
+            paths_to_delete = []
+            for item in rejected_items:
+                for p in item.stacked_paths:
+                    if p.suffix.lower() == ".arw" or ImageLoader.is_raw(p):
+                        paths_to_delete.append(p)
+            if paths_to_delete:
+                self._confirm_and_delete_files(rejected_items, paths_to_delete, is_batch_rejected=True)
+            else:
+                mb.showinfo("No RAW Files", "No RAW files found in the rejected photos.")
+        elif stacked_count > 0:
+            dialog = DeleteStackedDialog(self, target_items=rejected_items)
+            if dialog.result is None:
+                return
+            self._confirm_and_delete_files(rejected_items, dialog.result, is_batch_rejected=True)
+        else:
+            paths_to_delete = [p for item in rejected_items for p in item.stacked_paths]
+            self._confirm_and_delete_files(rejected_items, paths_to_delete, is_batch_rejected=True)
 
     def _on_raw_settings_changed(self):
         scale = self.toolbar.get_raw_scale()
@@ -2482,6 +2621,7 @@ class ImageCullerApp(ctk.CTk):
                 moved = session.move_items_by_flag(FlagState.PICK, folder_name)
                 mb.showinfo("Move Picked Complete", f"Successfully moved {len(moved)} PICK files into '{folder_name}'.")
                 self._suppress_folder_watch(session.directory)
+                self.selected_indices = set()
                 self._load_directory(str(session.directory))
             except Exception as e:
                 mb.showerror("Move Error", f"Failed to move picked files: {e}")
@@ -2503,6 +2643,7 @@ class ImageCullerApp(ctk.CTk):
                 moved = session.move_items_by_flag(FlagState.REJECT, folder_name)
                 mb.showinfo("Move Rejected Complete", f"Successfully moved {len(moved)} REJECT files into '{folder_name}'.")
                 self._suppress_folder_watch(session.directory)
+                self.selected_indices = set()
                 self._load_directory(str(session.directory))
             except Exception as e:
                 mb.showerror("Move Error", f"Failed to move rejected files: {e}")

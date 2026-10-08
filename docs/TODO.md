@@ -10,7 +10,11 @@ Make corrections optionally, if required.
   - [ ] add hide/unhide for thumbnail panel and right side tool panel
   - [ ] make each sections of right side tool panel collapsible: "Culling Actions", "Exif Metadata"
   - [ ] save state of the UI (panel positions, sizes, hide/unhide, panel sections collapsed/expanded, menubar state) for relaunch
-  - [ ] 
+  - [x] Shortcuts: Shift+X -> UnReject, Shift+P -> UnPick, Shift+D -> Delete (Move to trash) All Rejected
+  - [x] Add a button for "Delete (Move to trash) All Rejected"
+  - [x] When an operation like Delete/Move etc made the thumbnail list empty, move to All filter automatically
+- [ ] UI Glitches to fix:
+  - [ ] Reject some photos, Go to Rejected filter, Select all, delete all selected, come back to All filter -> all thumbnails show an yellow glitchy outline
 - [ ] Add a search by filename, to jump to a file in the thumbnails list. it should suggest continuously as typed. Add it right on top of thumbnail list. Ctrl+F to focus on it.
 - [ ] Scrolling on thumbnails with large data: glitch, freeze & performance
   - [x] some times thumbnails show blanks, and selecting a thumbnail shows the image in preview but doesnt highlight with blue in thumbnails list
