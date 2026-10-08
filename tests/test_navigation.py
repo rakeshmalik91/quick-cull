@@ -244,6 +244,60 @@ class TestNavigationAndSelection(unittest.TestCase):
         from gui import ImageCullerApp
         self.assertTrue(hasattr(ImageCullerApp, "_on_load_100_percent"))
 
+    def test_select_all_and_select_none(self):
+        """
+        Verify _select_all selects all items and _select_none clears to active item.
+        """
+        from gui import ImageCullerApp
+        app = MagicMock(spec=ImageCullerApp)
+        app.current_items = list(self.session.items)
+        app.current_index = 3
+        app.selected_indices = {3}
+        tab = {"selected_indices": {3}}
+        app._get_active_tab.return_value = tab
+        app.thumb_list = MagicMock()
+
+        # Execute Select All
+        ImageCullerApp._select_all(app)
+        self.assertEqual(app.selected_indices, set(range(10)))
+        self.assertEqual(tab["selected_indices"], set(range(10)))
+        app.thumb_list.set_selected_indices.assert_called_with(
+            set(range(10)), 3, active_path=self.session.items[3].path
+        )
+
+        # Execute Select None
+        ImageCullerApp._select_none(app)
+        self.assertEqual(app.selected_indices, {3})
+        self.assertEqual(tab["selected_indices"], {3})
+        app.thumb_list.set_selected_indices.assert_called_with(
+            {3}, 3, active_path=self.session.items[3].path
+        )
+
+    def test_on_ctrl_a_handler(self):
+        """
+        Verify _on_ctrl_a calls _select_all when not in entry, and selects entry text when in entry.
+        """
+        from gui import ImageCullerApp
+        app = MagicMock(spec=ImageCullerApp)
+        app._is_entry_focused.return_value = False
+
+        # When not in entry: calls _select_all
+        res = ImageCullerApp._on_ctrl_a(app)
+        self.assertEqual(res, "break")
+        app._select_all.assert_called_once()
+
+        # When in entry: selects entry text range
+        app._select_all.reset_mock()
+        app._is_entry_focused.return_value = True
+        mock_entry = MagicMock()
+        app.focus_get.return_value = mock_entry
+
+        res = ImageCullerApp._on_ctrl_a(app)
+        self.assertEqual(res, "break")
+        app._select_all.assert_not_called()
+        mock_entry.select_range.assert_called_with(0, "end")
+        mock_entry.icursor.assert_called_with("end")
+
 
 if __name__ == "__main__":
     unittest.main()

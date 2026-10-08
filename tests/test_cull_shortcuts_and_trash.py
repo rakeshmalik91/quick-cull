@@ -260,7 +260,7 @@ class TestMetadataPanelTrashButton(unittest.TestCase):
                 on_trash_rejected=on_trash_cb
             )
             self.assertTrue(hasattr(panel, "btn_trash_rejected"))
-            self.assertIn("Delete (Move to trash) All Rejected", panel.btn_trash_rejected.cget("text"))
+            self.assertIn("Move Rejected to Trash", panel.btn_trash_rejected.cget("text"))
 
             # Invoke button command
             panel.btn_trash_rejected.invoke()

@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -417,10 +418,28 @@ class CullingSession:
             pi = ImageItem(spec.primary, size_bytes=spec.size_bytes, resolved=True)
             pi.filename = spec.filename
             pi.format_name = spec.format_name
-            pi.stacked_paths = [spec.primary]
+            pi.stacked_paths = list(spec.stacked_paths) if getattr(spec, "stacked_paths", None) else [spec.primary]
             pi.is_stacked = False
             pi.is_placeholder = True
             placeholder_items.append(pi)
+
+        # Pre-load saved DB records or previous donor state onto placeholder items
+        # so Pick/Reject counts, flags, star ratings, and tags reflect immediately upon initial UI render.
+        init_records = self._records_for(placeholder_items)
+        prev_donors: Dict[str, ImageItem] = {}
+        if previous_items:
+            for item in previous_items:
+                for p in item.stacked_paths:
+                    prev_donors.setdefault(entry_key(p), item)
+
+        for pi in placeholder_items:
+            donor = prev_donors.get(entry_key(pi.path))
+            if donor is not None:
+                self._adopt_state(pi, donor)
+            else:
+                rec = self._lookup_record(init_records, pi)
+                if rec:
+                    self._overlay_record(pi, rec)
 
         self.placeholder_items = placeholder_items
         self.items = placeholder_items
@@ -433,7 +452,8 @@ class CullingSession:
 
         _emit_progress(progress_callback, 0, len(row_specs), f"Found {arw_count} ARW ({len(row_specs)} photos)")
 
-        items = self._reconcile_items(row_specs, previous_items, diff, progress_callback)
+        donors_list = previous_items if previous_items else placeholder_items
+        items = self._reconcile_items(row_specs, donors_list, diff, progress_callback)
 
         # Only files whose bytes changed lose their decoded pixels; everything else stays
         # resident, so a one-file reload does not re-decode the whole folder.
@@ -573,11 +593,15 @@ class CullingSession:
                 # Identical row, unchanged files: keep the very same object, so the grid
                 # stays bound to it and its decoded thumbnails stay valid.
                 donor.size_bytes = spec.size_bytes
+                donor.is_placeholder = False
+                donor.is_stacked = len(spec.stacked_paths) > 1
                 reused_ids.add(id(donor))
                 items.append(donor)
                 continue
             donor = donor or next((donors[k] for k in spec.path_keys if k in donors), None)
-            items.append(self._build_item(spec, donor))
+            built = self._build_item(spec, donor)
+            built.is_placeholder = False
+            items.append(built)
             if donor is not None:
                 carried_ids.add(id(items[-1]))
 
@@ -608,10 +632,16 @@ class CullingSession:
                 if not had_state:
                     item.rating = meta.get("rating", 0)
 
-            if not had_state or meta is not None:
-                self._overlay_record(item, self._lookup_record(records, item))
-
             if not had_state:
+                self._overlay_record(item, self._lookup_record(records, item))
+            elif meta is not None:
+                # If item had prior state (e.g. from donor), only populate in-camera rating from EXIF if item had no rating
+                if item.rating == 0 and meta.get("rating", 0) > 0:
+                    rec = self._lookup_record(records, item)
+                    if not rec or rec.get("rating", 0) == 0:
+                        item.rating = meta.get("rating", 0)
+
+            if item.manual_detection_box is None:
                 if manual_annos is None:
                     manual_annos = load_manual_annotations(
                         dataset_dir=str(self.db.dataset_dir) if self.db else None
@@ -663,7 +693,12 @@ class CullingSession:
         getter = getattr(self.db, "get_records_for_paths", None)
         if getter is None:
             return self.db.get_all_records_for_dir(str(self.directory)) if self.directory else {}
-        return getter([str(it.path) for it in items])
+        paths = []
+        for it in items:
+            paths.append(str(it.path))
+            for p in getattr(it, "stacked_paths", []):
+                paths.append(str(p))
+        return getter(paths)
 
     @staticmethod
     def _lookup_record(records: Dict[str, Dict[str, Any]], item: ImageItem) -> Dict[str, Any]:
@@ -674,6 +709,14 @@ class CullingSession:
             rec = records.get(candidate)
             if rec is not None:
                 return rec
+        for p in getattr(item, "stacked_paths", []):
+            try:
+                for candidate in (str(p), str(p.resolve())):
+                    rec = records.get(candidate)
+                    if rec is not None:
+                        return rec
+            except Exception:
+                pass
         return {}
 
     def _overlay_record(self, item: ImageItem, rec: Dict[str, Any]) -> None:
@@ -803,42 +846,46 @@ class CullingSession:
         """
         Reset all item flags in session to UNFLAGGED and update DB.
         """
-        count = 0
+        changed_items = []
         for item in self.items:
             if item.flag != FlagState.UNFLAGGED:
                 item.flag = FlagState.UNFLAGGED
-                self.save_item_record(item)
-                count += 1
-        return count
+                changed_items.append(item)
+        if changed_items:
+            self.save_item_records(changed_items)
+        return len(changed_items)
 
     def untag_all_items(self) -> int:
         """
         Remove all tags from every item in session and update DB.
         """
-        count = 0
+        changed_items = []
         for item in self.items:
             if item.tags:
                 item.tags.clear()
-                self.save_item_record(item)
-                count += 1
-        return count
+                changed_items.append(item)
+        if changed_items:
+            self.save_item_records(changed_items)
+        return len(changed_items)
 
     def unrate_all_items(self) -> int:
         """
         Reset all star ratings to 0 across all items in session and update DB.
         """
-        count = 0
+        changed_items = []
         for item in self.items:
-            item.rating = 0
-            self.save_item_record(item)
-            count += 1
-        return count
+            if item.rating != 0:
+                item.rating = 0
+                changed_items.append(item)
+        if changed_items:
+            self.save_item_records(changed_items)
+        return len(changed_items)
 
     def clear_all_metadata(self) -> int:
         """
         Reset flags to UNFLAGGED, remove all tags, set star ratings to 0, and clear detection boxes across all items in session.
         """
-        count = 0
+        changed_items = []
         for item in self.items:
             changed = False
             if item.flag != FlagState.UNFLAGGED:
@@ -857,9 +904,10 @@ class CullingSession:
                 item.eye_box = None
                 changed = True
             if changed:
-                self.save_item_record(item)
-                count += 1
-        return count
+                changed_items.append(item)
+        if changed_items:
+            self.save_item_records(changed_items)
+        return len(changed_items)
 
     def move_items_to_trash(self, items: List[ImageItem], format_filter: Optional[str] = None) -> int:
         """
@@ -1212,6 +1260,7 @@ class CullingSession:
                         pass
 
         flagged_blurry = []
+        items_to_save = []
         for i in range(cutoff_index):
             if cancel_event and cancel_event.is_set():
                 break
@@ -1246,7 +1295,10 @@ class CullingSession:
             if rating_action is not None:
                 item.rating = max(0, min(5, rating_action))
 
-            self.save_item_record(item)
+            items_to_save.append(item)
+
+        if items_to_save:
+            self.save_item_records(items_to_save)
 
         return flagged_blurry
 
@@ -1307,6 +1359,7 @@ class CullingSession:
         }
 
         flagged_duplicates = []
+        modified_items = []
         for group in groups:
             if cancel_event and cancel_event.is_set():
                 break
@@ -1320,7 +1373,7 @@ class CullingSession:
                 keeper.add_tag(keeper_tag)
             if keeper_rating is not None:
                 keeper.rating = max(0, min(5, keeper_rating))
-            self.save_item_record(keeper)
+            modified_items.append(keeper)
 
             for dup in group[1:]:
                 if cancel_event and cancel_event.is_set():
@@ -1334,8 +1387,11 @@ class CullingSession:
                 if rating_action is not None:
                     dup.rating = max(0, min(5, rating_action))
 
-                self.save_item_record(dup)
+                modified_items.append(dup)
                 flagged_duplicates.append(dup)
+
+        if modified_items:
+            self.save_item_records(modified_items)
 
         return flagged_duplicates
 
@@ -1496,10 +1552,15 @@ class CullingSession:
                 filtered = [item for item in filtered if any(t.lower() == target_tag for t in item.tags)]
 
         if search_query:
-            query = search_query.lower()
+            query = search_query.strip().lower()
+            tokens = [t for t in re.split(r'[\s_\-]+', query) if t]
             filtered = [
                 item for item in filtered
-                if query in item.filename.lower() or query in item.tags_str.lower()
+                if (
+                    query in item.filename.lower()
+                    or query in item.tags_str.lower()
+                    or (len(tokens) > 1 and all(t in item.filename.lower() or t in item.tags_str.lower() for t in tokens))
+                )
             ]
 
         return filtered

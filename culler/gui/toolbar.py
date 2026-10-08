@@ -298,8 +298,9 @@ class HeaderToolbar(ctk.CTkFrame):
         self.seg_filter = ctk.CTkSegmentedButton(
             self,
             values=["All", "Pick", "Reject", "Unflagged"],
-            command=lambda v: self.on_filter_change("filter")
+            command=self._on_seg_filter_clicked
         )
+        self._wrap_seg_filter()
         self.seg_filter.set("All")
         self.seg_filter.pack(side="left", padx=3)
 
@@ -488,6 +489,73 @@ class HeaderToolbar(ctk.CTkFrame):
             else:
                 self.btn_toggle_tools.configure(text="🛠️ ◀", fg_color="#3a3a3a")
                 ToolTip(self.btn_toggle_tools, "Show Right Tool Panel (F9 / Ctrl+J)")
+
+    @staticmethod
+    def _normalize_flag_name(val: Optional[str]) -> str:
+        if not val:
+            return "All"
+        base = val.split("(")[0].strip()
+        mapping = {
+            "all": "All",
+            "pick": "Pick",
+            "reject": "Reject",
+            "unflagged": "Unflagged"
+        }
+        return mapping.get(base.lower(), base)
+
+    def _wrap_seg_filter(self):
+        orig_set = self.seg_filter.set
+        orig_get = self.seg_filter.get
+
+        def custom_set(val: str, *args, **kwargs):
+            base = self._normalize_flag_name(val)
+            values = getattr(self.seg_filter, "_value_list", [])
+            target = next(
+                (v for v in values if self._normalize_flag_name(v).lower() == base.lower()),
+                val
+            )
+            return orig_set(target, *args, **kwargs)
+
+        def custom_get(*args, **kwargs) -> str:
+            raw = orig_get(*args, **kwargs)
+            return self._normalize_flag_name(raw)
+
+        self.seg_filter.set = custom_set
+        self.seg_filter.get = custom_get
+
+    def _on_seg_filter_clicked(self, value: str):
+        if self.on_filter_change:
+            self.on_filter_change("filter")
+
+    def get_flag_filter(self) -> str:
+        return self.seg_filter.get()
+
+    def set_flag_filter(self, flag: str):
+        self.seg_filter.set(flag)
+
+    def update_filter_counts(self, counts: Optional[Dict[str, int]] = None):
+        """Update button labels with photo counts for Pick and Reject only."""
+        if not hasattr(self, "seg_filter"):
+            return
+        try:
+            current_base = self.get_flag_filter()
+            if counts is not None:
+                pick_c = counts.get("Pick", counts.get("pick", 0))
+                reject_c = counts.get("Reject", counts.get("reject", 0))
+                new_values = [
+                    "All",
+                    f"Pick ({pick_c})",
+                    f"Reject ({reject_c})",
+                    "Unflagged"
+                ]
+            else:
+                new_values = ["All", "Pick", "Reject", "Unflagged"]
+
+            if getattr(self.seg_filter, "_value_list", None) != new_values:
+                self.seg_filter.configure(values=new_values)
+            self.seg_filter.set(current_base)
+        except Exception:
+            pass
 
     def get_filter_values(self) -> Dict[str, Any]:
         return {

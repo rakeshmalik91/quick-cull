@@ -5,23 +5,33 @@ Do not add any new details here. only use this for checking/unchecking the TODO 
 Make corrections optionally, if required.
 ---------------------
 
-- [ ] UI changes:
+- [x] UI changes:
   - [x] add a bit of gap between "Close all Tabs" & "About" button
   - [x] add hide/unhide for thumbnail panel and right side tool panel
   - [x] make each sections of right side tool panel collapsible: "Culling Actions", "Exif Metadata"
   - [x] save state of the UI (panel positions, sizes, hide/unhide, panel sections collapsed/expanded, menubar state) for relaunch
   - [x] Shortcuts: Shift+X -> UnReject, Shift+P -> UnPick, Shift+D -> Delete (Move to trash) All Rejected
-  - [x] Add a button for "Delete (Move to trash) All Rejected"
+  - [x] Add a button for "Move Rejected to Trash"
   - [x] When an operation like Delete/Move etc made the thumbnail list empty, move to All filter automatically
-- [ ] UI Glitches to fix:
-  - [ ] Reject some photos, Go to Rejected filter, Select all, delete all selected, come back to All filter -> all thumbnails show an yellow glitchy outline
-- [x] Add a search by filename, to jump to a file in the thumbnails list. it should suggest continuously as typed. Add it right on top of thumbnail list. Ctrl+F to focus on it.
+  - [x] Ctrl+A for Select All
+
+
+- [x] UI Glitches to fix:
+  - [x] Reject some photos, Go to Rejected filter, Select all, delete all selected, come back to All filter -> all thumbnails show an yellow glitchy outline
+  - [x] Pick/Reject etc on multiple images taking too long, should be instantaneous, its just db operation
+  - [x] at first the Pick/Reject counts take some time to reflect, later any more update is instantaneous
+
+
 - [ ] Scrolling on thumbnails with large data: glitch, freeze & performance
   - [x] some times thumbnails show blanks, and selecting a thumbnail shows the image in preview but doesnt highlight with blue in thumbnails list
   - [ ] when scrolling fast, text from new thumbnails overlap with old ones, making it look glitchy (last try on this reduced the glitch and increased freeze. need to accept completely removed glitch/freeze)
-- [ ] virtualize the thumbnail grid rows (recycled row pool + scroll-driven rebinding). needed for folders above ~1500 photos: 2771 rows currently take ~111s to build and freeze the app. see docs/analysis/ui-framework-assessment.md
+
+
+- [x] Add a search by filename (supports partial string & filename contains), to jump to a file in the thumbnails list. it should suggest continuously as typed. Add it right on top of thumbnail list. Ctrl+F to focus on it.
 - [x] if there is only one tab open, not able to close it. ensure closing a tab clears the memory completely. add a close all tabs button too. 
 - [x] tab button and tab close buttons are glitching all the time. thumbnail list glitching during folder/thumbnail loading. verify our ui framework is correctly being used or requires any replacement.
+
+
 - [x] create a doc for improving the folder and thumbnail load time
     - it should happen in background, shouldnt block ui. goal is to load images fastest possible without any glitches or freezing
     - moving between multiple tabs should not load same stuffs multiple times, should be cached
@@ -33,6 +43,8 @@ Make corrections optionally, if required.
     - consider using multithreading and gpu for faster operations
     - consider using exiftool batch processing if available
       (see docs/analysis/load-performance-v1.md)
+
+
 - [x] mark keeper tag as "Duplicate" too by default, not "Keeper", make stars configurable for keeper too
 - [x] remove the custom tag button on right panel, in settings create a new tab to manage tags
 - [x] for duplicate add feature for keeper selection methods. 

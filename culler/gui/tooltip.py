@@ -44,13 +44,10 @@ class ToolTip:
             return
 
         try:
-            x = self.widget.winfo_rootx() + (self.widget.winfo_width() // 2) - 30
-            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
-
             tw = tk.Toplevel(self.widget)
             tw.wm_overrideredirect(True)
-            tw.wm_geometry(f"+{x}+{y}")
             tw.attributes("-topmost", True)
+            tw.withdraw()
 
             label = tk.Label(
                 tw,
@@ -65,8 +62,48 @@ class ToolTip:
                 pady=4
             )
             label.pack()
+
+            tw.update_idletasks()
+            tip_w = tw.winfo_reqwidth()
+            tip_h = tw.winfo_reqheight()
+
+            screen_w = tw.winfo_screenwidth()
+            screen_h = tw.winfo_screenheight()
+
+            widget_rx = self.widget.winfo_rootx()
+            widget_ry = self.widget.winfo_rooty()
+            widget_w = self.widget.winfo_width()
+            widget_h = self.widget.winfo_height()
+
+            # Desired position: centered below widget
+            x = widget_rx + (widget_w // 2) - (tip_w // 2)
+            y = widget_ry + widget_h + 6
+
+            margin = 8
+
+            # Prevent clipping on the right edge of screen
+            if x + tip_w > screen_w - margin:
+                x = screen_w - tip_w - margin
+
+            # Prevent clipping on the left edge of screen
+            if x < margin:
+                x = margin
+
+            # If overflowing the bottom of the screen, flip above the widget
+            if y + tip_h > screen_h - margin:
+                y = widget_ry - tip_h - 6
+                if y < margin:
+                    y = margin
+
+            tw.wm_geometry(f"+{x}+{y}")
+            tw.deiconify()
             self.tooltip_window = tw
         except Exception:
+            if self.tooltip_window:
+                try:
+                    self.tooltip_window.destroy()
+                except Exception:
+                    pass
             self.tooltip_window = None
 
     def _hide(self):

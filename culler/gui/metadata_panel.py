@@ -198,7 +198,7 @@ class MetadataPanel(ctk.CTkFrame):
                     btn.configure(text="▶")
             else:
                 if key == "meta":
-                    content.pack(fill="both", expand=True, padx=10, pady=4)
+                    content.pack(fill="x", pady=(2, 0))
                 else:
                     content.pack(fill="x")
                 if btn is not None:
@@ -492,7 +492,7 @@ class MetadataPanel(ctk.CTkFrame):
 
         self.btn_trash_rejected = ctk.CTkButton(
             f_trash_reject_row,
-            text="🗑️ Delete (Move to trash) All Rejected",
+            text="🗑️ Move Rejected to Trash",
             fg_color="#5c0612",
             hover_color="#d90429",
             font=ctk.CTkFont(size=11, weight="bold"),
@@ -584,25 +584,26 @@ class MetadataPanel(ctk.CTkFrame):
             ToolTip(btn, f"Shortcut: {star} (Set rating to {star} Star{'s' if star > 1 else ''})")
             self.star_buttons.append(btn)
 
-        # Metadata Card Box
-        self.meta_card = ctk.CTkFrame(self._bags_area, corner_radius=6, fg_color="#242424")
+        # EXIF Metadata Box
+        self.meta_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
         self.lbl_meta_title, btn_c_meta = self._create_bag_header(
-            self.meta_card, "meta", "EXIF METADATA", 12, padx=10, pady=(6, 2)
+            self.meta_box, "meta", "EXIF METADATA", 12, pady=(0, 4)
         )
-        self.meta_content = ctk.CTkFrame(self.meta_card, fg_color="transparent")
-        self.meta_content.pack(fill="both", expand=True, padx=10, pady=4)
-        self._register_bag("meta", self.meta_card, self.lbl_meta_title,
-                           {"side": "top", "fill": "x", "padx": 10, "pady": 6},
+        self.meta_card = ctk.CTkFrame(self.meta_box, corner_radius=6, fg_color="#242424")
+        self.meta_card.pack(fill="x", pady=(2, 0))
+        self.meta_content = self.meta_card
+        self._register_bag("meta", self.meta_box, self.lbl_meta_title,
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 4},
                            self.meta_content, btn_c_meta)
 
         self.lbl_meta_details = ctk.CTkLabel(
-            self.meta_content,
+            self.meta_card,
             text="No image selected.",
             justify="left",
             anchor="nw",
             font=ctk.CTkFont(family="Consolas", size=11)
         )
-        self.lbl_meta_details.pack(fill="both", expand=True)
+        self.lbl_meta_details.pack(fill="both", expand=True, padx=10, pady=8)
 
     def update_output_folders(self, picked_folder: str, rejected_folder: str):
         self.picked_folder = picked_folder

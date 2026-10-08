@@ -1,4 +1,5 @@
 import os
+import re
 import tkinter as tk
 import threading
 import time
@@ -12,6 +13,7 @@ from PIL import Image, ImageDraw
 from ..culler_engine import ImageItem, FlagState, CullingSession
 from ..image_loader import ImageLoader
 from ..logger import log_debug, log_error
+from .tooltip import ToolTip
 from .row_pool import (
     INITIAL_BIND_ROWS,
     REBIND_ROWS_PER_TICK,
@@ -204,6 +206,12 @@ class ThumbnailList(ctk.CTkFrame):
         self._batch_after_id: Optional[str] = None
         self._thumb_submit_after_id: Optional[str] = None
         self._current_item_signature: Optional[List] = None
+        self._current_selected_indices: Set[int] = set()
+        self._current_active_idx: int = -1
+        self._current_active_path_str: Optional[str] = None
+        self._prev_selected_indices: Set[int] = set()
+        self._prev_active_idx: int = -1
+        self._prev_active_path_str: Optional[str] = None
         self._pending_items: List[ImageItem] = []
         self._pending_selected_idx: int = 0
         self._pending_white_balance: str = "camera"
@@ -245,6 +253,7 @@ class ThumbnailList(ctk.CTkFrame):
             command=self._handle_select_none
         )
         self.btn_select_none.pack(side="right", padx=2)
+        ToolTip(self.btn_select_none, "Clear Selection (Ctrl+D)")
 
         self.btn_select_all = ctk.CTkButton(
             self.hdr_frame,
@@ -257,6 +266,7 @@ class ThumbnailList(ctk.CTkFrame):
             command=self._handle_select_all
         )
         self.btn_select_all.pack(side="right", padx=2)
+        ToolTip(self.btn_select_all, "Select All Photos (Ctrl+A)")
 
         self.lbl_selection_count = ctk.CTkLabel(
             self.hdr_frame,
@@ -277,11 +287,28 @@ class ThumbnailList(ctk.CTkFrame):
         self.search_entry = ctk.CTkEntry(
             self.search_frame,
             textvariable=self.search_var,
-            placeholder_text="🔍 Search filename... (Ctrl+F)",
+            placeholder_text="🔍 Search filename contains... (Ctrl+F)",
             height=28,
             font=ctk.CTkFont(size=11),
         )
         self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        ToolTip(
+            self.search_entry,
+            "Search filename contains (partial string / substring, Ctrl+F)\n"
+            "• Enter: Jump to match / Cycle next\n"
+            "• Shift+Enter: Cycle previous match\n"
+            "• Up/Down: Navigate suggestions dropdown\n"
+            "• Esc: Close suggestions"
+        )
+
+        self.lbl_search_count = ctk.CTkLabel(
+            self.search_frame,
+            text="",
+            font=ctk.CTkFont(size=10),
+            text_color="#888888",
+            width=36,
+        )
+        self.lbl_search_count.pack(side="left", padx=(0, 2))
 
         self.btn_clear_search = ctk.CTkButton(
             self.search_frame,
@@ -295,6 +322,7 @@ class ThumbnailList(ctk.CTkFrame):
             command=self.clear_search,
         )
         self.btn_clear_search.pack(side="right")
+        ToolTip(self.btn_clear_search, "Clear search query")
 
         # Suggestions Container (continuous suggestions as typed)
         self.suggestion_container = ctk.CTkFrame(
@@ -304,6 +332,8 @@ class ThumbnailList(ctk.CTkFrame):
             border_width=1,
             corner_radius=4,
         )
+        self._all_matches: List[Tuple[int, ImageItem]] = []
+        self._current_match_cursor: int = 0
         self._suggestion_items: List[Tuple[int, ImageItem]] = []
         self._suggestion_buttons: List[ctk.CTkButton] = []
         self._highlighted_suggestion_idx: int = -1
@@ -313,7 +343,11 @@ class ThumbnailList(ctk.CTkFrame):
         self.search_entry.bind("<Up>", self._on_search_up)
         self.search_entry.bind("<Return>", self._on_search_return)
         self.search_entry.bind("<KP_Enter>", self._on_search_return)
+        self.search_entry.bind("<Shift-Return>", self._on_search_shift_return)
+        self.search_entry.bind("<Shift-KP_Enter>", self._on_search_shift_return)
         self.search_entry.bind("<Escape>", self._on_search_escape)
+        self.search_entry.bind("<FocusIn>", self._on_search_focus_in)
+        self.search_entry.bind("<Button-1>", self._on_search_click)
 
         self.scroll_frame = ctk.CTkScrollableFrame(self, label_text="")
         self.scroll_frame.pack(side="top", fill="both", expand=True, padx=2, pady=2)
@@ -557,42 +591,122 @@ class ThumbnailList(ctk.CTkFrame):
     # Filename Search & Continuous Suggestions
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _match_item_filename(item: ImageItem, query: str) -> Optional[Tuple[int, int]]:
+        """
+        Check if an ImageItem matches the search query (partial string / contains).
+        Returns a tuple (match_type_rank, sub_score) if matched, or None if not matched.
+        Lower rank/score means better match.
+        """
+        q = query.strip().lower()
+        if not q:
+            return None
+
+        fn = item.filename.lower()
+        stem = item.path.stem.lower()
+        name = item.path.name.lower()
+
+        stacked_names = [p.name.lower() for p in item.stacked_paths] if getattr(item, "is_stacked", False) else []
+        stacked_stems = [p.stem.lower() for p in item.stacked_paths] if getattr(item, "is_stacked", False) else []
+        all_names = [fn, stem, name] + stacked_names + stacked_stems
+
+        # 1. Exact match on stem or name
+        if q == stem or q == name or any(q == s for s in stacked_stems) or any(q == n for n in stacked_names):
+            return (0, 0)
+
+        # 2. Exact prefix match
+        if fn.startswith(q) or stem.startswith(q) or name.startswith(q):
+            return (1, 0)
+        if any(sn.startswith(q) or ss.startswith(q) for sn, ss in zip(stacked_names, stacked_stems)):
+            return (1, 1)
+
+        # 3. Substring match (partial string contains)
+        pos = fn.find(q)
+        if pos >= 0:
+            is_word_boundary = pos > 0 and fn[pos - 1] in "_- . "
+            return (2, 0 if is_word_boundary else pos + 1)
+
+        pos_stem = stem.find(q)
+        if pos_stem >= 0:
+            is_word_boundary = pos_stem > 0 and stem[pos_stem - 1] in "_- . "
+            return (2, 0 if is_word_boundary else pos_stem + 1)
+
+        pos_name = name.find(q)
+        if pos_name >= 0:
+            return (2, pos_name + 1)
+
+        for s_name in stacked_names:
+            sp = s_name.find(q)
+            if sp >= 0:
+                return (2, sp + 2)
+
+        # 4. Multi-token contains (e.g. "dsc 001" or "paris 2024")
+        tokens = [t for t in re.split(r'[\s_\-]+', q) if t]
+        if len(tokens) > 1:
+            all_text = " ".join(all_names)
+            if all(t in all_text for t in tokens):
+                return (3, 0)
+
+        # 5. Normalized alphanumeric contains (ignores _, -, ., space)
+        q_alnum = re.sub(r'[^a-z0-9]', '', q)
+        if len(q_alnum) >= 2:
+            fn_alnum = re.sub(r'[^a-z0-9]', '', fn)
+            if q_alnum in fn_alnum:
+                return (4, fn_alnum.find(q_alnum))
+            name_alnum = re.sub(r'[^a-z0-9]', '', name)
+            if q_alnum in name_alnum:
+                return (4, name_alnum.find(q_alnum))
+            for s_name in stacked_names:
+                sa = re.sub(r'[^a-z0-9]', '', s_name)
+                if q_alnum in sa:
+                    return (4, sa.find(q_alnum))
+
+        return None
+
     def _on_search_text_changed(self, *args):
         query = self.search_var.get().strip()
         if not query:
             self._hide_suggestions()
+            self._all_matches = []
+            self._current_match_cursor = 0
+            if hasattr(self, "lbl_search_count"):
+                self.lbl_search_count.configure(text="")
             return
         self._update_suggestions(query)
 
     def _update_suggestions(self, query: str):
-        q = query.lower()
         items = self._pending_items if self._pending_items else self.row_pool.items
         if not items:
             self._hide_suggestions()
+            self._all_matches = []
+            self._current_match_cursor = 0
+            if hasattr(self, "lbl_search_count"):
+                self.lbl_search_count.configure(text="")
             return
 
-        matches: List[Tuple[int, ImageItem]] = []
+        matches_with_score = []
         for idx, item in enumerate(items):
-            fn = item.filename.lower()
-            if q in fn:
-                matches.append((idx, item))
-            elif getattr(item, "is_stacked", False) and any(q in p.name.lower() for p in item.stacked_paths):
-                matches.append((idx, item))
+            score = self._match_item_filename(item, query)
+            if score is not None:
+                matches_with_score.append((score, idx, item))
 
-        if not matches:
+        if not matches_with_score:
+            self._all_matches = []
+            self._current_match_cursor = 0
+            if hasattr(self, "lbl_search_count"):
+                self.lbl_search_count.configure(text="0/0", text_color="#e63946")
             self._render_no_matches(query)
             return
 
-        def rank_key(pair: Tuple[int, ImageItem]):
-            idx, item = pair
-            fn = item.filename.lower()
-            stem = item.path.stem.lower()
-            if fn.startswith(q) or stem.startswith(q):
-                return (0, idx)
-            return (1, idx)
+        matches_with_score.sort(key=lambda x: (x[0], x[1]))
+        self._all_matches = [(idx, item) for _, idx, item in matches_with_score]
+        self._current_match_cursor = 0
 
-        matches.sort(key=rank_key)
-        self._suggestion_items = matches[:8]
+        total_cnt = len(self._all_matches)
+        if hasattr(self, "lbl_search_count"):
+            self.lbl_search_count.configure(text=f"1/{total_cnt}", text_color="#aaaaaa")
+
+        self._suggestion_items = self._all_matches[:10]
         self._highlighted_suggestion_idx = 0
         self._render_suggestions()
 
@@ -644,6 +758,17 @@ class ThumbnailList(ctk.CTkFrame):
             btn.bind("<Enter>", lambda e, s=s_idx: self._on_suggestion_hover(s))
             self._suggestion_buttons.append(btn)
 
+        if len(self._all_matches) > len(self._suggestion_items):
+            more_cnt = len(self._all_matches) - len(self._suggestion_items)
+            lbl_more = ctk.CTkLabel(
+                self.suggestion_container,
+                text=f"... and {more_cnt} more matches (Press Enter to cycle)",
+                font=ctk.CTkFont(size=10, slant="italic"),
+                text_color="#888888",
+                height=20,
+            )
+            lbl_more.pack(fill="x", padx=6, pady=(1, 3))
+
         if not self.suggestion_container.winfo_ismapped():
             self.suggestion_container.pack(side="top", fill="x", pady=(2, 0))
 
@@ -660,27 +785,81 @@ class ThumbnailList(ctk.CTkFrame):
 
     def _on_search_down(self, event=None):
         if not self._suggestion_items:
-            return "break"
+            query = self.search_var.get().strip()
+            if query:
+                self._update_suggestions(query)
+            if not self._suggestion_items:
+                return "break"
         self._highlighted_suggestion_idx = (self._highlighted_suggestion_idx + 1) % len(self._suggestion_items)
         self._update_suggestion_highlight()
         return "break"
 
     def _on_search_up(self, event=None):
         if not self._suggestion_items:
-            return "break"
+            query = self.search_var.get().strip()
+            if query:
+                self._update_suggestions(query)
+            if not self._suggestion_items:
+                return "break"
         self._highlighted_suggestion_idx = (self._highlighted_suggestion_idx - 1) % len(self._suggestion_items)
         self._update_suggestion_highlight()
         return "break"
 
     def _on_search_return(self, event=None):
-        if self._suggestion_items:
-            target_s_idx = (
-                self._highlighted_suggestion_idx
-                if 0 <= self._highlighted_suggestion_idx < len(self._suggestion_items)
-                else 0
+        if not self._all_matches:
+            query = self.search_var.get().strip()
+            if query:
+                self._update_suggestions(query)
+            if not self._all_matches:
+                return "break"
+
+        # If suggestions dropdown is visible and user navigated to a specific suggestion:
+        if (
+            self.suggestion_container.winfo_ismapped()
+            and self._suggestion_items
+            and 0 <= self._highlighted_suggestion_idx < len(self._suggestion_items)
+        ):
+            target_idx, _ = self._suggestion_items[self._highlighted_suggestion_idx]
+            for m_idx, (idx, _) in enumerate(self._all_matches):
+                if idx == target_idx:
+                    self._current_match_cursor = m_idx
+                    break
+            self.jump_to_index(target_idx)
+            self._current_match_cursor = (self._current_match_cursor + 1) % len(self._all_matches)
+            if hasattr(self, "lbl_search_count"):
+                self.lbl_search_count.configure(
+                    text=f"{self._current_match_cursor + 1}/{len(self._all_matches)}",
+                    text_color="#aaaaaa"
+                )
+            return "break"
+
+        # Otherwise cycle through all matching items
+        item_idx, _ = self._all_matches[self._current_match_cursor]
+        self.jump_to_index(item_idx)
+        self._current_match_cursor = (self._current_match_cursor + 1) % len(self._all_matches)
+        if hasattr(self, "lbl_search_count"):
+            self.lbl_search_count.configure(
+                text=f"{self._current_match_cursor + 1}/{len(self._all_matches)}",
+                text_color="#aaaaaa"
             )
-            item_idx, _ = self._suggestion_items[target_s_idx]
-            self.jump_to_index(item_idx)
+        return "break"
+
+    def _on_search_shift_return(self, event=None):
+        if not self._all_matches:
+            query = self.search_var.get().strip()
+            if query:
+                self._update_suggestions(query)
+            if not self._all_matches:
+                return "break"
+
+        self._current_match_cursor = (self._current_match_cursor - 1) % len(self._all_matches)
+        item_idx, _ = self._all_matches[self._current_match_cursor]
+        self.jump_to_index(item_idx)
+        if hasattr(self, "lbl_search_count"):
+            self.lbl_search_count.configure(
+                text=f"{self._current_match_cursor + 1}/{len(self._all_matches)}",
+                text_color="#aaaaaa"
+            )
         return "break"
 
     def _on_search_escape(self, event=None):
@@ -690,6 +869,16 @@ class ThumbnailList(ctk.CTkFrame):
         except Exception:
             pass
         return "break"
+
+    def _on_search_focus_in(self, event=None):
+        query = self.search_var.get().strip()
+        if query and not self.suggestion_container.winfo_ismapped():
+            self._update_suggestions(query)
+
+    def _on_search_click(self, event=None):
+        query = self.search_var.get().strip()
+        if query and not self.suggestion_container.winfo_ismapped():
+            self.after(50, lambda: self._update_suggestions(self.search_var.get().strip()))
 
     def _hide_suggestions(self):
         self._suggestion_items = []
@@ -716,17 +905,24 @@ class ThumbnailList(ctk.CTkFrame):
             self.set_selected_index(idx, item.path)
 
     def focus_search(self):
-        """Focus the search input and select existing text."""
+        """Focus the search input, select existing text, and show suggestions."""
         try:
             self.search_entry.focus_set()
             self.search_entry.select_range(0, "end")
             self.search_entry.icursor("end")
+            query = self.search_var.get().strip()
+            if query:
+                self._update_suggestions(query)
         except Exception:
             pass
 
     def clear_search(self, keep_focus: bool = True):
         """Clear search query and hide suggestions."""
         self.search_var.set("")
+        self._all_matches = []
+        self._current_match_cursor = 0
+        if hasattr(self, "lbl_search_count"):
+            self.lbl_search_count.configure(text="")
         self._hide_suggestions()
         if keep_focus:
             try:
@@ -915,6 +1111,7 @@ class ThumbnailList(ctk.CTkFrame):
         if cached is None or cached[0] != flag_color:
             try:
                 slot["indicator"].configure(fg_color=flag_color)
+                slot["applied"]["flag"] = flag_color
             except Exception:
                 pass
 
@@ -924,12 +1121,24 @@ class ThumbnailList(ctk.CTkFrame):
         widget = self._label_map.get(idx)
         if widget is not None:
             if isinstance(widget, ctk.CTkLabel):
-                text = f"{self.base_stem_for(item).upper()} [{item.format_name}] {stars}"
+                if getattr(item, "is_stacked", False) and len(getattr(item, "stacked_paths", [])) >= 2:
+                    raw_n = sum(1 for p in item.stacked_paths if p.suffix.lower() == ".arw")
+                    jpg_n = sum(1 for p in item.stacked_paths if p.suffix.lower() in (".jpg", ".jpeg"))
+                    parts = []
+                    if raw_n:
+                        parts.append(f"{raw_n} ARW")
+                    if jpg_n:
+                        parts.append(f"{jpg_n} JPG")
+                    comp = ", ".join(parts) if parts else f"{len(item.stacked_paths)} files"
+                    text = f"{self.base_stem_for(item).upper()} [Stacked: {comp}] {stars}"
+                else:
+                    text = f"{self.base_stem_for(item).upper()} [{item.format_name}] {stars}"
             elif isinstance(widget, ctk.CTkButton):
                 text = f"{item.filename}\n{stars}" if stars else item.filename
             if text is not None and (cached is None or cached[1] != text):
                 try:
                     widget.configure(text=text)
+                    slot["applied"]["text"] = text
                 except Exception:
                     pass
 
@@ -1222,10 +1431,16 @@ class ThumbnailList(ctk.CTkFrame):
             self._reset_rows()
 
         self._current_item_signature = new_signature
-        self._prev_selected_indices = {selected_idx}
-        self._prev_active_idx = selected_idx
+        self._current_selected_indices = {selected_idx} if items else set()
+        self._current_active_idx = selected_idx if items else -1
+        self._prev_selected_indices = {selected_idx} if items else set()
+        self._prev_active_idx = selected_idx if items else -1
 
         if not items:
+            self._current_selected_indices = set()
+            self._current_active_idx = -1
+            self._prev_selected_indices = set()
+            self._prev_active_idx = -1
             self.row_pool.set_items([])
             self.row_pool.sync()
             self._total_thumbs = 0
@@ -1247,6 +1462,13 @@ class ThumbnailList(ctk.CTkFrame):
             # Same rows as last time. Only the visible ones have widgets, so this is a
             # bounded walk, and the statuses of the rest are re-applied lazily as the
             # pool rebinds them.
+            self._invalidate_row_render_cache()
+            for item_idx, slot_idx in list(self.row_pool._slot_by_item.items()):
+                if 0 <= item_idx < len(items) and slot_idx < len(self.row_pool._slots):
+                    item = items[item_idx]
+                    self.update_single_item_status(item_idx, item)
+                    slot = self.row_pool._slots[slot_idx]
+                    self.row_pool._style_slot(slot, item_idx)
             cached_count = self._count_cached_thumb_requests(items)
             self._total_thumbs = cached_count
             self._loaded_thumbs = cached_count
@@ -1282,6 +1504,9 @@ class ThumbnailList(ctk.CTkFrame):
         self._ctk_img_cache.clear()
         self._inflight_thumbs.clear()
         self._failed_thumbs.clear()
+        self._current_selected_indices = set()
+        self._current_active_idx = -1
+        self._current_active_path_str = None
         self._prev_selected_indices = set()
         self._prev_active_idx = -1
         self._prev_active_path_str = None

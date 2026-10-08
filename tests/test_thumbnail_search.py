@@ -224,6 +224,95 @@ class TestThumbnailSearch(unittest.TestCase):
         self.assertEqual(self.thumb_list._suggestion_buttons[2].cget("fg_color"), "#1f538d")
         self.assertEqual(self.thumb_list._suggestion_buttons[0].cget("fg_color"), "transparent")
 
+    def test_partial_string_substring_matching(self):
+        # Substring "300" within SUNSET_DSC00300.JPG
+        self.thumb_list.search_var.set("300")
+        self.root.update()
+
+        self.assertEqual(len(self.thumb_list._all_matches), 1)
+        self.assertEqual(self.thumb_list._all_matches[0][1].filename, "SUNSET_DSC00300.JPG")
+
+        # Substring "SET" within SUNSET_DSC00300.JPG
+        self.thumb_list.search_var.set("SET")
+        self.root.update()
+        self.assertEqual(len(self.thumb_list._all_matches), 1)
+        self.assertEqual(self.thumb_list._all_matches[0][1].filename, "SUNSET_DSC00300.JPG")
+
+        # Substring "PORT" within FAMILY_PORTRAIT.JPG
+        self.thumb_list.search_var.set("PORT")
+        self.root.update()
+        self.assertEqual(len(self.thumb_list._all_matches), 1)
+        self.assertEqual(self.thumb_list._all_matches[0][1].filename, "FAMILY_PORTRAIT.JPG")
+
+    def test_multi_token_contains_matching(self):
+        # Space-separated tokens "sunset 300"
+        self.thumb_list.search_var.set("sunset 300")
+        self.root.update()
+        self.assertEqual(len(self.thumb_list._all_matches), 1)
+        self.assertEqual(self.thumb_list._all_matches[0][1].filename, "SUNSET_DSC00300.JPG")
+
+        # Space-separated tokens "family portrait"
+        self.thumb_list.search_var.set("family portrait")
+        self.root.update()
+        self.assertEqual(len(self.thumb_list._all_matches), 1)
+        self.assertEqual(self.thumb_list._all_matches[0][1].filename, "FAMILY_PORTRAIT.JPG")
+
+    def test_enter_cycles_through_all_matches(self):
+        self.thumb_list.search_var.set("DSC")
+        self.root.update()
+
+        # Should match 4 items: DSC00101, DSC00102, DSC00201, SUNSET_DSC00300
+        self.assertEqual(len(self.thumb_list._all_matches), 4)
+        self.assertEqual(self.thumb_list.lbl_search_count.cget("text"), "1/4")
+
+        # Press Return -> jumps to match 0
+        self.thumb_list._on_search_return()
+        self.assertEqual(self.mock_select.call_args[0][0], self.thumb_list._all_matches[0][0])
+        self.assertEqual(self.thumb_list.lbl_search_count.cget("text"), "2/4")
+
+        # Press Return -> jumps to match 1
+        self.thumb_list._on_search_return()
+        self.assertEqual(self.mock_select.call_args[0][0], self.thumb_list._all_matches[1][0])
+        self.assertEqual(self.thumb_list.lbl_search_count.cget("text"), "3/4")
+
+        # Press Return -> jumps to match 2
+        self.thumb_list._on_search_return()
+        self.assertEqual(self.mock_select.call_args[0][0], self.thumb_list._all_matches[2][0])
+        self.assertEqual(self.thumb_list.lbl_search_count.cget("text"), "4/4")
+
+        # Press Return -> jumps to match 3
+        self.thumb_list._on_search_return()
+        self.assertEqual(self.mock_select.call_args[0][0], self.thumb_list._all_matches[3][0])
+        self.assertEqual(self.thumb_list.lbl_search_count.cget("text"), "1/4")
+
+    def test_shift_enter_cycles_backward(self):
+        self.thumb_list.search_var.set("DSC")
+        self.root.update()
+
+        # Shift+Return from initial position -> jumps to last match (wrap around)
+        self.thumb_list._on_search_shift_return()
+        self.assertEqual(self.mock_select.call_args[0][0], self.thumb_list._all_matches[3][0])
+        self.assertEqual(self.thumb_list.lbl_search_count.cget("text"), "4/4")
+
+        # Shift+Return again -> jumps to match 2
+        self.thumb_list._on_search_shift_return()
+        self.assertEqual(self.mock_select.call_args[0][0], self.thumb_list._all_matches[2][0])
+        self.assertEqual(self.thumb_list.lbl_search_count.cget("text"), "3/4")
+
+    def test_search_count_indicator(self):
+        # Empty
+        self.assertEqual(self.thumb_list.lbl_search_count.cget("text"), "")
+
+        # Matched
+        self.thumb_list.search_var.set("PORTRAIT")
+        self.root.update()
+        self.assertEqual(self.thumb_list.lbl_search_count.cget("text"), "1/1")
+
+        # Non-matching
+        self.thumb_list.search_var.set("NON_EXISTING")
+        self.root.update()
+        self.assertEqual(self.thumb_list.lbl_search_count.cget("text"), "0/0")
+
 
 class TestGuiSearchIntegration(unittest.TestCase):
     def test_is_entry_focused(self):

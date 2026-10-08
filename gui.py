@@ -518,6 +518,11 @@ class ImageCullerApp(ctk.CTk):
         except Exception:
             log_error("Failed to clear the viewer after closing tabs", exc_info=True)
 
+        try:
+            self.toolbar.update_filter_counts(None)
+        except Exception:
+            pass
+
         self._sync_loading_progress()
         self._update_status("No folder open. Use + to open one.")
 
@@ -550,6 +555,7 @@ class ImageCullerApp(ctk.CTk):
 
         self.thumb_list.set_image_loader(session.image_loader)
         self.toolbar.apply_filter_values(tab.get("filter_values", {}))
+        self._update_toolbar_filter_counts()
         self.meta_panel.update_output_folders(
             self.db.get_picked_folder(),
             self.db.get_rejected_folder()
@@ -734,36 +740,93 @@ class ImageCullerApp(ctk.CTk):
             if not items:
                 return
 
-        placeholder_items = []
-        for item in items:
-            pi = ImageItem(item.path)
-            pi.filename = item.filename or item.path.name
-            pi.format_name = getattr(item, "format_name", item.path.suffix.upper().lstrip("."))
-            pi.flag = item.flag
-            pi.rating = item.rating
-            pi.is_stacked = False
-            pi.stacked_paths = [item.path]
-            pi.is_placeholder = True
-            placeholder_items.append(pi)
+        placeholder_items = items
+        tab["placeholder_items"] = placeholder_items
+        if session:
+            session.items = placeholder_items
+            session.placeholder_items = placeholder_items
+
+        filter_vals = tab.get("filter_values", {})
+        flag_f = filter_vals.get("flag", "All")
+        rating_set, fmt_val, tag_f = ImageCullerApp._parse_filter_criteria(filter_vals)
+        if session and ((flag_f and flag_f != "All") or rating_set or (fmt_val and "ALL" not in fmt_val.upper()) or tag_f):
+            try:
+                display_items = session.get_filtered_items(
+                    flag_filter=flag_f,
+                    rating_filter=rating_set,
+                    format_filter=fmt_val,
+                    tag_filter=tag_f
+                )
+            except Exception:
+                display_items = placeholder_items
+        else:
+            display_items = placeholder_items
 
         sel_idx = 0
         pending_target = tab.get("pending_target_image")
         if pending_target:
-            f_idx, _ = find_item_index_by_path(placeholder_items, pending_target)
+            f_idx, _ = find_item_index_by_path(display_items, pending_target)
             if f_idx >= 0:
                 sel_idx = f_idx
 
-        tab["current_items"] = placeholder_items
+        tab["current_items"] = display_items
         tab["current_index"] = sel_idx
         if tab is self._get_active_tab():
-            self.current_items = placeholder_items
+            self.current_items = display_items
             self.current_index = sel_idx
             if session:
                 self.thumb_list.set_image_loader(session.image_loader)
-            self.thumb_list.update_items(placeholder_items, selected_idx=sel_idx, white_balance=white_balance)
-            if placeholder_items and 0 <= sel_idx < len(placeholder_items):
+            self.thumb_list.update_items(display_items, selected_idx=sel_idx, white_balance=white_balance)
+            self._update_toolbar_filter_counts()
+            if display_items and 0 <= sel_idx < len(display_items):
                 self._select_image(sel_idx, from_click=False)
             self._sync_loading_progress()
+
+    @staticmethod
+    def _sync_tab_scan_items(tab: Dict[str, Any], session: Any):
+        user_actions = tab.pop("_user_actions", {}) or {}
+
+        # 1. Apply all explicit user actions made during the background scan
+        if user_actions:
+            for item in session.items:
+                act = user_actions.get(item.path)
+                if not act:
+                    for p in getattr(item, "stacked_paths", []):
+                        if p in user_actions:
+                            act = user_actions[p]
+                            break
+                if act:
+                    if "flag" in act:
+                        item.flag = act["flag"]
+                    if "rating" in act:
+                        item.rating = act["rating"]
+                    if "tags" in act:
+                        item.tags = set(act["tags"])
+
+        # 2. Sync decisions from placeholder items in case a donor wasn't reused
+        placeholder_items = tab.get("placeholder_items", [])
+        if placeholder_items:
+            placeholder_map: Dict[Any, ImageItem] = {}
+            for pi in placeholder_items:
+                placeholder_map[pi.path] = pi
+                for p in getattr(pi, "stacked_paths", []):
+                    placeholder_map[p] = pi
+
+            for item in session.items:
+                if item.path not in user_actions and not any(p in user_actions for p in getattr(item, "stacked_paths", [])):
+                    pi = placeholder_map.get(item.path)
+                    if pi is None:
+                        for p in getattr(item, "stacked_paths", []):
+                            if p in placeholder_map:
+                                pi = placeholder_map[p]
+                                break
+                    if pi is not None:
+                        if pi.flag != FlagState.UNFLAGGED and item.flag == FlagState.UNFLAGGED:
+                            item.flag = pi.flag
+                        if pi.rating > 0 and item.rating == 0:
+                            item.rating = pi.rating
+                        if pi.tags and not item.tags:
+                            item.tags = set(pi.tags)
 
     def _on_tab_scan_complete(self, tab: Dict[str, Any]):
         # A tab closed mid-scan: the worker thread still holds a reference to its dict.
@@ -773,6 +836,7 @@ class ImageCullerApp(ctk.CTk):
         self._watch_tab_directory(tab)
 
         session = tab["session"]
+        ImageCullerApp._sync_tab_scan_items(tab, session)
         self._apply_tab_filter_values(tab)
 
         if tab is not self._get_active_tab():
@@ -781,6 +845,7 @@ class ImageCullerApp(ctk.CTk):
         self.thumb_list.finish_folder_timing()
         self.thumb_list.set_image_loader(session.image_loader)
         self._on_filter_changed()
+        self._update_toolbar_filter_counts()
         stats = tab["session"].get_summary_stats()
         arw_count = stats.get("arw_count", tab.get("arw_count", 0))
         arw_info = f" ({arw_count} ARW)" if arw_count > 0 else ""
@@ -840,34 +905,7 @@ class ImageCullerApp(ctk.CTk):
             return
 
         filter_vals = tab.get("filter_values", {})
-
-        rating_selected = filter_vals.get("rating", [])
-        rating_filter_set = None
-        if rating_selected:
-            rating_filter_set = set()
-            for r_str in rating_selected:
-                if r_str == "Unrated":
-                    rating_filter_set.add(0)
-                else:
-                    try:
-                        rating_filter_set.add(int(r_str.replace("★", "").strip()))
-                    except Exception:
-                        pass
-
-        fmt_val = filter_vals.get("format", "All Formats")
-        if ".ARW" in fmt_val.upper() or "ARW" in fmt_val.upper():
-            fmt_val = ".ARW"
-        elif ".JPG" in fmt_val.upper() or "JPG" in fmt_val.upper():
-            fmt_val = ".JPG"
-        elif ".PNG" in fmt_val.upper() or "PNG" in fmt_val.upper():
-            fmt_val = ".PNG"
-        elif ".HEIC" in fmt_val.upper() or "HEIC" in fmt_val.upper():
-            fmt_val = ".HEIC"
-        else:
-            fmt_val = "All"
-
-        tag_selected = filter_vals.get("tag", [])
-        tag_filter = tag_selected if tag_selected else None
+        rating_filter_set, fmt_val, tag_filter = ImageCullerApp._parse_filter_criteria(filter_vals)
 
         tab["current_items"] = session.get_filtered_items(
             flag_filter=filter_vals.get("flag", "All"),
@@ -1163,6 +1201,10 @@ class ImageCullerApp(ctk.CTk):
         self.bind("<Control-C>", lambda e: self._on_copy_image_to_clipboard())
         self.bind("<Control-s>", lambda e: self._on_save_as())
         self.bind("<Control-S>", lambda e: self._on_save_as())
+        self.bind("<Control-a>", self._on_ctrl_a)
+        self.bind("<Control-A>", self._on_ctrl_a)
+        self.bind("<Control-d>", lambda e: None if self._is_entry_focused() else self._select_none())
+        self.bind("<Control-D>", lambda e: None if self._is_entry_focused() else self._select_none())
         self.bind("<Return>", lambda e: None if self._is_entry_focused() else self._on_return_pressed())
         self.bind("<KP_Enter>", lambda e: None if self._is_entry_focused() else self._on_return_pressed())
         self.bind("<Escape>", lambda e: None if self._is_entry_focused() else self._on_escape_pressed())
@@ -1286,13 +1328,7 @@ class ImageCullerApp(ctk.CTk):
             "format": "All Formats",
             "tag": []
         }
-        tab["loading"] = True
-        tab["load_total"] = 0
-        tab["load_current"] = 0
-        tab["arw_count"] = 0
-        tab["_placeholders_loaded"] = False
         tab["pending_target_image"] = target_image
-        tab["_load_started_at"] = time.monotonic()
 
         self.current_items = []
         self.current_index = -1
@@ -1303,89 +1339,18 @@ class ImageCullerApp(ctk.CTk):
 
         self.tab_bar.set_label(self.active_tab_index, tab["tab_label"] + " ⟳")
         self._update_status(f"Scanning directory: {folder_path}...")
-        self.thumb_list.start_load_timing(tab["_load_started_at"])
-
-        white_balance = self.toolbar.get_white_balance()
-
-        def on_discovered(items: List[ImageItem], arw_count: int):
-            tab["arw_count"] = arw_count
-            tab["load_total"] = len(items)
-            if not tab.get("_released"):
-                if not tab.get("_placeholders_loaded"):
-                    tab["_placeholders_loaded"] = True
-                    self.after(0, lambda: self._preload_placeholder_items(tab, white_balance, items=items, arw_count=arw_count))
-                elif tab is self._get_active_tab():
-                    self.after(0, self._sync_loading_progress)
-
-        def on_progress(current: int, total: int, filename: str = ""):
-            tab["load_current"] = current
-            tab["load_total"] = total
-            if tab is self._get_active_tab() and not tab.get("_released"):
-                if current == 0 and total > 0 and not tab.get("_placeholders_loaded"):
-                    tab["_placeholders_loaded"] = True
-                    self.after(50, lambda: self._preload_placeholder_items(tab, white_balance))
-                self.after(0, self._sync_loading_progress)
-
-        def worker():
-            started_at = time.monotonic()
-            try:
-                tab["session"].scan_directory(
-                    folder_path,
-                    stack_raw_jpg=True,
-                    progress_callback=on_progress,
-                    on_discovered=on_discovered,
-                )
-                tab["load_stats"]["folder"] = time.monotonic() - started_at
-                tab["is_loaded"] = True
-                tab["loading"] = False
-                self.after(0, lambda: self._on_scan_complete(tab))
-            except Exception as e:
-                tab["load_stats"]["folder"] = time.monotonic() - started_at
-                tab["loading"] = False
-                self.after(0, lambda err=e: self._on_scan_error(tab, err))
-
-        threading.Thread(target=worker, daemon=True).start()
+        self._load_tab_directory(tab, show_progress=True)
 
     def _on_scan_complete(self, tab: Dict[str, Any]):
-        self._update_tab_loading_indicator(tab)
-        self._watch_tab_directory(tab)
-
-        if tab is not self._get_active_tab():
-            return
-
-        self.thumb_list.finish_folder_timing()
-
-        self._on_filter_changed(trigger_source="operation")
-        stats = tab["session"].get_summary_stats()
-        arw_count = stats.get("arw_count", tab.get("arw_count", 0))
-        arw_info = f" ({arw_count} ARW)" if arw_count > 0 else ""
-        if stats['total_images'] == 0:
-            folder_str = str(tab["session"].directory) if tab["session"].directory else "selected directory"
-            mb.showwarning(
-                "No Photos Found",
-                f"No supported photo files (.ARW, .JPG, .PNG, .HEIC, .CR2, .NEF, etc.) were found in:\n\n{folder_str}"
-            )
-            self._update_status(f"No supported photo files found in {folder_str}.")
-        else:
-            self._update_status(
-                f"Loaded {stats['total_images']} photos{arw_info} ({stats['total_size_mb']} MB) | "
-                f"Picked: {stats['picked']}, Rejected: {stats['rejected']}, Unflagged: {stats['unflagged']}"
-            )
+        self._on_tab_scan_complete(tab)
+        # Completed scan delegates to _on_tab_scan_complete which calls self._on_filter_changed()
 
     def _on_scan_error(self, tab: Dict[str, Any], err: Exception):
-        self._update_tab_loading_indicator(tab)
-        self.thumb_list.finish_load_timing()
-        self._update_status("Error loading directory.")
+        self._on_tab_scan_error(tab, err)
 
-    def _on_filter_changed(self, trigger_source: str = "filter"):
-        tab = self._get_active_tab()
-        session = self._get_active_session()
-        if not tab or not session:
-            return
-
-        filter_vals = self.toolbar.get_filter_values()
-
-        rating_selected = filter_vals["rating"]
+    @staticmethod
+    def _parse_filter_criteria(filter_vals: Dict[str, Any]):
+        rating_selected = filter_vals.get("rating", [])
         rating_filter_set = None
         if rating_selected:
             rating_filter_set = set()
@@ -1398,15 +1363,98 @@ class ImageCullerApp(ctk.CTk):
                     except Exception:
                         pass
 
-        fmt_val = filter_vals["format"]
-        if ".ARW" in fmt_val.upper() or "ARW" in fmt_val.upper(): fmt_val = ".ARW"
-        elif ".JPG" in fmt_val.upper() or "JPG" in fmt_val.upper(): fmt_val = ".JPG"
-        elif ".PNG" in fmt_val.upper() or "PNG" in fmt_val.upper(): fmt_val = ".PNG"
-        elif ".HEIC" in fmt_val.upper() or "HEIC" in fmt_val.upper(): fmt_val = ".HEIC"
-        else: fmt_val = "All"
+        fmt_val = filter_vals.get("format", "All Formats")
+        if ".ARW" in fmt_val.upper() or "ARW" in fmt_val.upper():
+            fmt_val = ".ARW"
+        elif ".JPG" in fmt_val.upper() or "JPG" in fmt_val.upper():
+            fmt_val = ".JPG"
+        elif ".PNG" in fmt_val.upper() or "PNG" in fmt_val.upper():
+            fmt_val = ".PNG"
+        elif ".HEIC" in fmt_val.upper() or "HEIC" in fmt_val.upper():
+            fmt_val = ".HEIC"
+        else:
+            fmt_val = "All"
 
         tag_selected = filter_vals.get("tag", [])
         tag_filter = tag_selected if tag_selected else None
+
+        return rating_filter_set, fmt_val, tag_filter
+
+    @staticmethod
+    def _compute_flag_counts(
+        session,
+        rating_filter_set: Optional[Set[int]] = None,
+        fmt_val: str = "All",
+        tag_filter: Optional[List[str]] = None
+    ) -> Dict[str, int]:
+        if not session or not getattr(session, "items", None):
+            return {"All": 0, "Pick": 0, "Reject": 0, "Unflagged": 0}
+
+        if rating_filter_set or (fmt_val and "ALL" not in fmt_val.upper()) or tag_filter:
+            try:
+                base_items = session.get_filtered_items(
+                    flag_filter="ALL",
+                    rating_filter=rating_filter_set,
+                    format_filter=fmt_val,
+                    tag_filter=tag_filter
+                )
+            except Exception:
+                base_items = session.items
+        else:
+            base_items = session.items
+
+        all_cnt = len(base_items)
+        pick_cnt = 0
+        reject_cnt = 0
+        unflagged_cnt = 0
+        for item in base_items:
+            flag_val = getattr(getattr(item, "flag", None), "value", str(getattr(item, "flag", "")))
+            if flag_val == "PICK":
+                pick_cnt += 1
+            elif flag_val == "REJECT":
+                reject_cnt += 1
+            elif flag_val == "UNFLAGGED":
+                unflagged_cnt += 1
+
+        return {
+            "All": all_cnt,
+            "Pick": pick_cnt,
+            "Reject": reject_cnt,
+            "Unflagged": unflagged_cnt
+        }
+
+    def _update_toolbar_filter_counts(self):
+        if not hasattr(self, "toolbar"):
+            return
+        session = self._get_active_session()
+        if not session or not getattr(session, "items", None):
+            try:
+                self.toolbar.update_filter_counts({"All": 0, "Pick": 0, "Reject": 0, "Unflagged": 0} if session else None)
+            except Exception:
+                pass
+            return
+
+        try:
+            filter_vals = self.toolbar.get_filter_values()
+            rating_filter_set, fmt_val, tag_filter = ImageCullerApp._parse_filter_criteria(filter_vals)
+            counts = ImageCullerApp._compute_flag_counts(
+                session=session,
+                rating_filter_set=rating_filter_set,
+                fmt_val=fmt_val,
+                tag_filter=tag_filter
+            )
+            self.toolbar.update_filter_counts(counts)
+        except Exception:
+            log_error("Failed to update toolbar filter counts", exc_info=True)
+
+    def _on_filter_changed(self, trigger_source: str = "filter"):
+        tab = self._get_active_tab()
+        session = self._get_active_session()
+        if not tab or not session:
+            return
+
+        filter_vals = self.toolbar.get_filter_values()
+        rating_filter_set, fmt_val, tag_filter = ImageCullerApp._parse_filter_criteria(filter_vals)
 
         prev_selected_path = None
         if self.current_items and 0 <= self.current_index < len(self.current_items):
@@ -1475,6 +1523,17 @@ class ImageCullerApp(ctk.CTk):
 
         log_info(f"_on_filter_changed: filter='{filter_vals['flag']}', rating={rating_filter_set}, format='{fmt_val}', tag='{tag_filter}' -> {len(self.current_items)} items matched")
 
+        counts = ImageCullerApp._compute_flag_counts(
+            session=session,
+            rating_filter_set=rating_filter_set,
+            fmt_val=fmt_val,
+            tag_filter=tag_filter
+        )
+        try:
+            self.toolbar.update_filter_counts(counts)
+        except Exception:
+            pass
+
         white_balance = self.toolbar.get_white_balance()
 
         self.thumb_list.update_items(
@@ -1491,10 +1550,34 @@ class ImageCullerApp(ctk.CTk):
             self.meta_panel.clear()
             self._update_status("No photos match current filter criteria.")
 
+    def _on_ctrl_a(self, event=None):
+        if self._is_entry_focused():
+            w = self.focus_get()
+            if hasattr(w, "select_range"):
+                try:
+                    w.select_range(0, "end")
+                    w.icursor("end")
+                    return "break"
+                except Exception:
+                    pass
+            elif hasattr(w, "_entry") and hasattr(w._entry, "select_range"):
+                try:
+                    w._entry.select_range(0, "end")
+                    w._entry.icursor("end")
+                    return "break"
+                except Exception:
+                    pass
+            return None
+        self._select_all()
+        return "break"
+
     def _select_all(self):
         if not self.current_items:
             return
         self.selected_indices = set(range(len(self.current_items)))
+        tab = self._get_active_tab()
+        if tab:
+            tab["selected_indices"] = set(self.selected_indices)
         cur_idx = self.current_index if 0 <= self.current_index < len(self.current_items) else 0
         cur_item = self.current_items[cur_idx]
         self.thumb_list.set_selected_indices(self.selected_indices, cur_idx, active_path=cur_item.path)
@@ -1506,6 +1589,10 @@ class ImageCullerApp(ctk.CTk):
         cur_idx = self.current_index if 0 <= self.current_index < len(self.current_items) else 0
         self.selected_indices = {cur_idx}
         self.selection_anchor_idx = cur_idx
+        tab = self._get_active_tab()
+        if tab:
+            tab["selected_indices"] = {cur_idx}
+            tab["selection_anchor_idx"] = cur_idx
         cur_item = self.current_items[cur_idx]
         self.thumb_list.set_selected_indices(self.selected_indices, cur_idx, active_path=cur_item.path)
         self._update_status(f"Selection cleared to active photo ({cur_idx + 1}/{len(self.current_items)}).")
@@ -1732,22 +1819,46 @@ class ImageCullerApp(ctk.CTk):
         display_name = active_path.name if active_path else item.filename
         self._update_status(f"Displaying: {display_name} [{item.format_name} - {res_str}]")
 
+    def _record_user_item_action(self, item: ImageItem):
+        tab = self._get_active_tab()
+        if not tab:
+            return
+        actions = tab.setdefault("_user_actions", {})
+        info = {
+            "flag": item.flag,
+            "rating": item.rating,
+            "tags": set(item.tags)
+        }
+        actions[item.path] = info
+        for p in getattr(item, "stacked_paths", []):
+            actions[p] = info
+
     def _set_current_flag(self, flag: FlagState):
         session = self._get_active_session()
         if self.current_index < 0 or not self.current_items or not session:
             return
         target_indices = self.selected_indices if self.selected_indices else {self.current_index}
+        changed_items = []
         for idx in target_indices:
             if 0 <= idx < len(self.current_items):
                 item = self.current_items[idx]
                 item.flag = flag
-                session.save_item_record(item)
+                changed_items.append(item)
                 self.thumb_list.update_single_item_status(idx, item)
+
+        for ci in changed_items:
+            self._record_user_item_action(ci)
+
+        if len(changed_items) == 1:
+            session.save_item_record(changed_items[0])
+        elif len(changed_items) > 1:
+            session.save_item_records(changed_items)
 
         cur_item = self.current_items[self.current_index]
         self.meta_panel.update_metadata(cur_item)
         count_str = f" across {len(target_indices)} photos" if len(target_indices) > 1 else ""
         self._update_status(f"Flagged {cur_item.filename} as {flag.value}{count_str}")
+        self._update_toolbar_filter_counts()
 
     def _on_unreject_current(self):
         session = self._get_active_session()
@@ -1755,14 +1866,23 @@ class ImageCullerApp(ctk.CTk):
             return
         target_indices = self.selected_indices if self.selected_indices else {self.current_index}
         unrejected_count = 0
+        changed_items = []
         for idx in target_indices:
             if 0 <= idx < len(self.current_items):
                 item = self.current_items[idx]
                 if item.flag == FlagState.REJECT:
                     item.flag = FlagState.UNFLAGGED
-                    session.save_item_record(item)
+                    changed_items.append(item)
                     self.thumb_list.update_single_item_status(idx, item)
                     unrejected_count += 1
+
+        for ci in changed_items:
+            self._record_user_item_action(ci)
+
+        if len(changed_items) == 1:
+            session.save_item_record(changed_items[0])
+        elif len(changed_items) > 1:
+            session.save_item_records(changed_items)
 
         cur_item = self.current_items[self.current_index]
         self.meta_panel.update_metadata(cur_item)
@@ -1771,6 +1891,7 @@ class ImageCullerApp(ctk.CTk):
             self._update_status(f"Unrejected {cur_item.filename}{count_str}")
         else:
             self._update_status(f"Selected photo(s) are not flagged as REJECT")
+        self._update_toolbar_filter_counts()
 
     def _on_unpick_current(self):
         session = self._get_active_session()
@@ -1778,14 +1899,23 @@ class ImageCullerApp(ctk.CTk):
             return
         target_indices = self.selected_indices if self.selected_indices else {self.current_index}
         unpicked_count = 0
+        changed_items = []
         for idx in target_indices:
             if 0 <= idx < len(self.current_items):
                 item = self.current_items[idx]
                 if item.flag == FlagState.PICK:
                     item.flag = FlagState.UNFLAGGED
-                    session.save_item_record(item)
+                    changed_items.append(item)
                     self.thumb_list.update_single_item_status(idx, item)
                     unpicked_count += 1
+
+        for ci in changed_items:
+            self._record_user_item_action(ci)
+
+        if len(changed_items) == 1:
+            session.save_item_record(changed_items[0])
+        elif len(changed_items) > 1:
+            session.save_item_records(changed_items)
 
         cur_item = self.current_items[self.current_index]
         self.meta_panel.update_metadata(cur_item)
@@ -1794,29 +1924,41 @@ class ImageCullerApp(ctk.CTk):
             self._update_status(f"Unpicked {cur_item.filename}{count_str}")
         else:
             self._update_status(f"Selected photo(s) are not flagged as PICK")
+        self._update_toolbar_filter_counts()
 
     def _set_current_rating(self, rating: int):
         session = self._get_active_session()
         if self.current_index < 0 or not self.current_items or not session:
             return
         target_indices = self.selected_indices if self.selected_indices else {self.current_index}
+        changed_items = []
         for idx in target_indices:
             if 0 <= idx < len(self.current_items):
                 item = self.current_items[idx]
                 item.rating = rating
-                session.save_item_record(item)
+                changed_items.append(item)
                 self.thumb_list.update_single_item_status(idx, item)
+
+        for ci in changed_items:
+            self._record_user_item_action(ci)
+
+        if len(changed_items) == 1:
+            session.save_item_record(changed_items[0])
+        elif len(changed_items) > 1:
+            session.save_item_records(changed_items)
 
         cur_item = self.current_items[self.current_index]
         self.meta_panel.update_metadata(cur_item)
         count_str = f" across {len(target_indices)} photos" if len(target_indices) > 1 else ""
         self._update_status(f"Set rating for {cur_item.filename} to {rating} stars{count_str}")
+        self._update_toolbar_filter_counts()
 
     def _on_toggle_tag(self, tag_name: str):
         session = self._get_active_session()
         if self.current_index < 0 or not self.current_items or not session:
             return
         target_indices = self.selected_indices if self.selected_indices else {self.current_index}
+        changed_items = []
         for idx in target_indices:
             if 0 <= idx < len(self.current_items):
                 item = self.current_items[idx]
@@ -1824,11 +1966,20 @@ class ImageCullerApp(ctk.CTk):
                     item.remove_tag(tag_name)
                 else:
                     item.add_tag(tag_name)
-                session.save_item_record(item)
+                changed_items.append(item)
+
+        for ci in changed_items:
+            self._record_user_item_action(ci)
+
+        if len(changed_items) == 1:
+            session.save_item_record(changed_items[0])
+        elif len(changed_items) > 1:
+            session.save_item_records(changed_items)
 
         cur_item = self.current_items[self.current_index]
         self.meta_panel.update_metadata(cur_item)
         self._update_status(f"Toggled tag '{tag_name}' for {len(target_indices)} photo(s)")
+        self._update_toolbar_filter_counts()
 
     def _navigate(self, delta: int, is_shift: bool = False):
         if not self.current_items:
@@ -2270,7 +2421,8 @@ class ImageCullerApp(ctk.CTk):
         if ans:
             count = session.unflag_all_items()
             self.toolbar.seg_filter.set("All")
-            self._on_filter_changed()
+            self.selected_indices = set()
+            self._on_filter_changed(trigger_source="unflag_all")
             self._update_status(f"Unflagged {count} images across current directory.")
 
     def _on_untag_all(self):
@@ -2281,7 +2433,9 @@ class ImageCullerApp(ctk.CTk):
         ans = mb.askyesno("Untag All Images", "Are you sure you want to remove all tags from all images?")
         if ans:
             count = session.untag_all_items()
-            self._on_filter_changed()
+            self.toolbar.tag_filter.reset()
+            self.selected_indices = set()
+            self._on_filter_changed(trigger_source="untag_all")
             self._update_status(f"Removed all tags across {count} images.")
 
     def _on_unrate_all(self):
@@ -2292,7 +2446,9 @@ class ImageCullerApp(ctk.CTk):
         ans = mb.askyesno("Remove All Ratings", "Are you sure you want to reset all star ratings to 0?")
         if ans:
             count = session.unrate_all_items()
-            self._on_filter_changed()
+            self.toolbar.rating_filter.reset()
+            self.selected_indices = set()
+            self._on_filter_changed(trigger_source="unrate_all")
             self._update_status(f"Reset star ratings to 0 across {count} images.")
 
     def _on_clear_all(self):
@@ -2304,8 +2460,11 @@ class ImageCullerApp(ctk.CTk):
         if ans:
             count = session.clear_all_metadata()
             self.toolbar.seg_filter.set("All")
+            self.toolbar.tag_filter.reset()
+            self.toolbar.rating_filter.reset()
+            self.selected_indices = set()
             self.viewer.clear_detection_box()
-            self._on_filter_changed()
+            self._on_filter_changed(trigger_source="clear_all")
             self._update_status(f"Cleared flags, tags, ratings, and subject bounding boxes across {count} photos.")
 
     def _on_trigger_crop(self):
