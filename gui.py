@@ -32,7 +32,7 @@ from culler.dataset_exporter import save_annotation, save_manual_annotation
 from culler.folder_watcher import FolderWatcher, FolderChange
 from culler.exif_wrapper import ExifToolWrapper
 from culler.image_loader import ImageLoader
-from culler.gui.metadata_panel import BAG_SETTINGS_KEY
+from culler.gui.metadata_panel import BAG_SETTINGS_KEY, BAG_COLLAPSED_SETTINGS_KEY
 from culler.ml_trainer import train_custom_yolo
 from culler.paths import DATASET_DIR
 from bootstrap import APP_NAME, SplashScreen, adopt_default_root, apply_window_icon, launch_gui
@@ -935,6 +935,16 @@ class ImageCullerApp(ctk.CTk):
         init_scale = self.db.get_raw_scale()
         init_wb = self.db.get_white_balance()
 
+        # Restore UI Layout State (Panel visibility, panel widths, menubar visibility)
+        self._thumbnail_panel_visible, self._tool_panel_visible = self.db.get_ui_panels_visible()
+        self._thumbnail_panel_width, self._tool_panel_width = self.db.get_ui_panels_width()
+        self._menubar_visible = self.db.get_ui_menubar_visible()
+
+        # Native Menu Bar
+        self._create_menubar()
+        if not self._menubar_visible:
+            self.config(menu="")
+
         # Tab Bar
         self.tab_bar = TabBar(
             self,
@@ -959,6 +969,8 @@ class ImageCullerApp(ctk.CTk):
             on_scan_blur=self._on_scan_blur,
             on_scan_duplicates=self._on_scan_duplicates,
             on_open_settings=self._on_open_settings,
+            on_toggle_thumbs=self.toggle_thumbnail_panel,
+            on_toggle_tools=self.toggle_tool_panel,
             initial_raw_scale=init_scale,
             initial_wb=init_wb
         )
@@ -980,12 +992,14 @@ class ImageCullerApp(ctk.CTk):
         # Left Thumbnail List
         self.thumb_list = ThumbnailList(
             self.main_container,
+            width=self._thumbnail_panel_width,
             on_select_image=self._select_image,
             on_select_all=self._select_all,
             on_select_none=self._select_none,
             on_load_stats_changed=self._on_load_stats_changed
         )
-        self.thumb_list.pack(side="left", fill="y", padx=3, pady=3)
+        if self._thumbnail_panel_visible:
+            self.thumb_list.pack(side="left", fill="y", padx=3, pady=3)
 
         # Center Canvas Viewer
         self.viewer = ImageCanvasViewer(self.main_container)
@@ -997,6 +1011,7 @@ class ImageCullerApp(ctk.CTk):
 
         self.meta_panel = MetadataPanel(
             self.main_container,
+            width=self._tool_panel_width,
             on_set_flag=self._set_current_flag,
             on_set_rating=self._set_current_rating,
             on_toggle_tag=self._on_toggle_tag,
@@ -1014,10 +1029,15 @@ class ImageCullerApp(ctk.CTk):
             initial_picked_folder=init_picked_folder,
             initial_rejected_folder=init_rejected_folder,
             bag_order=self._load_meta_panel_bag_order(),
-            on_bag_order_changed=self._save_meta_panel_bag_order
+            on_bag_order_changed=self._save_meta_panel_bag_order,
+            collapsed_states=self._load_meta_panel_bag_collapsed(),
+            on_bag_collapse_changed=self._save_meta_panel_bag_collapsed
         )
-        self.meta_panel.pack(side="right", fill="y", padx=3, pady=3)
+        if self._tool_panel_visible:
+            self.meta_panel.pack(side="right", fill="y", padx=3, pady=3, before=self.viewer)
         self.meta_panel.refresh_tag_buttons(self.db.get_custom_tags())
+
+        self._sync_panel_toggle_buttons()
 
         # Status Bar
         self.status_bar = ctk.CTkFrame(self, height=30, corner_radius=0)
@@ -1126,6 +1146,22 @@ class ImageCullerApp(ctk.CTk):
         for star in range(6):
             self.bind(str(star), lambda e, s=star: self._set_current_rating(s))
 
+        # Panel & Menubar Toggles & Tab Navigation
+        self.bind("<F8>", lambda e: self.toggle_thumbnail_panel())
+        self.bind("<Control-b>", lambda e: self.toggle_thumbnail_panel())
+        self.bind("<Control-B>", lambda e: self.toggle_thumbnail_panel())
+        self.bind("<F9>", lambda e: self.toggle_tool_panel())
+        self.bind("<Control-j>", lambda e: self.toggle_tool_panel())
+        self.bind("<Control-J>", lambda e: self.toggle_tool_panel())
+        self.bind("<Tab>", self._on_tab_key)
+        self.bind("<Alt-m>", lambda e: self.toggle_menubar())
+        self.bind("<Alt-M>", lambda e: self.toggle_menubar())
+        self.bind("<F5>", lambda e: self._on_refresh_directory())
+        self.bind("<Control-o>", lambda e: self._on_new_tab())
+        self.bind("<Control-O>", lambda e: self._on_new_tab())
+        self.bind("<Control-w>", lambda e: self._on_close_active_tab())
+        self.bind("<Control-W>", lambda e: self._on_close_active_tab())
+
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _on_close(self):
@@ -1161,6 +1197,11 @@ class ImageCullerApp(ctk.CTk):
             x = self.winfo_x()
             y = self.winfo_y()
             self.db.save_window_geometry(w, h, x, y, is_max)
+        except Exception:
+            pass
+
+        try:
+            self._save_ui_state()
         except Exception:
             pass
 
@@ -2664,6 +2705,205 @@ class ImageCullerApp(ctk.CTk):
             self.db.set_setting(BAG_SETTINGS_KEY, list(order))
         except Exception:
             log_error("Failed to save the metadata panel section order", exc_info=True)
+
+    def _load_meta_panel_bag_collapsed(self):
+        """Restore which sections were collapsed/expanded."""
+        try:
+            return self.db.get_meta_panel_collapsed()
+        except Exception:
+            log_error("Failed to read the metadata panel collapsed state", exc_info=True)
+            return None
+
+    def _save_meta_panel_bag_collapsed(self, states: Dict[str, bool]):
+        try:
+            self.db.set_meta_panel_collapsed(states)
+        except Exception:
+            log_error("Failed to save the metadata panel collapsed state", exc_info=True)
+
+    def toggle_thumbnail_panel(self, show: Optional[bool] = None):
+        """Show or hide the left thumbnail panel."""
+        if show is None:
+            self._thumbnail_panel_visible = not getattr(self, "_thumbnail_panel_visible", True)
+        else:
+            self._thumbnail_panel_visible = bool(show)
+
+        if hasattr(self, "_var_show_thumbs"):
+            self._var_show_thumbs.set(self._thumbnail_panel_visible)
+
+        if hasattr(self, "thumb_list") and hasattr(self, "viewer"):
+            if self._thumbnail_panel_visible:
+                self.thumb_list.pack(side="left", fill="y", padx=3, pady=3, before=self.viewer)
+            else:
+                self.thumb_list.pack_forget()
+
+        self._sync_panel_toggle_buttons()
+        self._save_ui_state()
+
+    def toggle_tool_panel(self, show: Optional[bool] = None):
+        """Show or hide the right tool / metadata panel."""
+        if show is None:
+            self._tool_panel_visible = not getattr(self, "_tool_panel_visible", True)
+        else:
+            self._tool_panel_visible = bool(show)
+
+        if hasattr(self, "_var_show_tools"):
+            self._var_show_tools.set(self._tool_panel_visible)
+
+        if hasattr(self, "meta_panel") and hasattr(self, "viewer"):
+            if self._tool_panel_visible:
+                self.meta_panel.pack(side="right", fill="y", padx=3, pady=3, before=self.viewer)
+            else:
+                self.meta_panel.pack_forget()
+
+        self._sync_panel_toggle_buttons()
+        self._save_ui_state()
+
+    def toggle_both_panels(self):
+        """Cinema mode: toggles both panels together."""
+        any_visible = getattr(self, "_thumbnail_panel_visible", True) or getattr(self, "_tool_panel_visible", True)
+        target = not any_visible
+        self.toggle_thumbnail_panel(target)
+        self.toggle_tool_panel(target)
+
+    def toggle_menubar(self, show: Optional[bool] = None):
+        """Show or hide the top native menu bar."""
+        if show is None:
+            self._menubar_visible = not getattr(self, "_menubar_visible", True)
+        else:
+            self._menubar_visible = bool(show)
+
+        if hasattr(self, "_var_show_menubar"):
+            self._var_show_menubar.set(self._menubar_visible)
+
+        if self._menubar_visible and hasattr(self, "menubar"):
+            self.config(menu=self.menubar)
+        else:
+            self.config(menu="")
+        self._save_ui_state()
+
+    def _sync_panel_toggle_buttons(self):
+        if hasattr(self, "toolbar"):
+            self.toolbar.set_panel_visibility_state(
+                getattr(self, "_thumbnail_panel_visible", True),
+                getattr(self, "_tool_panel_visible", True)
+            )
+
+    def _save_ui_state(self):
+        try:
+            self.db.set_ui_panels_visible(
+                getattr(self, "_thumbnail_panel_visible", True),
+                getattr(self, "_tool_panel_visible", True)
+            )
+            self.db.set_ui_menubar_visible(getattr(self, "_menubar_visible", True))
+            if hasattr(self, "thumb_list"):
+                w = self.thumb_list.winfo_width()
+                if w > 50:
+                    self._thumbnail_panel_width = w
+            if hasattr(self, "meta_panel"):
+                w = self.meta_panel.winfo_width()
+                if w > 50:
+                    self._tool_panel_width = w
+                self.db.set_meta_panel_collapsed(self.meta_panel.bag_collapsed_state())
+            self.db.set_ui_panels_width(
+                getattr(self, "_thumbnail_panel_width", 340),
+                getattr(self, "_tool_panel_width", 290)
+            )
+        except Exception:
+            log_error("Failed to save UI state", exc_info=True)
+
+    def _on_tab_key(self, event=None):
+        self.toggle_both_panels()
+        return "break"
+
+    def _on_close_active_tab(self):
+        if 0 <= self.active_tab_index < len(self.tabs):
+            self._on_tab_closed(self.active_tab_index)
+
+    def _create_menubar(self):
+        self.menubar = tk.Menu(self)
+
+        # File Menu
+        file_menu = tk.Menu(self.menubar, tearoff=0)
+        file_menu.add_command(label="Open Folder...", command=self._on_new_tab, accelerator="Ctrl+O")
+        file_menu.add_command(label="Close Current Tab", command=self._on_close_active_tab, accelerator="Ctrl+W")
+        file_menu.add_command(label="Close All Tabs", command=self._close_all_tabs)
+        file_menu.add_separator()
+        file_menu.add_command(label="Open Folder in File Explorer", command=self._on_open_explorer)
+        file_menu.add_command(label="Settings...", command=self._on_open_settings, accelerator="Ctrl+,")
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._on_close, accelerator="Alt+F4")
+        self.menubar.add_cascade(label="File", menu=file_menu)
+
+        # Edit Menu
+        edit_menu = tk.Menu(self.menubar, tearoff=0)
+        edit_menu.add_command(label="Select All", command=self._select_all, accelerator="Ctrl+A")
+        edit_menu.add_command(label="Select None", command=self._select_none, accelerator="Ctrl+D")
+        edit_menu.add_command(label="Copy Image to Clipboard", command=self._on_copy_image_to_clipboard, accelerator="Ctrl+C")
+        self.menubar.add_cascade(label="Edit", menu=edit_menu)
+
+        # View Menu
+        view_menu = tk.Menu(self.menubar, tearoff=0)
+        self._var_show_thumbs = tk.BooleanVar(value=getattr(self, "_thumbnail_panel_visible", True))
+        self._var_show_tools = tk.BooleanVar(value=getattr(self, "_tool_panel_visible", True))
+        self._var_show_menubar = tk.BooleanVar(value=getattr(self, "_menubar_visible", True))
+
+        view_menu.add_checkbutton(
+            label="Show Thumbnail Panel",
+            variable=self._var_show_thumbs,
+            command=lambda: self.toggle_thumbnail_panel(self._var_show_thumbs.get()),
+            accelerator="F8"
+        )
+        view_menu.add_checkbutton(
+            label="Show Tool Panel",
+            variable=self._var_show_tools,
+            command=lambda: self.toggle_tool_panel(self._var_show_tools.get()),
+            accelerator="F9"
+        )
+        view_menu.add_command(label="Toggle Both Panels (Cinema Mode)", command=self.toggle_both_panels, accelerator="Tab")
+        view_menu.add_separator()
+        view_menu.add_command(label="Refresh Directory", command=self._on_refresh_directory, accelerator="F5")
+        view_menu.add_command(label="Load 100% Full Resolution", command=self._on_load_100_percent, accelerator="A")
+        view_menu.add_separator()
+        view_menu.add_checkbutton(
+            label="Show Menu Bar",
+            variable=self._var_show_menubar,
+            command=lambda: self.toggle_menubar(self._var_show_menubar.get()),
+            accelerator="Alt+M"
+        )
+        self.menubar.add_cascade(label="View", menu=view_menu)
+
+        # Cull Menu
+        cull_menu = tk.Menu(self.menubar, tearoff=0)
+        cull_menu.add_command(label="Pick Image", command=lambda: self._set_current_flag(FlagState.PICK), accelerator="P")
+        cull_menu.add_command(label="UnPick Image", command=self._on_unpick_current, accelerator="Shift+P")
+        cull_menu.add_command(label="Reject Image", command=lambda: self._set_current_flag(FlagState.REJECT), accelerator="X")
+        cull_menu.add_command(label="UnReject Image", command=self._on_unreject_current, accelerator="Shift+X")
+        cull_menu.add_command(label="Unflag Image", command=lambda: self._set_current_flag(FlagState.UNFLAGGED), accelerator="U")
+        cull_menu.add_separator()
+        cull_menu.add_command(label="Move Picked Photos...", command=self._on_move_picked)
+        cull_menu.add_command(label="Move Rejected Photos...", command=self._on_move_rejected)
+        cull_menu.add_command(label="Delete Selected to Trash", command=self._on_delete_selected_to_trash, accelerator="Delete")
+        cull_menu.add_command(label="Delete All Rejected to Trash", command=self._on_delete_all_rejected_to_trash, accelerator="Shift+D")
+        self.menubar.add_cascade(label="Cull", menu=cull_menu)
+
+        # Tools Menu
+        tools_menu = tk.Menu(self.menubar, tearoff=0)
+        tools_menu.add_command(label="Scan for Blurry Photos...", command=self._on_scan_blur)
+        tools_menu.add_command(label="Scan for Duplicates...", command=self._on_scan_duplicates)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Crop Active Photo", command=self._on_trigger_crop, accelerator="C")
+        tools_menu.add_command(label="Annotate / Correct Bounding Box", command=self._on_trigger_annotate, accelerator="B")
+        tools_menu.add_command(label="Convert Selected to JPG", command=self._on_save_as, accelerator="Ctrl+S")
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Clean Up Metadata Cache...", command=self._on_cleanup_metadata)
+        self.menubar.add_cascade(label="Tools", menu=tools_menu)
+
+        # Help Menu
+        help_menu = tk.Menu(self.menubar, tearoff=0)
+        help_menu.add_command(label="About Quick Cull...", command=self._on_about_clicked)
+        self.menubar.add_cascade(label="Help", menu=help_menu)
+
+        self.config(menu=self.menubar)
 
     def _on_config_output_folders(self):
         self._on_open_settings()

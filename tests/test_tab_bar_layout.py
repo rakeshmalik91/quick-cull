@@ -314,6 +314,17 @@ class TestTabBarHitTesting(_TabBarTestCase):
             self.assertEqual(button.pack_info(), info,
                              "adding a tab must not disturb the existing buttons")
 
+    def test_close_all_and_about_button_have_spacing(self):
+        """The Close All button must have padding to ensure a clean visual gap from the About button."""
+        self.bar.add_tab("Tab 1")
+        self.root.update()
+        info = self.bar._btn_close_all.pack_info()
+        padx = info.get("padx")
+        if isinstance(padx, (tuple, list)):
+            self.assertGreaterEqual(int(padx[1]), 10, "Close all button must have at least 10px right padding")
+        else:
+            self.assertGreaterEqual(int(padx), 10)
+
 
 if __name__ == "__main__":
     unittest.main()

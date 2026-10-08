@@ -147,7 +147,9 @@ class ThumbnailList(ctk.CTkFrame):
         on_load_stats_changed: Optional[Callable[[Dict[str, Optional[float]]], None]] = None,
         **kwargs
     ):
-        super().__init__(master, width=340, corner_radius=5, **kwargs)
+        kwargs.setdefault("width", 340)
+        kwargs.setdefault("corner_radius", 5)
+        super().__init__(master, **kwargs)
         self.pack_propagate(False)
 
         self.on_select_image = on_select_image

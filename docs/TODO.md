@@ -6,10 +6,10 @@ Make corrections optionally, if required.
 ---------------------
 
 - [ ] UI changes:
-  - [ ] add a bit of gap between "Close all Tabs" & "About" button
-  - [ ] add hide/unhide for thumbnail panel and right side tool panel
-  - [ ] make each sections of right side tool panel collapsible: "Culling Actions", "Exif Metadata"
-  - [ ] save state of the UI (panel positions, sizes, hide/unhide, panel sections collapsed/expanded, menubar state) for relaunch
+  - [x] add a bit of gap between "Close all Tabs" & "About" button
+  - [x] add hide/unhide for thumbnail panel and right side tool panel
+  - [x] make each sections of right side tool panel collapsible: "Culling Actions", "Exif Metadata"
+  - [x] save state of the UI (panel positions, sizes, hide/unhide, panel sections collapsed/expanded, menubar state) for relaunch
   - [x] Shortcuts: Shift+X -> UnReject, Shift+P -> UnPick, Shift+D -> Delete (Move to trash) All Rejected
   - [x] Add a button for "Delete (Move to trash) All Rejected"
   - [x] When an operation like Delete/Move etc made the thumbnail list empty, move to All filter automatically

@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 import customtkinter as ctk
 from ..culler_engine import ImageItem, FlagState
 from ..logger import log_error
@@ -11,6 +11,7 @@ from .tooltip import ToolTip
 BAG_KEYS = ("action", "reset", "move", "tags", "rating", "meta")
 
 BAG_SETTINGS_KEY = "meta_panel_bag_order"
+BAG_COLLAPSED_SETTINGS_KEY = "meta_panel_bag_collapsed"
 
 #: The panel is the right-hand sidebar. Its bags live in one scrollable column so a short
 #: window scrolls instead of overlapping them, and the width the tag buttons are laid out
@@ -31,6 +32,7 @@ class MetadataPanel(ctk.CTkFrame):
     that they live in one scrollable column: packed straight into a fixed-height panel
     they overflowed, and Tk placed the remainder on top of each other. Each bag's title
     doubles as a drag handle, so the order is the user's to choose and is persisted.
+    Each bag is collapsible to maximize viewport space.
     """
 
     def __init__(
@@ -54,9 +56,13 @@ class MetadataPanel(ctk.CTkFrame):
         initial_rejected_folder: str = "_REJECTED",
         bag_order: Optional[List[str]] = None,
         on_bag_order_changed: Optional[Callable[[List[str]], None]] = None,
+        collapsed_states: Optional[Dict[str, bool]] = None,
+        on_bag_collapse_changed: Optional[Callable[[Dict[str, bool]], None]] = None,
         **kwargs
     ):
-        super().__init__(master, width=PANEL_WIDTH, corner_radius=5, **kwargs)
+        kwargs.setdefault("width", PANEL_WIDTH)
+        kwargs.setdefault("corner_radius", 5)
+        super().__init__(master, **kwargs)
         self.pack_propagate(False)
 
         self.on_set_flag = on_set_flag
@@ -74,6 +80,7 @@ class MetadataPanel(ctk.CTkFrame):
         self.on_trash_rejected = on_trash_rejected
         self.on_config_output_folders = on_config_output_folders
         self.on_bag_order_changed = on_bag_order_changed
+        self.on_bag_collapse_changed = on_bag_collapse_changed
 
         self.picked_folder = initial_picked_folder
         self.rejected_folder = initial_rejected_folder
@@ -84,12 +91,17 @@ class MetadataPanel(ctk.CTkFrame):
         self._bag_titles: Dict[str, ctk.CTkLabel] = {}
         self._bag_pack: Dict[str, dict] = {}
         self._bag_title_colors: Dict[str, str] = {}
+        self._bag_contents: Dict[str, ctk.CTkFrame] = {}
+        self._bag_collapse_btns: Dict[str, ctk.CTkButton] = {}
+        self._bag_collapsed: Dict[str, bool] = {k: False for k in BAG_KEYS}
         self._bag_order: List[str] = self._sanitize_order(bag_order)
         self._drag_key: Optional[str] = None
         self._drag_target: Optional[str] = None
 
         self._build_widgets()
         self._apply_bag_order()
+        if collapsed_states:
+            self.set_all_collapsed_states(collapsed_states)
 
     def _sanitize_order(self, order: Optional[List[str]]) -> List[str]:
         """A persisted order, filtered to known keys and completed with any new ones.
@@ -105,8 +117,47 @@ class MetadataPanel(ctk.CTkFrame):
                 seen.append(key)
         return seen
 
-    def _register_bag(self, key: str, frame: ctk.CTkFrame, title: ctk.CTkLabel,
-                      pack_options: dict) -> None:
+    def _create_bag_header(
+        self,
+        parent: ctk.CTkFrame,
+        key: str,
+        title_text: str,
+        font_size: int = 12,
+        padx: int = 0,
+        pady: tuple = (0, 3),
+    ) -> Tuple[ctk.CTkLabel, ctk.CTkButton]:
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.pack(fill="x", padx=padx, pady=pady)
+        lbl = ctk.CTkLabel(
+            header,
+            text=title_text,
+            font=ctk.CTkFont(size=font_size, weight="bold")
+        )
+        lbl.pack(side="left", anchor="w")
+        btn = ctk.CTkButton(
+            header,
+            text="▼",
+            width=20,
+            height=18,
+            fg_color="transparent",
+            hover_color="#333333",
+            text_color="#888888",
+            font=ctk.CTkFont(size=10),
+            command=lambda: self.toggle_bag_collapse(key)
+        )
+        btn.pack(side="right")
+        ToolTip(btn, f"Collapse / Expand {title_text}")
+        return lbl, btn
+
+    def _register_bag(
+        self,
+        key: str,
+        frame: ctk.CTkFrame,
+        title: ctk.CTkLabel,
+        pack_options: dict,
+        content_frame: Optional[ctk.CTkFrame] = None,
+        collapse_btn: Optional[ctk.CTkButton] = None,
+    ) -> None:
         """Remember a bag so it can be reordered, and make its title a drag handle.
 
         The title doubles as the handle rather than adding a separate grip widget, so
@@ -115,14 +166,61 @@ class MetadataPanel(ctk.CTkFrame):
         self._bags[key] = frame
         self._bag_titles[key] = title
         self._bag_pack[key] = pack_options
+        if content_frame is not None:
+            self._bag_contents[key] = content_frame
+        if collapse_btn is not None:
+            self._bag_collapse_btns[key] = collapse_btn
         # CustomTkinter has no "unset" for text_color, so the original is kept and
         # restored rather than cleared.
         self._bag_title_colors[key] = title.cget("text_color")
         title.configure(cursor="hand2")
-        ToolTip(title, "Drag to reorder this section")
+        ToolTip(title, "Drag to reorder section | Double-click to collapse/expand")
         title.bind("<ButtonPress-1>", self._on_bag_drag_start)
         title.bind("<B1-Motion>", self._on_bag_drag_motion)
         title.bind("<ButtonRelease-1>", self._on_bag_drag_end)
+        title.bind("<Double-Button-1>", lambda e, k=key: self.toggle_bag_collapse(k))
+
+    # ------------------------------------------------------------- collapsible sections
+
+    def toggle_bag_collapse(self, key: str) -> None:
+        self.set_bag_collapsed(key, not self._bag_collapsed.get(key, False))
+
+    def set_bag_collapsed(self, key: str, collapsed: bool) -> None:
+        if key not in self._bags:
+            return
+        self._bag_collapsed[key] = bool(collapsed)
+        content = self._bag_contents.get(key)
+        btn = self._bag_collapse_btns.get(key)
+        if content is not None:
+            if collapsed:
+                content.pack_forget()
+                if btn is not None:
+                    btn.configure(text="▶")
+            else:
+                if key == "meta":
+                    content.pack(fill="both", expand=True, padx=10, pady=4)
+                else:
+                    content.pack(fill="x")
+                if btn is not None:
+                    btn.configure(text="▼")
+        if self.on_bag_collapse_changed:
+            try:
+                self.on_bag_collapse_changed(self.bag_collapsed_state())
+            except Exception:
+                log_error("Failed to persist bag collapsed state", exc_info=True)
+
+    def is_bag_collapsed(self, key: str) -> bool:
+        return self._bag_collapsed.get(key, False)
+
+    def bag_collapsed_state(self) -> Dict[str, bool]:
+        return dict(self._bag_collapsed)
+
+    def set_all_collapsed_states(self, states: Dict[str, bool]) -> None:
+        if not states or not isinstance(states, dict):
+            return
+        for key, collapsed in states.items():
+            if key in self._bags:
+                self.set_bag_collapsed(key, bool(collapsed))
 
     # ------------------------------------------------------------- reordering
 
@@ -214,16 +312,17 @@ class MetadataPanel(ctk.CTkFrame):
 
         # Action Buttons Box
         self.action_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
-
-        self.lbl_action = ctk.CTkLabel(
-            self.action_box, text="CULLING ACTIONS", font=ctk.CTkFont(size=12, weight="bold")
+        self.lbl_action, btn_c_action = self._create_bag_header(
+            self.action_box, "action", "CULLING ACTIONS", 12, pady=(0, 4)
         )
-        self.lbl_action.pack(anchor="w", pady=(0, 4))
+        self.action_content = ctk.CTkFrame(self.action_box, fg_color="transparent")
+        self.action_content.pack(fill="x")
         self._register_bag("action", self.action_box, self.lbl_action,
-                           {"side": "top", "fill": "x", "padx": 10, "pady": 6})
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 6},
+                           self.action_content, btn_c_action)
 
         self.btn_pick = ctk.CTkButton(
-            self.action_box,
+            self.action_content,
             text="[P] PICK",
             fg_color="#1b4332",
             hover_color="#2b9348",
@@ -234,7 +333,7 @@ class MetadataPanel(ctk.CTkFrame):
         ToolTip(self.btn_pick, "Shortcut: P (Pick) | Shift+P (UnPick)")
 
         self.btn_reject = ctk.CTkButton(
-            self.action_box,
+            self.action_content,
             text="[X] REJECT",
             fg_color="#5c0612",
             hover_color="#d90429",
@@ -245,7 +344,7 @@ class MetadataPanel(ctk.CTkFrame):
         ToolTip(self.btn_reject, "Shortcut: X (Reject) | Shift+X (UnReject)")
 
         self.btn_unflag = ctk.CTkButton(
-            self.action_box,
+            self.action_content,
             text="[U] UNFLAG",
             fg_color="#1f538d",
             hover_color="#14375e",
@@ -256,15 +355,16 @@ class MetadataPanel(ctk.CTkFrame):
 
         # Clear / Reset Metadata Row (Flags, Tags, Ratings, All side by side)
         self.reset_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
-
-        self.lbl_reset = ctk.CTkLabel(
-            self.reset_box, text="CLEAR METADATA", font=ctk.CTkFont(size=11, weight="bold")
+        self.lbl_reset, btn_c_reset = self._create_bag_header(
+            self.reset_box, "reset", "CLEAR METADATA", 11, pady=(0, 3)
         )
-        self.lbl_reset.pack(anchor="w", pady=(0, 3))
+        self.reset_content = ctk.CTkFrame(self.reset_box, fg_color="transparent")
+        self.reset_content.pack(fill="x")
         self._register_bag("reset", self.reset_box, self.lbl_reset,
-                           {"side": "top", "fill": "x", "padx": 10, "pady": 4})
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 4},
+                           self.reset_content, btn_c_reset)
 
-        self.reset_btn_row = ctk.CTkFrame(self.reset_box, fg_color="transparent")
+        self.reset_btn_row = ctk.CTkFrame(self.reset_content, fg_color="transparent")
         self.reset_btn_row.pack(fill="x")
 
         if self.on_unflag_all:
@@ -325,18 +425,19 @@ class MetadataPanel(ctk.CTkFrame):
 
         # Move & Export Operations Box
         self.move_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
-
-        self.lbl_move = ctk.CTkLabel(
-            self.move_box, text="MOVE & EXPORT", font=ctk.CTkFont(size=12, weight="bold")
+        self.lbl_move, btn_c_move = self._create_bag_header(
+            self.move_box, "move", "MOVE & EXPORT", 12, pady=(0, 4)
         )
-        self.lbl_move.pack(anchor="w", pady=(0, 4))
+        self.move_content = ctk.CTkFrame(self.move_box, fg_color="transparent")
+        self.move_content.pack(fill="x")
         self._register_bag("move", self.move_box, self.lbl_move,
-                           {"side": "top", "fill": "x", "padx": 10, "pady": 4})
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 4},
+                           self.move_content, btn_c_move)
 
         p_name = Path(self.picked_folder).name or self.picked_folder
         r_name = Path(self.rejected_folder).name or self.rejected_folder
 
-        f_pick_row = ctk.CTkFrame(self.move_box, fg_color="transparent")
+        f_pick_row = ctk.CTkFrame(self.move_content, fg_color="transparent")
         f_pick_row.pack(fill="x", pady=2)
 
         self.btn_move_picked = ctk.CTkButton(
@@ -361,7 +462,7 @@ class MetadataPanel(ctk.CTkFrame):
         self.btn_open_picked.pack(side="left", padx=(2, 0))
         ToolTip(self.btn_open_picked, "Open picked folder in file explorer")
 
-        f_reject_row = ctk.CTkFrame(self.move_box, fg_color="transparent")
+        f_reject_row = ctk.CTkFrame(self.move_content, fg_color="transparent")
         f_reject_row.pack(fill="x", pady=2)
 
         self.btn_move_rejected = ctk.CTkButton(
@@ -386,7 +487,7 @@ class MetadataPanel(ctk.CTkFrame):
         self.btn_open_rejected.pack(side="left", padx=(2, 0))
         ToolTip(self.btn_open_rejected, "Open rejected folder in file explorer")
 
-        f_trash_reject_row = ctk.CTkFrame(self.move_box, fg_color="transparent")
+        f_trash_reject_row = ctk.CTkFrame(self.move_content, fg_color="transparent")
         f_trash_reject_row.pack(fill="x", pady=2)
 
         self.btn_trash_rejected = ctk.CTkButton(
@@ -402,7 +503,7 @@ class MetadataPanel(ctk.CTkFrame):
 
         if self.on_crop:
             self.btn_crop = ctk.CTkButton(
-                self.move_box,
+                self.move_content,
                 text="✂️ Crop This Image",
                 fg_color="#1f538d",
                 hover_color="#14375e",
@@ -415,7 +516,7 @@ class MetadataPanel(ctk.CTkFrame):
 
         if self.on_annotate:
             self.btn_annotate = ctk.CTkButton(
-                self.move_box,
+                self.move_content,
                 text="🎯 Correct Bounding Box",
                 fg_color="#a37a00",
                 hover_color="#7a5c00",
@@ -428,7 +529,7 @@ class MetadataPanel(ctk.CTkFrame):
 
         if self.on_convert_jpg:
             self.btn_convert_jpg = ctk.CTkButton(
-                self.move_box,
+                self.move_content,
                 text="🖼️ Convert Selected to JPG",
                 fg_color="#1f538d",
                 hover_color="#14375e",
@@ -440,30 +541,32 @@ class MetadataPanel(ctk.CTkFrame):
 
         # Tags Box (Blur, Duplicate, Dark, Over-exposed + Custom from Settings)
         self.tags_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
-
-        self.lbl_tags = ctk.CTkLabel(
-            self.tags_box, text="IMAGE TAGS", font=ctk.CTkFont(size=12, weight="bold")
+        self.lbl_tags, btn_c_tags = self._create_bag_header(
+            self.tags_box, "tags", "IMAGE TAGS", 12, pady=(0, 4)
         )
-        self.lbl_tags.pack(anchor="w", pady=(0, 4))
+        self.tags_content = ctk.CTkFrame(self.tags_box, fg_color="transparent")
+        self.tags_content.pack(fill="x")
         self._register_bag("tags", self.tags_box, self.lbl_tags,
-                           {"side": "top", "fill": "x", "padx": 10, "pady": 4})
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 4},
+                           self.tags_content, btn_c_tags)
 
-        self._tags_container = ctk.CTkFrame(self.tags_box, fg_color="transparent")
+        self._tags_container = ctk.CTkFrame(self.tags_content, fg_color="transparent")
         self._tags_container.pack(fill="x")
 
         self._build_tag_buttons([])
 
         # Rating Stars Box
         self.rating_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
-
-        self.lbl_stars = ctk.CTkLabel(
-            self.rating_box, text="STAR RATING", font=ctk.CTkFont(size=12, weight="bold")
+        self.lbl_stars, btn_c_stars = self._create_bag_header(
+            self.rating_box, "rating", "STAR RATING", 12, pady=(0, 4)
         )
-        self.lbl_stars.pack(anchor="w", pady=(0, 4))
+        self.rating_content = ctk.CTkFrame(self.rating_box, fg_color="transparent")
+        self.rating_content.pack(fill="x")
         self._register_bag("rating", self.rating_box, self.lbl_stars,
-                           {"side": "top", "fill": "x", "padx": 10, "pady": 4})
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 4},
+                           self.rating_content, btn_c_stars)
 
-        self.star_btn_frame = ctk.CTkFrame(self.rating_box, fg_color="transparent")
+        self.star_btn_frame = ctk.CTkFrame(self.rating_content, fg_color="transparent")
         self.star_btn_frame.pack(fill="x")
 
         self.star_buttons = []
@@ -483,22 +586,23 @@ class MetadataPanel(ctk.CTkFrame):
 
         # Metadata Card Box
         self.meta_card = ctk.CTkFrame(self._bags_area, corner_radius=6, fg_color="#242424")
-
-        self.lbl_meta_title = ctk.CTkLabel(
-            self.meta_card, text="EXIF METADATA", font=ctk.CTkFont(size=12, weight="bold")
+        self.lbl_meta_title, btn_c_meta = self._create_bag_header(
+            self.meta_card, "meta", "EXIF METADATA", 12, padx=10, pady=(6, 2)
         )
-        self.lbl_meta_title.pack(anchor="w", padx=10, pady=(6, 2))
+        self.meta_content = ctk.CTkFrame(self.meta_card, fg_color="transparent")
+        self.meta_content.pack(fill="both", expand=True, padx=10, pady=4)
         self._register_bag("meta", self.meta_card, self.lbl_meta_title,
-                           {"side": "top", "fill": "x", "padx": 10, "pady": 6})
+                           {"side": "top", "fill": "x", "padx": 10, "pady": 6},
+                           self.meta_content, btn_c_meta)
 
         self.lbl_meta_details = ctk.CTkLabel(
-            self.meta_card,
+            self.meta_content,
             text="No image selected.",
             justify="left",
             anchor="nw",
             font=ctk.CTkFont(family="Consolas", size=11)
         )
-        self.lbl_meta_details.pack(fill="both", expand=True, padx=10, pady=4)
+        self.lbl_meta_details.pack(fill="both", expand=True)
 
     def update_output_folders(self, picked_folder: str, rejected_folder: str):
         self.picked_folder = picked_folder

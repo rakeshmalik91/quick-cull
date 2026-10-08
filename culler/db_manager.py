@@ -307,6 +307,42 @@ class DatabaseManager:
     def set_duplicate_rating_action(self, rating_str: str):
         self.set_setting("duplicate_rating_action", rating_str)
 
+    # --- UI State Persistence API ---
+
+    def get_ui_panels_visible(self) -> Tuple[bool, bool]:
+        thumbs = self.get_setting("ui_thumbnail_panel_visible", default=True)
+        tools = self.get_setting("ui_tool_panel_visible", default=True)
+        return bool(thumbs), bool(tools)
+
+    def set_ui_panels_visible(self, thumbs: bool, tools: bool):
+        self.set_setting("ui_thumbnail_panel_visible", bool(thumbs))
+        self.set_setting("ui_tool_panel_visible", bool(tools))
+
+    def get_ui_panels_width(self) -> Tuple[int, int]:
+        thumbs_w = self.get_setting("ui_thumbnail_panel_width", default=340)
+        tools_w = self.get_setting("ui_tool_panel_width", default=290)
+        try:
+            return int(thumbs_w), int(tools_w)
+        except (ValueError, TypeError):
+            return 340, 290
+
+    def set_ui_panels_width(self, thumbs_width: int, tools_width: int):
+        self.set_setting("ui_thumbnail_panel_width", int(thumbs_width))
+        self.set_setting("ui_tool_panel_width", int(tools_width))
+
+    def get_ui_menubar_visible(self) -> bool:
+        return bool(self.get_setting("ui_menubar_visible", default=True))
+
+    def set_ui_menubar_visible(self, visible: bool):
+        self.set_setting("ui_menubar_visible", bool(visible))
+
+    def get_meta_panel_collapsed(self) -> Dict[str, bool]:
+        val = self.get_setting("meta_panel_bag_collapsed", default={})
+        return val if isinstance(val, dict) else {}
+
+    def set_meta_panel_collapsed(self, states: Dict[str, bool]):
+        self.set_setting("meta_panel_bag_collapsed", states)
+
     # --- Image Record Persistence & Cleanup API ---
 
     def save_image_record(

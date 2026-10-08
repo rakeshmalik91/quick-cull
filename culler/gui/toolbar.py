@@ -251,6 +251,8 @@ class HeaderToolbar(ctk.CTkFrame):
         on_scan_blur: Callable[[], None] = None,
         on_scan_duplicates: Callable[[], None] = None,
         on_open_settings: Optional[Callable[[], None]] = None,
+        on_toggle_thumbs: Optional[Callable[[], None]] = None,
+        on_toggle_tools: Optional[Callable[[], None]] = None,
         initial_raw_scale: float = 0.25,
         initial_wb: str = "camera",
         **kwargs
@@ -265,6 +267,8 @@ class HeaderToolbar(ctk.CTkFrame):
         self.on_scan_blur = on_scan_blur
         self.on_scan_duplicates = on_scan_duplicates
         self.on_open_settings = on_open_settings
+        self.on_toggle_thumbs = on_toggle_thumbs
+        self.on_toggle_tools = on_toggle_tools
 
         self.initial_raw_scale = initial_raw_scale
         self.initial_wb = initial_wb
@@ -272,9 +276,24 @@ class HeaderToolbar(ctk.CTkFrame):
         self._build_widgets()
 
     def _build_widgets(self):
+        # Toggle Thumbnail Panel Button (F8 / Ctrl+B)
+        if self.on_toggle_thumbs:
+            self.btn_toggle_thumbs = ctk.CTkButton(
+                self,
+                text="◀ 🎞️",
+                width=46,
+                height=28,
+                fg_color="#1f538d",
+                hover_color="#14375e",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                command=self.on_toggle_thumbs
+            )
+            self.btn_toggle_thumbs.pack(side="left", padx=(4, 4))
+            ToolTip(self.btn_toggle_thumbs, "Toggle Thumbnail Panel (F8 / Ctrl+B)")
+
         # Filter Segmented Control
         self.lbl_filter = ctk.CTkLabel(self, text="Filter:", font=ctk.CTkFont(weight="bold"))
-        self.lbl_filter.pack(side="left", padx=(6, 2))
+        self.lbl_filter.pack(side="left", padx=(4, 2))
 
         self.seg_filter = ctk.CTkSegmentedButton(
             self,
@@ -399,6 +418,21 @@ class HeaderToolbar(ctk.CTkFrame):
         self.btn_scan_dups.pack(side="left", padx=3)
         ToolTip(self.btn_scan_dups, "Detect duplicate burst shots & keep sharpest")
 
+        # Toggle Tool Panel Button (F9 / Ctrl+J, far right edge)
+        if self.on_toggle_tools:
+            self.btn_toggle_tools = ctk.CTkButton(
+                self,
+                text="🛠️ ▶",
+                width=46,
+                height=28,
+                fg_color="#1f538d",
+                hover_color="#14375e",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                command=self.on_toggle_tools
+            )
+            self.btn_toggle_tools.pack(side="right", padx=(2, 4))
+            ToolTip(self.btn_toggle_tools, "Toggle Right Tool Panel (F9 / Ctrl+J)")
+
         # Settings Button
         if self.on_open_settings:
             self.btn_settings = ctk.CTkButton(
@@ -438,6 +472,22 @@ class HeaderToolbar(ctk.CTkFrame):
             )
             self.btn_explorer.pack(side="right", padx=4)
             ToolTip(self.btn_explorer, "Open current photo folder in OS File Explorer / Finder")
+
+    def set_panel_visibility_state(self, thumbs_visible: bool, tools_visible: bool) -> None:
+        if hasattr(self, "btn_toggle_thumbs"):
+            if thumbs_visible:
+                self.btn_toggle_thumbs.configure(text="◀ 🎞️", fg_color="#1f538d")
+                ToolTip(self.btn_toggle_thumbs, "Hide Thumbnail Panel (F8 / Ctrl+B)")
+            else:
+                self.btn_toggle_thumbs.configure(text="▶ 🎞️", fg_color="#3a3a3a")
+                ToolTip(self.btn_toggle_thumbs, "Show Thumbnail Panel (F8 / Ctrl+B)")
+        if hasattr(self, "btn_toggle_tools"):
+            if tools_visible:
+                self.btn_toggle_tools.configure(text="🛠️ ▶", fg_color="#1f538d")
+                ToolTip(self.btn_toggle_tools, "Hide Right Tool Panel (F9 / Ctrl+J)")
+            else:
+                self.btn_toggle_tools.configure(text="🛠️ ◀", fg_color="#3a3a3a")
+                ToolTip(self.btn_toggle_tools, "Show Right Tool Panel (F9 / Ctrl+J)")
 
     def get_filter_values(self) -> Dict[str, Any]:
         return {

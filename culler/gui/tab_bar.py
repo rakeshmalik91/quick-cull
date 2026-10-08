@@ -87,7 +87,7 @@ class TabBar(ctk.CTkFrame):
             font=ctk.CTkFont(size=11),
             command=self._handle_close_all
         )
-        self._btn_close_all.pack(side="right", padx=2, pady=3)
+        self._btn_close_all.pack(side="right", padx=(2, 12), pady=3)
         ToolTip(self._btn_close_all, "Close all tabs and release their memory")
         self._btn_close_all.pack_forget()
 
@@ -158,7 +158,7 @@ class TabBar(ctk.CTkFrame):
     def _sync_close_all_visibility(self) -> None:
         """The Close All button has nothing to act on with no tabs open."""
         if self._tab_count > 0:
-            self._btn_close_all.pack(side="right", padx=2, pady=3)
+            self._btn_close_all.pack(side="right", padx=(2, 12), pady=3)
         else:
             self._btn_close_all.pack_forget()
 
