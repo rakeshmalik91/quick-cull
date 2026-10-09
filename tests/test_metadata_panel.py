@@ -56,7 +56,9 @@ def _callbacks():
 
 class _PanelTestCase(unittest.TestCase):
     def make_panel(self, **kwargs):
-        panel = MetadataPanel(_ROOT, **_callbacks(), **kwargs)
+        cbs = _callbacks()
+        cbs.update(kwargs)
+        panel = MetadataPanel(_ROOT, **cbs)
         panel.pack(side="top", fill="x")
         _ROOT.update()
         self.addCleanup(self._destroy, panel)
@@ -79,8 +81,7 @@ class TestBagLayout(_PanelTestCase):
         titles = {panel._bag_titles[k].cget("text") for k in panel.bag_order()}
         self.assertEqual(
             titles,
-            {"CULLING ACTIONS", "CLEAR METADATA", "MOVE & EXPORT",
-             "IMAGE TAGS", "STAR RATING", "EXIF METADATA"},
+            {"CULLING ACTIONS", "MOVE & EXPORT", "IMAGE TAGS", "EXIF METADATA"},
         )
 
     def test_bags_do_not_overlap(self):
@@ -201,7 +202,7 @@ class TestBagReordering(_PanelTestCase):
     def test_visual_order_follows_the_stored_order(self):
         panel = self.make_panel()
 
-        self._drag(panel, "rating", "action")
+        self._drag(panel, "meta", "action")
 
         by_position = sorted(
             ((panel._bags[k].winfo_rooty(), k) for k in panel.bag_order()))
@@ -212,7 +213,7 @@ class TestBagReordering(_PanelTestCase):
         saved = []
         panel = self.make_panel(on_bag_order_changed=lambda order: saved.append(list(order)))
 
-        self._drag(panel, "tags", "reset")
+        self._drag(panel, "tags", "move")
 
         self.assertEqual(len(saved), 1, "one drag must report one order")
         self.assertEqual(saved[0], panel.bag_order())
@@ -247,22 +248,22 @@ class TestBagReordering(_PanelTestCase):
     def test_set_bag_order_applies_a_new_order(self):
         panel = self.make_panel()
 
-        panel.set_bag_order(["rating", "action", "reset", "move", "tags", "meta"])
+        panel.set_bag_order(["meta", "action", "move", "tags"])
         _ROOT.update()
 
         by_position = sorted(
             ((panel._bags[k].winfo_rooty(), k) for k in panel.bag_order()))
         self.assertEqual([k for _, k in by_position],
-                         ["rating", "action", "reset", "move", "tags", "meta"])
+                         ["meta", "action", "move", "tags"])
 
 
 class TestBagOrderPersistence(_PanelTestCase):
     def test_unknown_keys_are_dropped_and_missing_ones_added(self):
-        panel = self.make_panel(bag_order=["rating", "no-such-bag", "action"])
+        panel = self.make_panel(bag_order=["meta", "no-such-bag", "action"])
 
         self.assertEqual(set(panel.bag_order()), set(BAG_KEYS))
         self.assertNotIn("no-such-bag", panel.bag_order())
-        self.assertEqual(panel.bag_order()[:2], ["rating", "action"],
+        self.assertEqual(panel.bag_order()[:2], ["meta", "action"],
                          "the persisted order must be respected where it is valid")
 
     def test_an_absent_order_falls_back_to_the_default(self):
@@ -312,6 +313,73 @@ class TestPanelWidth(_PanelTestCase):
         for key in panel.bag_order():
             self.assertLessEqual(panel._bags[key].winfo_reqwidth(), panel.winfo_width(),
                                  f"{key} overflows the sidebar")
+
+
+class TestCullingActionsControls(_PanelTestCase):
+    def test_star_buttons_under_culling_actions(self):
+        rating_clicked = []
+        panel = self.make_panel(on_set_rating=lambda r: rating_clicked.append(r))
+        self.assertEqual(len(panel.star_buttons), 5)
+        # Verify star buttons are children inside action_content
+        for btn in panel.star_buttons:
+            self.assertEqual(btn.master, panel.star_btn_frame)
+            self.assertEqual(panel.star_btn_frame.master, panel.action_content)
+
+        # Trigger star 3
+        panel.star_buttons[2].invoke()
+        self.assertEqual(rating_clicked, [3])
+
+    def test_clear_buttons_2_in_a_row_under_culling_actions(self):
+        unflag_called = []
+        untag_called = []
+        unrate_called = []
+        clear_called = []
+
+        panel = self.make_panel(
+            on_unflag_all=lambda: unflag_called.append(True),
+            on_untag_all=lambda: untag_called.append(True),
+            on_unrate_all=lambda: unrate_called.append(True),
+            on_clear_all=lambda: clear_called.append(True),
+        )
+
+        # Verify buttons exist and are inside action_content
+        self.assertIsNotNone(panel.btn_unflag_all)
+        self.assertIsNotNone(panel.btn_untag_all)
+        self.assertIsNotNone(panel.btn_unrate_all)
+        self.assertIsNotNone(panel.btn_clear_all)
+
+        self.assertEqual(panel.btn_unflag_all.master, panel.reset_row1)
+        self.assertEqual(panel.btn_untag_all.master, panel.reset_row1)
+        self.assertEqual(panel.btn_unrate_all.master, panel.reset_row2)
+        self.assertEqual(panel.btn_clear_all.master, panel.reset_row2)
+
+        self.assertEqual(panel.reset_row1.master, panel.action_content)
+        self.assertEqual(panel.reset_row2.master, panel.action_content)
+
+        # Check button styling (red for individual clear, darker red for clear all)
+        self.assertEqual(panel.btn_unflag_all.cget("fg_color"), "#991b1b")
+        self.assertEqual(panel.btn_untag_all.cget("fg_color"), "#991b1b")
+        self.assertEqual(panel.btn_unrate_all.cget("fg_color"), "#991b1b")
+        self.assertEqual(panel.btn_clear_all.cget("fg_color"), "#520713")
+
+        # Check button invocations
+        panel.btn_unflag_all.invoke()
+        panel.btn_untag_all.invoke()
+        panel.btn_unrate_all.invoke()
+        panel.btn_clear_all.invoke()
+
+        self.assertEqual(unflag_called, [True])
+        self.assertEqual(untag_called, [True])
+        self.assertEqual(unrate_called, [True])
+        self.assertEqual(clear_called, [True])
+
+    def test_tag_buttons_color_is_green(self):
+        panel = self.make_panel()
+        self.assertIn("Blur", panel._tag_buttons)
+        self.assertEqual(panel._tag_buttons["Blur"].cget("fg_color"), "#1b4332")
+        self.assertEqual(panel._tag_buttons["Duplicate"].cget("fg_color"), "#1b4332")
+        self.assertEqual(panel._tag_buttons["Dark"].cget("fg_color"), "#1b4332")
+        self.assertEqual(panel._tag_buttons["Over-exposed"].cget("fg_color"), "#1b4332")
 
 
 if __name__ == "__main__":

@@ -106,9 +106,9 @@ class TestCollapsibleMetadataSections(unittest.TestCase):
         reported = []
         self.panel.on_bag_collapse_changed = lambda states: reported.append(dict(states))
 
-        self.panel.set_bag_collapsed("rating", True)
+        self.panel.set_bag_collapsed("meta", True)
         self.assertEqual(len(reported), 1)
-        self.assertTrue(reported[0]["rating"])
+        self.assertTrue(reported[0]["meta"])
 
 
 class TestUIStateDatabasePersistence(unittest.TestCase):

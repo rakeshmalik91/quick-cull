@@ -8,7 +8,7 @@ from .tooltip import ToolTip
 
 #: Stable identifiers for the panel's sections, in their default order. The order the
 #: user drags them into is persisted against these keys, not against widget instances.
-BAG_KEYS = ("action", "reset", "move", "tags", "rating", "meta")
+BAG_KEYS = ("action", "move", "tags", "meta")
 
 BAG_SETTINGS_KEY = "meta_panel_bag_order"
 BAG_COLLAPSED_SETTINGS_KEY = "meta_panel_bag_collapsed"
@@ -22,11 +22,17 @@ TAG_GRID_PAD = 2
 #: Inner width available to a bag: the panel, less its own padding on both sides.
 TAG_ROW_WIDTH = PANEL_WIDTH - PANEL_PADDING * 4
 
+TAG_COLOR_INACTIVE = "#1b4332"
+TAG_HOVER_INACTIVE = "#245a44"
+TAG_COLOR_ACTIVE = "#2b9348"
+TAG_HOVER_ACTIVE = "#38b000"
+
 
 class MetadataPanel(ctk.CTkFrame):
     """
-    Right sidebar containing Pick/Reject action buttons, Move Picked / Move Rejected actions with custom output folders,
-    Unflag All, Tagging controls (Blur, Duplicate, Dark, Over-exposed, Custom), star rating controls, and EXIF card.
+    Right sidebar containing Pick/Reject action buttons, star rating buttons, bulk reset actions,
+    Move Picked / Move Rejected actions with custom output folders, Tagging controls
+    (Blur, Duplicate, Dark, Over-exposed, Custom), and EXIF card.
 
     The bags keep the arrangement they have always had. The only structural change is
     that they live in one scrollable column: packed straight into a fixed-height panel
@@ -97,6 +103,12 @@ class MetadataPanel(ctk.CTkFrame):
         self._bag_order: List[str] = self._sanitize_order(bag_order)
         self._drag_key: Optional[str] = None
         self._drag_target: Optional[str] = None
+
+        self.star_buttons: List[ctk.CTkButton] = []
+        self.btn_unflag_all: Optional[ctk.CTkButton] = None
+        self.btn_untag_all: Optional[ctk.CTkButton] = None
+        self.btn_unrate_all: Optional[ctk.CTkButton] = None
+        self.btn_clear_all: Optional[ctk.CTkButton] = None
 
         self._build_widgets()
         self._apply_bag_order()
@@ -353,74 +365,87 @@ class MetadataPanel(ctk.CTkFrame):
         self.btn_unflag.pack(fill="x", pady=2)
         ToolTip(self.btn_unflag, "Shortcut: U (Unflag active photo)")
 
-        # Clear / Reset Metadata Row (Flags, Tags, Ratings, All side by side)
-        self.reset_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
-        self.lbl_reset, btn_c_reset = self._create_bag_header(
-            self.reset_box, "reset", "CLEAR METADATA", 11, pady=(0, 3)
-        )
-        self.reset_content = ctk.CTkFrame(self.reset_box, fg_color="transparent")
-        self.reset_content.pack(fill="x")
-        self._register_bag("reset", self.reset_box, self.lbl_reset,
-                           {"side": "top", "fill": "x", "padx": 10, "pady": 4},
-                           self.reset_content, btn_c_reset)
+        # Star Rating Row (1-5 Stars)
+        self.star_btn_frame = ctk.CTkFrame(self.action_content, fg_color="transparent")
+        self.star_btn_frame.pack(fill="x", pady=(4, 2))
 
-        self.reset_btn_row = ctk.CTkFrame(self.reset_content, fg_color="transparent")
-        self.reset_btn_row.pack(fill="x")
+        self.star_buttons = []
+        for star in range(1, 6):
+            btn = ctk.CTkButton(
+                self.star_btn_frame,
+                text=f"★{star}",
+                width=42,
+                height=28,
+                fg_color="#3a86ff",
+                hover_color="#0077b6",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                command=lambda s=star: self._handle_set_rating(s)
+            )
+            btn.pack(side="left", padx=1, fill="x", expand=True)
+            ToolTip(btn, f"Shortcut: {star} (Set rating to {star} Star{'s' if star > 1 else ''})")
+            self.star_buttons.append(btn)
+
+        # Clear / Reset Metadata Controls (2 in a row)
+        self.reset_row1 = ctk.CTkFrame(self.action_content, fg_color="transparent")
+        self.reset_row1.pack(fill="x", pady=(2, 1))
 
         if self.on_unflag_all:
             self.btn_unflag_all = ctk.CTkButton(
-                self.reset_btn_row,
-                text="🚩 Flags",
-                width=62,
-                height=26,
-                fg_color="#1f538d",
-                hover_color="#14375e",
-                font=ctk.CTkFont(size=10, weight="bold"),
+                self.reset_row1,
+                text="🚩 Unflag All",
+                width=100,
+                height=28,
+                fg_color="#991b1b",
+                hover_color="#b91c1c",
+                font=ctk.CTkFont(size=11, weight="bold"),
                 command=self.on_unflag_all
             )
-            self.btn_unflag_all.pack(side="left", padx=1)
+            self.btn_unflag_all.pack(side="left", padx=1, fill="x", expand=True)
             ToolTip(self.btn_unflag_all, "Clear flags across all photos")
 
         if self.on_untag_all:
             self.btn_untag_all = ctk.CTkButton(
-                self.reset_btn_row,
-                text="🏷️ Tags",
-                width=62,
-                height=26,
-                fg_color="#1f538d",
-                hover_color="#14375e",
-                font=ctk.CTkFont(size=10, weight="bold"),
+                self.reset_row1,
+                text="🏷️ Untag All",
+                width=100,
+                height=28,
+                fg_color="#991b1b",
+                hover_color="#b91c1c",
+                font=ctk.CTkFont(size=11, weight="bold"),
                 command=self.on_untag_all
             )
-            self.btn_untag_all.pack(side="left", padx=1)
+            self.btn_untag_all.pack(side="left", padx=1, fill="x", expand=True)
             ToolTip(self.btn_untag_all, "Remove all tags from all photos")
+
+        self.reset_row2 = ctk.CTkFrame(self.action_content, fg_color="transparent")
+        self.reset_row2.pack(fill="x", pady=(1, 2))
 
         if self.on_unrate_all:
             self.btn_unrate_all = ctk.CTkButton(
-                self.reset_btn_row,
-                text="⭐ Stars",
-                width=62,
-                height=26,
-                fg_color="#1f538d",
-                hover_color="#14375e",
-                font=ctk.CTkFont(size=10, weight="bold"),
+                self.reset_row2,
+                text="⭐ Unrate All",
+                width=100,
+                height=28,
+                fg_color="#991b1b",
+                hover_color="#b91c1c",
+                font=ctk.CTkFont(size=11, weight="bold"),
                 command=self.on_unrate_all
             )
-            self.btn_unrate_all.pack(side="left", padx=1)
+            self.btn_unrate_all.pack(side="left", padx=1, fill="x", expand=True)
             ToolTip(self.btn_unrate_all, "Reset star ratings to 0")
 
         if self.on_clear_all:
             self.btn_clear_all = ctk.CTkButton(
-                self.reset_btn_row,
-                text="💥 All",
-                width=62,
-                height=26,
-                fg_color="#1f538d",
-                hover_color="#14375e",
-                font=ctk.CTkFont(size=10, weight="bold"),
+                self.reset_row2,
+                text="💥 Clear All",
+                width=100,
+                height=28,
+                fg_color="#520713",
+                hover_color="#780d1e",
+                font=ctk.CTkFont(size=11, weight="bold"),
                 command=self.on_clear_all
             )
-            self.btn_clear_all.pack(side="left", padx=1)
+            self.btn_clear_all.pack(side="left", padx=1, fill="x", expand=True)
             ToolTip(self.btn_clear_all, "Clear Flags, Tags, AND Ratings across all photos")
 
         # Move & Export Operations Box
@@ -555,35 +580,6 @@ class MetadataPanel(ctk.CTkFrame):
 
         self._build_tag_buttons([])
 
-        # Rating Stars Box
-        self.rating_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
-        self.lbl_stars, btn_c_stars = self._create_bag_header(
-            self.rating_box, "rating", "STAR RATING", 12, pady=(0, 4)
-        )
-        self.rating_content = ctk.CTkFrame(self.rating_box, fg_color="transparent")
-        self.rating_content.pack(fill="x")
-        self._register_bag("rating", self.rating_box, self.lbl_stars,
-                           {"side": "top", "fill": "x", "padx": 10, "pady": 4},
-                           self.rating_content, btn_c_stars)
-
-        self.star_btn_frame = ctk.CTkFrame(self.rating_content, fg_color="transparent")
-        self.star_btn_frame.pack(fill="x")
-
-        self.star_buttons = []
-        for star in range(1, 6):
-            btn = ctk.CTkButton(
-                self.star_btn_frame,
-                text=f"★{star}",
-                width=46,
-                fg_color="#3a86ff",
-                hover_color="#0077b6",
-                font=ctk.CTkFont(size=11, weight="bold"),
-                command=lambda s=star: self._handle_set_rating(s)
-            )
-            btn.pack(side="left", padx=2)
-            ToolTip(btn, f"Shortcut: {star} (Set rating to {star} Star{'s' if star > 1 else ''})")
-            self.star_buttons.append(btn)
-
         # EXIF Metadata Box
         self.meta_box = ctk.CTkFrame(self._bags_area, fg_color="transparent")
         self.lbl_meta_title, btn_c_meta = self._create_bag_header(
@@ -695,8 +691,8 @@ class MetadataPanel(ctk.CTkFrame):
                 text=f"🏷️ {tag}",
                 width=button_width,
                 height=26,
-                fg_color="#3a3a3a",
-                hover_color="#555555",
+                fg_color=TAG_COLOR_INACTIVE,
+                hover_color=TAG_HOVER_INACTIVE,
                 font=ctk.CTkFont(size=10, weight="bold"),
                 command=lambda t=tag: self._toggle_tag(t)
             )
@@ -707,9 +703,9 @@ class MetadataPanel(ctk.CTkFrame):
         if self.current_item:
             for tag, btn in self._tag_buttons.items():
                 if self.current_item.has_tag(tag):
-                    btn.configure(fg_color="#7b2cbf")
+                    btn.configure(fg_color=TAG_COLOR_ACTIVE, hover_color=TAG_HOVER_ACTIVE)
                 else:
-                    btn.configure(fg_color="#3a3a3a")
+                    btn.configure(fg_color=TAG_COLOR_INACTIVE, hover_color=TAG_HOVER_INACTIVE)
 
     def refresh_tag_buttons(self, custom_tags: List[str]):
         """Refresh tag buttons with updated custom tags from settings."""
@@ -721,6 +717,8 @@ class MetadataPanel(ctk.CTkFrame):
             self.lbl_meta_details.configure(text="No image selected.")
             for btn in self.star_buttons:
                 btn.configure(fg_color="#3a86ff", text_color="#ffffff")
+            for btn in self._tag_buttons.values():
+                btn.configure(fg_color=TAG_COLOR_INACTIVE, hover_color=TAG_HOVER_INACTIVE)
             return
 
         m = item.metadata
@@ -737,12 +735,12 @@ class MetadataPanel(ctk.CTkFrame):
             else:
                 btn.configure(fg_color="#3a86ff", text_color="#ffffff")
 
-        # Update tag button colors (highlight active tags in purple #7b2cbf)
+        # Update tag button colors (highlight active tags in bright green #2b9348)
         for tag, btn in self._tag_buttons.items():
             if item.has_tag(tag):
-                btn.configure(fg_color="#7b2cbf")
+                btn.configure(fg_color=TAG_COLOR_ACTIVE, hover_color=TAG_HOVER_ACTIVE)
             else:
-                btn.configure(fg_color="#3a3a3a")
+                btn.configure(fg_color=TAG_COLOR_INACTIVE, hover_color=TAG_HOVER_INACTIVE)
 
         txt = (
             f"File: {item.filename}\n"
