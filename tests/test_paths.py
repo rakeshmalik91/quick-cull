@@ -38,14 +38,14 @@ class TestPathsAndWorkspaces(unittest.TestCase):
         self.assertEqual(LIB_DIR, root / "lib")
         self.assertEqual(MODELS_DIR, root / "lib" / "models")
         self.assertEqual(EXIFTOOL_DIR, root / "lib" / "exif-tools")
-        self.assertEqual(DEFAULT_WORKSPACE_PATH, root / "default.fpc-workspace")
+        self.assertEqual(DEFAULT_WORKSPACE_PATH, root / "default.qc-workspace")
         self.assertEqual(DEFAULT_DATASET_DIR, root / "_DATASET")
 
     def test_dataset_dir_for_custom_workspace(self):
         """
         Verify that custom workspace files look for _DATASET in that workspace file's directory.
         """
-        custom_ws = Path("D:/MyCustomProject/project.fpc-workspace")
+        custom_ws = Path("D:/MyCustomProject/project.qc-workspace")
         ds_dir = get_dataset_dir_for_workspace(custom_ws)
         self.assertEqual(ds_dir, Path("D:/MyCustomProject/_DATASET"))
 
@@ -62,7 +62,7 @@ class TestPathsAndWorkspaces(unittest.TestCase):
         Verify that DatabaseManager dynamically provides the correct dataset_dir property.
         """
         temp_dir = Path(tempfile.mkdtemp())
-        ws_file = temp_dir / "custom.fpc-workspace"
+        ws_file = temp_dir / "custom.qc-workspace"
 
         try:
             db = DatabaseManager(db_path=ws_file)
@@ -74,7 +74,7 @@ class TestPathsAndWorkspaces(unittest.TestCase):
 
     def test_resolve_workspace_path_defaults(self):
         """
-        Verify resolve_workspace_path resolves default.fpc-workspace when None is passed.
+        Verify resolve_workspace_path resolves default.qc-workspace when None is passed.
         """
         resolved = resolve_workspace_path(None)
         self.assertEqual(resolved, DEFAULT_WORKSPACE_PATH)

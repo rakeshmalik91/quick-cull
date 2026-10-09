@@ -60,7 +60,7 @@ class ImageCullerApp(ctk.CTk):
         return DATASET_DIR
 
     def _update_window_title(self):
-        ws_name = self.db.db_path.name if self.db and hasattr(self.db, "db_path") else "default.fpc-workspace"
+        ws_name = self.db.db_path.name if self.db and hasattr(self.db, "db_path") else "default.qc-workspace"
         self.title(f"{APP_NAME} - [{ws_name}]")
 
     def __init__(
@@ -78,7 +78,7 @@ class ImageCullerApp(ctk.CTk):
 
         target_ws = workspace_path
         folder_or_img = initial_path
-        if initial_path and (str(initial_path).endswith(".fpc-workspace") or str(initial_path).endswith(".db")):
+        if initial_path and (str(initial_path).endswith(".qc-workspace") or str(initial_path).endswith(".db")):
             target_ws = initial_path
             folder_or_img = None
 

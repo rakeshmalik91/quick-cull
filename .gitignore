@@ -12,7 +12,7 @@ culler_debug.log
 cull_manifest.json
 cull_manifest.csv
 *.db
-*.fpc-workspace
+*.qc-workspace
 *.sqlite
 culler.db
 Selected/

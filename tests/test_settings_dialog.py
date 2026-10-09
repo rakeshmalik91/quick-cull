@@ -17,7 +17,7 @@ class TestSettingsDialog(unittest.TestCase):
     """
 
     def setUp(self):
-        self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix=".fpc-workspace")
+        self.temp_db_fd, self.temp_db_path = tempfile.mkstemp(suffix=".qc-workspace")
         os.close(self.temp_db_fd)
         self.db = DatabaseManager(db_path=self.temp_db_path)
         try:

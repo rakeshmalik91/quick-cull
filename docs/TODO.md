@@ -5,6 +5,13 @@ Do not add any new details here. only use this for checking/unchecking the TODO 
 Make corrections optionally, if required.
 ---------------------
 
+- [ ] Check possibilities for storing tags, stars, subject boundingbox in image exif data instead of db
+- [ ] Scrolling on thumbnails with large data: glitch, freeze & performance
+  - [x] some times thumbnails show blanks, and selecting a thumbnail shows the image in preview but doesnt highlight with blue in thumbnails list
+  - [ ] when scrolling fast, text from new thumbnails overlap with old ones, making it look glitchy (last try on this reduced the glitch and increased freeze. need to accept completely removed glitch/freeze)
+
+---------------------
+
 - [x] UI changes:
   - [x] add a bit of gap between "Close all Tabs" & "About" button
   - [x] add hide/unhide for thumbnail panel and right side tool panel
@@ -20,11 +27,6 @@ Make corrections optionally, if required.
   - [x] Reject some photos, Go to Rejected filter, Select all, delete all selected, come back to All filter -> all thumbnails show an yellow glitchy outline
   - [x] Pick/Reject etc on multiple images taking too long, should be instantaneous, its just db operation
   - [x] at first the Pick/Reject counts take some time to reflect, later any more update is instantaneous
-
-
-- [ ] Scrolling on thumbnails with large data: glitch, freeze & performance
-  - [x] some times thumbnails show blanks, and selecting a thumbnail shows the image in preview but doesnt highlight with blue in thumbnails list
-  - [ ] when scrolling fast, text from new thumbnails overlap with old ones, making it look glitchy (last try on this reduced the glitch and increased freeze. need to accept completely removed glitch/freeze)
 
 
 - [x] Add a search by filename (supports partial string & filename contains), to jump to a file in the thumbnails list. it should suggest continuously as typed. Add it right on top of thumbnail list. Ctrl+F to focus on it.

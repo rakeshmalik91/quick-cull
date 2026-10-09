@@ -20,7 +20,7 @@ MODELS_DIR = LIB_DIR / "models"
 EXIFTOOL_DIR = LIB_DIR / "exif-tools"
 
 # Default workspace and dataset configuration
-DEFAULT_WORKSPACE_NAME = "default.fpc-workspace"
+DEFAULT_WORKSPACE_NAME = "default.qc-workspace"
 DEFAULT_WORKSPACE_PATH = PROJECT_ROOT / DEFAULT_WORKSPACE_NAME
 DEFAULT_DATASET_DIR = PROJECT_ROOT / "_DATASET"
 
@@ -59,7 +59,7 @@ def get_dataset_dir_for_workspace(workspace_path: Optional[Union[str, Path]] = N
     """
     if workspace_path:
         w_path = Path(workspace_path)
-        if w_path.suffix in (".fpc-workspace", ".db"):
+        if w_path.suffix in (".qc-workspace", ".db"):
             return w_path.parent / "_DATASET"
         elif not w_path.suffix:
             return w_path / "_DATASET"
@@ -79,7 +79,7 @@ def resolve_workspace_path(workspace_path: Optional[Union[str, Path]] = None) ->
             return p / DEFAULT_WORKSPACE_NAME
         return p
 
-    # Default workspace: check if legacy culler.db exists and default.fpc-workspace doesn't
+    # Default workspace: check if legacy culler.db exists and default.qc-workspace doesn't
     if not DEFAULT_WORKSPACE_PATH.exists():
         legacy_db = PROJECT_ROOT / "culler.db"
         if legacy_db.exists():

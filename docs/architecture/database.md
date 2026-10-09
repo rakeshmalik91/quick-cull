@@ -13,7 +13,7 @@ Quick Cull uses an embedded, zero-configuration, single-file SQLite database to 
 │                             Quick Cull Storage                              │
 ├──────────────────────────────────────┬──────────────────────────────────────┤
 │    Persistent Workspace Database     │      Filesystem Dataset Storage      │
-│     (.fpc-workspace / SQLite)        │      (_DATASET/annotations.json)     │
+│     (.qc-workspace / SQLite)        │      (_DATASET/annotations.json)     │
 ├──────────────────────────────────────┼──────────────────────────────────────┤
 │ • image_records (flags, ratings,     │ • Manual YOLO bounding box edits     │
 │   sharpness, tags, detection boxes)  │ • Active learning training exports   │
@@ -36,8 +36,8 @@ Quick Cull uses an embedded, zero-configuration, single-file SQLite database to 
 ### Workspace Concept & Database File Resolution
 
 1. **Workspace Databases**:
-   - The workspace file uses the extension `.fpc-workspace` (e.g., `default.fpc-workspace`), located at the project root or specified via workspace options.
-   - Legacy migration: If `default.fpc-workspace` is missing but legacy `culler.db` exists at project root, `culler.paths.resolve_workspace_path()` automatically renames `culler.db` to `default.fpc-workspace` without data loss.
+   - The workspace file uses the extension `.qc-workspace` (e.g., `default.qc-workspace`), located at the project root or specified via workspace options.
+   - Legacy migration: If `default.qc-workspace` is missing but legacy `culler.db` exists at project root, `culler.paths.resolve_workspace_path()` automatically renames `culler.db` to `default.qc-workspace` without data loss.
 2. **Decoupled Dataset Directory**:
    - Every workspace database resolves its associated active learning folder (`_DATASET`) via `get_dataset_dir_for_workspace()`.
 3. **RAM Separation**:

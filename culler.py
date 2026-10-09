@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Fast Image Culling Tool (Sony ARW, JPG, PNG, HEIC)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("-w", "--workspace", default=None, help="Path to custom .fpc-workspace database file")
+    parser.add_argument("-w", "--workspace", default=None, help="Path to custom .qc-workspace database file")
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
 
     # Scan command

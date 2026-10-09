@@ -7,7 +7,7 @@ attached. Argument handling matches ``gui.py``/``culler.py``:
     gui.pyw                        -> blank launch, restores open tabs
     gui.pyw "D:\Photos\2024"       -> opens a folder
     gui.pyw "D:\Photos\DSC1.ARW"   -> opens the folder and selects the image
-    gui.pyw "D:\Photos\ws.fpc-workspace" -> opens a specific workspace
+    gui.pyw "D:\Photos\ws.qc-workspace" -> opens a specific workspace
 
 Because a console is not available when this is launched through pythonw,
 failures are written to ``culler_debug.log`` and surfaced in a message box.
@@ -69,7 +69,7 @@ def parse_args(argv):
         text = str(arg)
         if text.startswith("-"):
             continue
-        if text.lower().endswith((".fpc-workspace", ".db")):
+        if text.lower().endswith((".qc-workspace", ".db")):
             workspace_path = text
         else:
             initial_path = text
