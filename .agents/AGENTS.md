@@ -18,8 +18,9 @@ Create temporary files under `_tmp` folder. Remove them after use.
 
 ## Technical Architecture & Documentation
 Consult the technical specifications and architecture documents in `docs/` before implementing or modifying related features:
-- [Scan for Blur & AI Subject Focus](../docs/scan-for-blur.md): 3 blur detection algorithms (Laplacian, 2-level YOLO subject/eye detection, FFT), 4-stage candidate recall, patch grid bokeh protection, auto-flagging, and dual bounding box UI.
-- [Scan for Duplicates & Burst Detection](../docs/scan-for-duplicate.md): Perceptual image hashing (dHash/pHash), Hamming distance thresholds, burst grouping, and sharpness-based keeper selection.
-- [Thumbnail & Preview Loading/Caching](../docs/thumbnail-preview-cache.md): Core `ImageLoader` LRU RAM cache, GUI widget caching, async directory scanning, folder watcher reload, and multi-tab isolation.
-- [YOLO Custom Training Pipeline](../docs/yolo-custom-training.md): End-to-end active learning fine-tuning on user annotations, dataset layout, training triggers, progress modal, and model hot-reloading.
+- [Scan for Blur & AI Subject Focus](../docs/architecture/scan-for-blur.md): 3 blur detection algorithms (Laplacian, 2-level YOLO subject/eye detection, FFT), 4-stage candidate recall, patch grid bokeh protection, auto-flagging, and dual bounding box UI.
+- [Scan for Duplicates & Burst Detection](../docs/architecture/scan-for-duplicate.md): Perceptual image hashing (dHash/pHash), Hamming distance thresholds, burst grouping, and sharpness-based keeper selection.
+- [Thumbnail & Preview Loading/Caching](../docs/architecture/thumbnail-preview-cache.md): Core `ImageLoader` LRU RAM cache, GUI widget caching, async directory scanning, folder watcher reload, and multi-tab isolation.
+- [YOLO Custom Training Pipeline](../docs/architecture/yolo-custom-training.md): End-to-end active learning fine-tuning on user annotations, dataset layout, training triggers, progress modal, and model hot-reloading.
+- [Database Architecture & Workspace Persistence](../docs/architecture/database.md): SQLite schema (`image_records`, `app_settings`), connection-per-operation thread safety, `_MAX_SQL_VARIABLES` batch chunking, fast placeholder preloading, and path canonicalization.
 
